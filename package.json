@@ -7,6 +7,7 @@
     "start": "node server.js",
     "check": "node --check server.js && node --check app.js",
     "smoke": "node server.js --smoke-test",
+    "ui-smoke": "node server.js --ui-smoke-test",
     "api-smoke": "node server.js --api-smoke-test"
   }
 }

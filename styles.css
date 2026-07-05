@@ -778,6 +778,30 @@ textarea:focus {
   gap: 8px;
 }
 
+.process-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.process-form input {
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  padding: 0 10px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-xs);
+}
+
+.process-form input:focus {
+  border-color: rgba(91, 141, 239, 0.7);
+  outline: none;
+}
+
 .section-title span {
   color: var(--text);
   font-size: var(--text-sm);
@@ -1082,6 +1106,76 @@ textarea:focus {
 
 .queue-row.active {
   border-color: rgba(242, 166, 90, 0.4);
+}
+
+.capability-list {
+  display: grid;
+  gap: 8px;
+  max-height: 190px;
+  overflow: auto;
+}
+
+.capability-row {
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.025);
+  cursor: pointer;
+}
+
+.capability-row strong {
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.capability-row small {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+
+.capability-row.implemented {
+  border-color: rgba(97, 212, 162, 0.35);
+}
+
+.capability-row.partial {
+  border-color: rgba(242, 166, 90, 0.4);
+}
+
+.capability-row.missing {
+  border-color: rgba(255, 107, 107, 0.35);
+}
+
+.goal-state {
+  display: grid;
+  gap: 5px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: rgba(91, 141, 239, 0.07);
+}
+
+.goal-state strong {
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.goal-state p {
+  overflow: hidden;
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.goal-state small {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.45;
 }
 
 .review-row {

@@ -1,5 +1,5 @@
 import http from "node:http";
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +10,25 @@ const DEFAULT_WORKSPACE = "D:\\cc-picture\\aaa\\coder-workspace";
 const INITIAL_WORKSPACE = path.resolve(process.env.FORGE_WORKSPACE || DEFAULT_WORKSPACE);
 let currentWorkspace = INITIAL_WORKSPACE;
 const PORT = Number(process.env.PORT || 4173);
-const MODEL = "deepseek-v4-pro";
+const DEFAULT_MODEL = "deepseek-v4-pro";
+const MODEL_API_URL = process.env.FORGE_MODEL_API_URL || "https://api.deepseek.com/chat/completions";
+const MODEL_CANDIDATES = (process.env.FORGE_MODELS || process.env.DEEPSEEK_MODEL || DEFAULT_MODEL)
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+let modelRuntime = {
+  provider: "deepseek-compatible",
+  endpoint: MODEL_API_URL,
+  candidates: MODEL_CANDIDATES,
+  lastModel: "",
+  lastFallbacks: [],
+  lastError: "",
+  lastUsedAt: ""
+};
+
+function currentModelName() {
+  return modelRuntime.lastModel || MODEL_CANDIDATES[0] || DEFAULT_MODEL;
+}
 const CONTEXT_LIMIT_BYTES = 220 * 1024;
 const MAX_FILE_BYTES = 120 * 1024;
 const MAX_AGENT_TURNS = 8;
@@ -19,6 +37,12 @@ const TASK_LOG_DIR = path.join(APP_ROOT, ".forge", "tasks");
 const WORKTREE_DIR = path.join(APP_ROOT, ".forge", "worktrees");
 const QUEUE_DIR = path.join(APP_ROOT, ".forge", "queue");
 const HANDOFF_DIR = path.join(APP_ROOT, ".forge", "handoffs");
+const REVIEW_DIR = path.join(APP_ROOT, ".forge", "reviews");
+const STATE_DIR = path.join(APP_ROOT, ".forge", "state");
+const GOAL_STATE_PATH = path.join(STATE_DIR, "goal.json");
+const APPROVAL_DIR = path.join(APP_ROOT, ".forge", "approvals");
+const EXTENSION_DIR = path.join(APP_ROOT, ".forge", "extensions");
+const MCP_DIR = path.join(APP_ROOT, ".forge", "mcp");
 const SKIP_DIRS = new Set([".git", ".forge", "node_modules", "dist", "build", ".next", ".turbo", "coverage"]);
 const SKIP_FILES = new Set([".env", ".env.local"]);
 const TEXT_EXTS = new Set([
@@ -26,6 +50,10 @@ const TEXT_EXTS = new Set([
   ".md", ".mjs", ".php", ".py", ".rb", ".rs", ".scss", ".sh", ".sql", ".ts", ".tsx", ".txt",
   ".vue", ".xml", ".yaml", ".yml"
 ]);
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif"]);
+const DOCUMENT_EXTS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]);
+const DATA_EXTS = new Set([".csv", ".tsv", ".parquet", ".jsonl"]);
+const MEDIA_EXTS = new Set([".mp3", ".wav", ".m4a", ".mp4", ".mov", ".webm"]);
 const CHECK_SCRIPT_NAMES = ["check", "test", "lint", "build"];
 const SAFE_COMMAND_PATTERNS = [
   /^npm (?:run )?(?:check|test|lint|build)(?:\s+--\s*[\w:./=-]+)?$/i,
@@ -35,6 +63,13 @@ const SAFE_COMMAND_PATTERNS = [
   /^node --check [\w./\\-]+$/i,
   /^node [\w./\\-]+ --smoke-test$/i
 ];
+const PROCESS_COMMAND_PATTERNS = [
+  /^npm (?:run )?(?:dev|start|serve|preview)(?:\s+--\s*[\w:./=-]+)?$/i,
+  /^pnpm (?:run )?(?:dev|start|serve|preview)(?:\s+[\w:./=-]+)?$/i,
+  /^yarn (?:run )?(?:dev|start|serve|preview)(?:\s+[\w:./=-]+)?$/i,
+  /^node [\w./\\-]+$/i
+];
+const managedProcesses = new Map();
 
 function send(res, status, payload, headers = {}) {
   const body = typeof payload === "string" ? payload : JSON.stringify(payload);
@@ -133,6 +168,15 @@ function isTextFile(name) {
   return TEXT_EXTS.has(ext) || (!ext && !name.includes("."));
 }
 
+function classifyAsset(name) {
+  const ext = path.extname(name).toLowerCase();
+  if (IMAGE_EXTS.has(ext)) return "image";
+  if (DOCUMENT_EXTS.has(ext)) return "document";
+  if (DATA_EXTS.has(ext)) return "data";
+  if (MEDIA_EXTS.has(ext)) return "media";
+  return "";
+}
+
 async function listFiles(dir = currentWorkspace, base = "") {
   const entries = await fs.readdir(dir, { withFileTypes: true });
   const files = [];
@@ -149,6 +193,57 @@ async function listFiles(dir = currentWorkspace, base = "") {
     files.push({ path: toPosix(path.join(base, entry.name)), size: stat.size });
   }
   return files.sort((a, b) => a.path.localeCompare(b.path)).slice(0, 400);
+}
+
+async function listAssetFiles(dir = currentWorkspace, base = "") {
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const assets = [];
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      assets.push(...await listAssetFiles(path.join(dir, entry.name), path.join(base, entry.name)));
+      continue;
+    }
+    if (!entry.isFile() || SKIP_FILES.has(entry.name)) continue;
+    const type = classifyAsset(entry.name);
+    if (!type) continue;
+    const full = path.join(dir, entry.name);
+    const stat = await fs.stat(full);
+    assets.push({
+      path: toPosix(path.join(base, entry.name)),
+      type,
+      ext: path.extname(entry.name).toLowerCase(),
+      size: stat.size,
+      modifiedAt: stat.mtime.toISOString()
+    });
+  }
+  return assets.sort((a, b) => a.path.localeCompare(b.path)).slice(0, 400);
+}
+
+async function buildAssetCatalog() {
+  const assets = await listAssetFiles();
+  const summary = assets.reduce((acc, asset) => {
+    acc.total += 1;
+    acc[asset.type] = (acc[asset.type] || 0) + 1;
+    return acc;
+  }, { total: 0, image: 0, document: 0, data: 0, media: 0 });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary,
+    assets,
+    policy: {
+      access: "metadata-only",
+      scope: "currentWorkspace",
+      readsContent: false
+    },
+    gaps: [
+      "PDF and Office text extraction",
+      "image OCR and vision summaries",
+      "audio/video transcription",
+      "visual regression screenshots"
+    ]
+  };
 }
 
 async function readWorkspaceFile(relativePath) {
@@ -420,14 +515,44 @@ async function rollbackCheckpoint(id) {
   return { id, restored: checkpoint.files.map((file) => file.path) };
 }
 
-function isSafeCommand(command) {
+function evaluateCommandPolicy(command) {
   const text = String(command || "").trim();
-  if (!text || text.length > 220) return false;
-  if (/[;&|`<>]/.test(text)) return false;
-  if (/\b(?:rm|del|rmdir|remove-item|format|curl|wget|invoke-webrequest|set-content|out-file)\b/i.test(text)) {
-    return false;
+  if (!text) {
+    return { allowed: false, risk: "blocked", reason: "空命令。", command: text };
   }
-  return SAFE_COMMAND_PATTERNS.some((pattern) => pattern.test(text));
+  if (text.length > 220) {
+    return { allowed: false, risk: "blocked", reason: "命令过长，已拒绝。", command: text };
+  }
+  if (/[;&|`<>]/.test(text)) {
+    return { allowed: false, risk: "blocked", reason: "包含 shell 控制符，已拒绝。", command: text };
+  }
+  if (/\b(?:rm|del|rmdir|remove-item|format|curl|wget|invoke-webrequest|set-content|out-file)\b/i.test(text)) {
+    return { allowed: false, risk: "blocked", reason: "包含删除、写入或网络下载类命令，已拒绝。", command: text };
+  }
+  const allowed = SAFE_COMMAND_PATTERNS.some((pattern) => pattern.test(text));
+  if (!allowed) {
+    return { allowed: false, risk: "blocked", reason: "未匹配允许的检查/构建命令模式。", command: text };
+  }
+  const risk = /\b(?:build|test)\b/i.test(text) ? "medium" : "low";
+  return { allowed: true, risk, reason: "匹配安全检查/构建命令策略。", command: text };
+}
+
+function isSafeCommand(command) {
+  return evaluateCommandPolicy(command).allowed;
+}
+
+function evaluateProcessPolicy(command) {
+  const text = String(command || "").trim();
+  const basePolicy = evaluateCommandPolicy(text);
+  if (!text) return basePolicy;
+  if (basePolicy.reason !== "未匹配允许的检查/构建命令模式。") {
+    return { ...basePolicy, reason: basePolicy.allowed ? "该命令适合短任务执行，不需要后台进程。" : basePolicy.reason };
+  }
+  const allowed = PROCESS_COMMAND_PATTERNS.some((pattern) => pattern.test(text));
+  if (!allowed) {
+    return { allowed: false, risk: "blocked", reason: "未匹配允许的受管服务命令模式。", command: text };
+  }
+  return { allowed: true, risk: "medium", reason: "匹配受管开发服务命令策略。", command: text };
 }
 
 async function readPackageScripts() {
@@ -458,9 +583,10 @@ async function discoverCheckCommands(commands = []) {
   const checks = [];
   const add = (command, reason = "") => {
     const text = String(command || "").trim();
-    if (!text || seen.has(text) || !isSafeCommand(text)) return;
+    const policy = evaluateCommandPolicy(text);
+    if (!text || seen.has(text) || !policy.allowed) return;
     seen.add(text);
-    checks.push({ command: text, reason });
+    checks.push({ command: text, reason, policy });
   };
 
   const scripts = await readPackageScripts();
@@ -496,8 +622,11 @@ async function discoverCheckCommands(commands = []) {
 }
 
 async function executeCommand(command) {
-  if (!isSafeCommand(command)) {
-    throw new Error("命令未通过安全白名单，已拒绝执行。");
+  const policy = evaluateCommandPolicy(command);
+  if (!policy.allowed) {
+    const error = new Error(`命令未通过安全策略：${policy.reason}`);
+    error.policy = policy;
+    throw error;
   }
   return new Promise((resolve) => {
     exec(command, {
@@ -509,10 +638,204 @@ async function executeCommand(command) {
     }, (error, stdout, stderr) => {
       resolve({
         exitCode: error?.code ?? 0,
+        policy,
         output: [stdout, stderr].filter(Boolean).join("\n").slice(0, 20000)
       });
     });
   });
+}
+
+async function executeUserCommand(command) {
+  const policy = evaluateCommandPolicy(command);
+  if (!policy.allowed) {
+    const approval = await writeApprovalRequest({
+      type: "command",
+      command: policy.command,
+      policy,
+      reason: policy.reason
+    });
+    return {
+      exitCode: 126,
+      blocked: true,
+      approval,
+      policy,
+      output: policy.reason
+    };
+  }
+  return executeCommand(command);
+}
+
+function summarizeManagedProcess(entry) {
+  return {
+    id: entry.id,
+    command: entry.command,
+    workspace: entry.workspace,
+    startedAt: entry.startedAt,
+    stoppedAt: entry.stoppedAt || "",
+    status: entry.status,
+    exitCode: entry.exitCode,
+    pid: entry.child?.pid || null,
+    policy: entry.policy,
+    probe: entry.probe,
+    outputTail: entry.output.slice(-12000)
+  };
+}
+
+function inferProcessProbe(entry) {
+  const source = `${entry.command}\n${entry.output || ""}`;
+  const explicit = /(?:localhost|127\.0\.0\.1):(\d{2,5})/i.exec(source)
+    || /\b(?:--port|-p|PORT|port)\s*=?\s*(\d{2,5})\b/i.exec(source);
+  if (!explicit) return null;
+  const port = Number(explicit[1]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return {
+    port,
+    url: `http://127.0.0.1:${port}`,
+    status: "unknown",
+    ok: false,
+    statusCode: null,
+    lastCheckedAt: "",
+    lastError: ""
+  };
+}
+
+async function probeManagedProcess(entry) {
+  if (!entry.probe) entry.probe = inferProcessProbe(entry);
+  if (!entry.probe || entry.status !== "running") return entry.probe;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1200);
+  try {
+    const response = await fetch(entry.probe.url, { signal: controller.signal });
+    entry.probe = {
+      ...entry.probe,
+      status: response.ok ? "healthy" : "unhealthy",
+      ok: response.ok,
+      statusCode: response.status,
+      lastCheckedAt: new Date().toISOString(),
+      lastError: ""
+    };
+  } catch (error) {
+    entry.probe = {
+      ...entry.probe,
+      status: "unreachable",
+      ok: false,
+      statusCode: null,
+      lastCheckedAt: new Date().toISOString(),
+      lastError: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+  return entry.probe;
+}
+
+function waitForProcessExit(entry, timeoutMs = 5000) {
+  if (!entry.child || entry.status === "exited" || entry.status === "error") return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    entry.child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+async function listManagedProcesses({ probe = false } = {}) {
+  const entries = Array.from(managedProcesses.values())
+    .filter((entry) => entry.workspace === currentWorkspace)
+    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
+    .slice(0, 20);
+  if (probe) {
+    await Promise.all(entries.map((entry) => probeManagedProcess(entry).catch(() => null)));
+  }
+  return entries.map(summarizeManagedProcess);
+}
+
+async function startManagedProcess(command) {
+  const policy = evaluateProcessPolicy(command);
+  if (!policy.allowed) {
+    const approval = await writeApprovalRequest({
+      type: "process",
+      command: policy.command,
+      policy,
+      reason: policy.reason
+    });
+    return {
+      blocked: true,
+      status: "blocked",
+      exitCode: 126,
+      approval,
+      policy,
+      outputTail: policy.reason
+    };
+  }
+
+  const id = `proc-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const child = spawn(command, {
+    cwd: currentWorkspace,
+    shell: process.platform === "win32" ? "powershell.exe" : "/bin/sh",
+    windowsHide: true,
+    env: process.env,
+    detached: process.platform !== "win32"
+  });
+  const entry = {
+    id,
+    command: policy.command,
+    workspace: currentWorkspace,
+    startedAt: new Date().toISOString(),
+    stoppedAt: "",
+    status: "running",
+    exitCode: null,
+    output: "",
+    probe: inferProcessProbe({ command: policy.command, output: "" }),
+    policy,
+    child
+  };
+  const appendOutput = (chunk) => {
+    entry.output = `${entry.output}${chunk.toString("utf8")}`.slice(-30000);
+    if (!entry.probe) entry.probe = inferProcessProbe(entry);
+  };
+  child.stdout?.on("data", appendOutput);
+  child.stderr?.on("data", appendOutput);
+  child.on("close", (code) => {
+    entry.status = "exited";
+    entry.exitCode = code ?? 0;
+    entry.stoppedAt = new Date().toISOString();
+  });
+  child.on("error", (error) => {
+    entry.status = "error";
+    entry.exitCode = 1;
+    entry.stoppedAt = new Date().toISOString();
+    appendOutput(error.message);
+  });
+  managedProcesses.set(id, entry);
+  return summarizeManagedProcess(entry);
+}
+
+async function stopManagedProcess(id) {
+  if (!/^[\w.-]+$/.test(String(id || ""))) throw new Error("process id 非法。");
+  const entry = managedProcesses.get(id);
+  if (!entry) throw new Error("未找到受管进程。");
+  if (entry.workspace !== currentWorkspace) {
+    throw new Error("该受管进程不属于当前工作目录。");
+  }
+  if (entry.status === "running") {
+    entry.status = "stopping";
+    entry.stoppedAt = new Date().toISOString();
+    if (process.platform === "win32" && entry.child?.pid) {
+      await new Promise((resolve) => {
+        exec(`taskkill /PID ${entry.child.pid} /T /F`, { windowsHide: true }, () => resolve());
+      });
+    } else {
+      try {
+        process.kill(-entry.child.pid, "SIGTERM");
+      } catch {
+        entry.child.kill("SIGTERM");
+      }
+    }
+    await waitForProcessExit(entry);
+  }
+  return summarizeManagedProcess(entry);
 }
 
 async function runCheckCommands(commands = []) {
@@ -527,10 +850,22 @@ async function runCheckCommands(commands = []) {
   const checks = [];
   for (const item of commands) {
     const command = item.command || item;
+    const policy = evaluateCommandPolicy(command);
+    if (!policy.allowed) {
+      checks.push({
+        command,
+        reason: item.reason || "",
+        policy,
+        exitCode: 126,
+        output: policy.reason
+      });
+      break;
+    }
     const result = await executeCommand(command);
     checks.push({
       command,
       reason: item.reason || "",
+      policy: result.policy || policy,
       exitCode: result.exitCode,
       output: result.output
     });
@@ -632,6 +967,40 @@ async function writeTaskLog(record) {
   return task;
 }
 
+function defaultGoalState() {
+  return {
+    workspace: currentWorkspace,
+    objective: "",
+    phase: "idle",
+    status: "idle",
+    updatedAt: "",
+    lastPrompt: "",
+    lastTaskId: "",
+    lastVerification: null,
+    pendingProposal: null,
+    nextStep: "输入任务并运行代理。"
+  };
+}
+
+async function readGoalState() {
+  const state = JSON.parse(await fs.readFile(GOAL_STATE_PATH, "utf8").catch(() => "{}"));
+  if (state.workspace !== currentWorkspace) return defaultGoalState();
+  return { ...defaultGoalState(), ...state };
+}
+
+async function writeGoalState(patch = {}) {
+  await fs.mkdir(STATE_DIR, { recursive: true });
+  const previous = await readGoalState();
+  const state = {
+    ...previous,
+    ...patch,
+    workspace: currentWorkspace,
+    updatedAt: new Date().toISOString()
+  };
+  await fs.writeFile(GOAL_STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+  return state;
+}
+
 async function listTaskLogs(limit = 20) {
   await fs.mkdir(TASK_LOG_DIR, { recursive: true });
   const entries = await fs.readdir(TASK_LOG_DIR, { withFileTypes: true });
@@ -710,6 +1079,114 @@ async function updateQueuedTask(id, status) {
   return item;
 }
 
+async function writeReviewArtifact(record) {
+  await fs.mkdir(REVIEW_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const id = `review-${stamp}`;
+  const artifact = {
+    id,
+    workspace: currentWorkspace,
+    createdAt: new Date().toISOString(),
+    ...record
+  };
+  const full = path.join(REVIEW_DIR, `${id}.json`);
+  await fs.writeFile(full, JSON.stringify(artifact, null, 2), "utf8");
+  return {
+    id,
+    path: full,
+    createdAt: artifact.createdAt,
+    prompt: artifact.prompt || "",
+    summary: artifact.reply || "",
+    findingCount: Array.isArray(artifact.review) ? artifact.review.length : 0,
+    commandCount: Array.isArray(artifact.commands) ? artifact.commands.length : 0,
+    changedFiles: artifact.git?.changedFiles || []
+  };
+}
+
+async function writeApprovalRequest(record) {
+  await fs.mkdir(APPROVAL_DIR, { recursive: true });
+  const id = `approval-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const approval = {
+    id,
+    workspace: currentWorkspace,
+    createdAt: new Date().toISOString(),
+    status: "blocked",
+    ...record
+  };
+  const full = path.join(APPROVAL_DIR, `${id}.json`);
+  await fs.writeFile(full, JSON.stringify(approval, null, 2), "utf8");
+  return {
+    id,
+    path: full,
+    type: approval.type || "command",
+    command: approval.command || "",
+    reason: approval.reason || approval.policy?.reason || "",
+    risk: approval.policy?.risk || "blocked",
+    status: approval.status,
+    createdAt: approval.createdAt
+  };
+}
+
+async function listApprovalRequests(limit = 20) {
+  await fs.mkdir(APPROVAL_DIR, { recursive: true });
+  const entries = await fs.readdir(APPROVAL_DIR, { withFileTypes: true });
+  const approvals = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const approval = JSON.parse(await fs.readFile(path.join(APPROVAL_DIR, entry.name), "utf8").catch(() => "{}"));
+    if (approval.workspace !== currentWorkspace) continue;
+    approvals.push({
+      id: approval.id,
+      type: approval.type || "command",
+      command: approval.command || "",
+      reason: approval.reason || approval.policy?.reason || "",
+      risk: approval.policy?.risk || "blocked",
+      status: approval.status || "blocked",
+      createdAt: approval.createdAt || ""
+    });
+  }
+  return approvals.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, limit);
+}
+
+async function readApprovalRequest(id) {
+  if (!/^[\w.-]+$/.test(String(id || ""))) throw new Error("approval id 非法。");
+  const approval = JSON.parse(await fs.readFile(path.join(APPROVAL_DIR, `${id}.json`), "utf8"));
+  if (approval.workspace !== currentWorkspace) {
+    throw new Error("该审批请求不属于当前工作目录。");
+  }
+  return approval;
+}
+
+async function listReviewArtifacts(limit = 20) {
+  await fs.mkdir(REVIEW_DIR, { recursive: true });
+  const entries = await fs.readdir(REVIEW_DIR, { withFileTypes: true });
+  const reviews = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const artifact = JSON.parse(await fs.readFile(path.join(REVIEW_DIR, entry.name), "utf8").catch(() => "{}"));
+    if (artifact.workspace !== currentWorkspace) continue;
+    reviews.push({
+      id: artifact.id,
+      createdAt: artifact.createdAt || "",
+      prompt: artifact.prompt || "",
+      summary: artifact.reply || "",
+      findingCount: Array.isArray(artifact.review) ? artifact.review.length : 0,
+      commandCount: Array.isArray(artifact.commands) ? artifact.commands.length : 0,
+      changedFiles: artifact.git?.changedFiles || []
+    });
+  }
+  return reviews.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, limit);
+}
+
+async function readReviewArtifact(id) {
+  if (!/^[\w.-]+$/.test(String(id || ""))) throw new Error("review id 非法。");
+  const artifact = JSON.parse(await fs.readFile(path.join(REVIEW_DIR, `${id}.json`), "utf8"));
+  if (artifact.workspace !== currentWorkspace) {
+    throw new Error("该审查记录不属于当前工作目录，请先切回对应目录。");
+  }
+  return artifact;
+}
+
 async function getCurrentDiff() {
   const git = await getGitSummary();
   if (!git.available) {
@@ -737,7 +1214,7 @@ async function reviewCurrentChanges(prompt = "") {
     throw new Error("当前工作区不是 Git 仓库，无法生成 Git diff 审查证据。");
   }
   if (!evidence.diff.trim()) {
-    return {
+    const payload = {
       reply: "当前没有 Git diff 可审查。",
       plan: [],
       diff: "",
@@ -745,6 +1222,16 @@ async function reviewCurrentChanges(prompt = "") {
       commands: [],
       evidence
     };
+    const artifact = await writeReviewArtifact({
+      prompt,
+      reply: payload.reply,
+      plan: payload.plan,
+      review: payload.review,
+      commands: payload.commands,
+      evidence: { ...evidence, diff: "" },
+      git: evidence.git
+    });
+    return { ...payload, artifact };
   }
 
   const repoMap = await buildRepoMap();
@@ -781,7 +1268,16 @@ async function reviewCurrentChanges(prompt = "") {
   const message = await callDeepSeekMessages(messages, null);
   const payload = normalizeAgentPayload(message.content);
   const commands = await discoverCheckCommands(payload.commands);
-  return { ...payload, diff: "", patches: [], commands, evidence };
+  const artifact = await writeReviewArtifact({
+    prompt,
+    reply: payload.reply || "",
+    plan: payload.plan || [],
+    review: payload.review || [],
+    commands,
+    evidence,
+    git: evidence.git
+  });
+  return { ...payload, diff: "", patches: [], commands, evidence, artifact };
 }
 
 function markdownList(items = []) {
@@ -842,6 +1338,377 @@ async function createHandoffDraft(prompt = "") {
     git,
     tasks,
     evidence
+  };
+}
+
+async function buildCapabilityAudit() {
+  const git = await getGitSummary();
+  const tasks = await listTaskLogs(5);
+  const queue = await listQueuedTasks(5);
+  const reviews = await listReviewArtifacts(5);
+  const approvals = await listApprovalRequests(5);
+  const extensions = await listExtensions();
+  const mcp = await discoverMcpServers();
+  const assets = await buildAssetCatalog();
+  const goal = await readGoalState();
+  const capabilities = [
+    {
+      area: "上下文索引",
+      status: "implemented",
+      evidence: ["repo_map", "read_file_range", "search_files"],
+      next: "后续可接入 AST/LSP 级语义索引。"
+    },
+    {
+      area: "审批写入与回滚",
+      status: "implemented",
+      evidence: ["/api/apply", "/api/rollback", ".forge/checkpoints"],
+      next: "可继续增强冲突处理和部分应用。"
+    },
+    {
+      area: "验证与修复闭环",
+      status: "implemented",
+      evidence: ["discoverCheckCommands", "runCheckCommands", "generateRepairDiff"],
+      next: "可继续接入 CI 状态和浏览器 E2E。"
+    },
+    {
+      area: "代码审查证据",
+      status: "implemented",
+      evidence: ["/api/review", "/api/reviews", ".forge/reviews"],
+      next: "可继续升级为行级评论和 PR review 输出。"
+    },
+    {
+      area: "Git 隔离",
+      status: git.available ? "implemented" : "partial",
+      evidence: ["/api/worktree", git.available ? git.branch || "git repo" : "当前工作区未检测到 Git"],
+      next: "可继续接入远端 PR 创建和 CI 检查。"
+    },
+    {
+      area: "任务队列",
+      status: "implemented",
+      evidence: ["/api/queue", `${queue.length} 个当前队列项`],
+      next: "可继续支持优先级、自动续跑和并发隔离。"
+    },
+    {
+      area: "可恢复状态",
+      status: "implemented",
+      evidence: [".forge/state/goal.json", goal.phase || "idle"],
+      next: "可继续增加上下文压缩和跨会话摘要。"
+    },
+    {
+      area: "长任务管理",
+      status: "implemented",
+      evidence: ["/api/processes", `${(await listManagedProcesses()).length} 个受管进程`],
+      next: "可继续增加日志搜索和更丰富的健康探针。"
+    },
+    {
+      area: "交付草稿",
+      status: "implemented",
+      evidence: ["/api/handoff", ".forge/handoffs"],
+      next: "可继续接入真实 PR 创建、推送和评论同步。"
+    },
+    {
+      area: "权限与命令策略",
+      status: approvals.length ? "partial" : "implemented",
+      evidence: ["evaluateCommandPolicy", "evaluateProcessPolicy", ".forge/approvals", `${approvals.length} 个近期审批请求`],
+      next: "仍缺完整沙箱和真实升级审批执行；当前已记录被拒绝动作的审计证据。"
+    },
+    {
+      area: "工具生态",
+      status: "partial",
+      evidence: [`内置工具 ${getAgentTools().length} 个`, `本地扩展 ${extensions.summary.total} 个`, `MCP server ${mcp.summary.total} 个`, "/api/tools", "/api/extensions", "/api/mcp"],
+      next: "已暴露本地工具目录、扩展注册表和 MCP server 发现；继续补浏览器和多模态文档工具。"
+    },
+    {
+      area: "外部工具与浏览器自动化",
+      status: "partial",
+      evidence: ["/api/mcp", "未接入 browser automation", "未接入多模态文档/图片工具"],
+      next: "下一步接入浏览器自动化和多模态文件处理。"
+    },
+    {
+      area: "多模态与浏览器执行",
+      status: "partial",
+      evidence: [`资产 ${assets.summary.total} 个`, "/api/assets", "未接入 browser automation", "未接入视觉回归验证"],
+      next: "已补工作区资产索引；继续补浏览器控制、页面截图验证和文档/图片内容解析。"
+    },
+    {
+      area: "浏览器自动化与视觉回归",
+      status: "missing",
+      evidence: ["未接入 browser automation", "未接入页面截图验证", "未接入视觉回归断言"],
+      next: "补本地浏览器控制、截图采样和 UI 视觉 smoke。"
+    },
+    {
+      area: "模型运行层",
+      status: modelRuntime.candidates.length > 1 ? "implemented" : "partial",
+      evidence: [
+        `候选模型：${modelRuntime.candidates.join(", ")}`,
+        modelRuntime.lastModel ? `最近使用：${modelRuntime.lastModel}` : "尚未发起模型请求"
+      ],
+      next: modelRuntime.candidates.length > 1
+        ? "可继续增加流式输出、成本/延迟策略和供应商级路由。"
+        : "可通过 FORGE_MODELS 配置多模型 fallback，后续再增加流式输出和成本/延迟策略。"
+    }
+  ];
+  const summary = capabilities.reduce((acc, item) => {
+    acc[item.status] = (acc[item.status] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary,
+    capabilities,
+    recentEvidence: { tasks, reviews, approvals, extensions: extensions.summary, mcp: mcp.summary, assets: assets.summary, goal }
+  };
+}
+
+function getAgentTools() {
+  return [
+    {
+      type: "function",
+      function: {
+        name: "list_files",
+        description: "列出工作区内可读取的文本文件。",
+        parameters: {
+          type: "object",
+          properties: { limit: { type: "number" } }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "repo_map",
+        description: "获取仓库地图、文件类型统计、package scripts 和符号索引。",
+        parameters: {
+          type: "object",
+          properties: {}
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "读取工作区内某个文本文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            maxChars: { type: "number" }
+          },
+          required: ["path"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_file_range",
+        description: "按行号读取文件片段，适合查看大文件中的局部实现。",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            startLine: { type: "number" },
+            lineCount: { type: "number" }
+          },
+          required: ["path", "startLine"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "search_files",
+        description: "在工作区文本文件中搜索关键词。",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            limit: { type: "number" }
+          },
+          required: ["query"]
+        }
+      }
+    }
+  ];
+}
+
+function buildToolCatalog() {
+  const tools = getAgentTools().map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters,
+    policy: {
+      access: "read-only",
+      scope: "currentWorkspace",
+      source: "builtin"
+    }
+  }));
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      total: tools.length,
+      builtin: tools.length,
+      external: 0
+    },
+    tools,
+    gaps: [
+      "MCP server discovery",
+      "browser automation",
+      "plugin/skill packages",
+      "multimodal document/image tools"
+    ]
+  };
+}
+
+function parseExtensionManifest(raw, source, type) {
+  const manifest = typeof raw === "string" ? JSON.parse(raw) : raw;
+  const name = String(manifest.name || path.basename(source, path.extname(source))).trim();
+  if (!name) throw new Error("extension manifest missing name");
+  return {
+    name,
+    type: manifest.type || type,
+    version: manifest.version || "",
+    description: manifest.description || "",
+    entry: manifest.entry || "",
+    capabilities: Array.isArray(manifest.capabilities) ? manifest.capabilities : [],
+    tools: Array.isArray(manifest.tools) ? manifest.tools : [],
+    policy: {
+      access: manifest.policy?.access || "declared",
+      source: "local-extension",
+      scope: manifest.policy?.scope || "currentWorkspace",
+      requiresApproval: manifest.policy?.requiresApproval !== false
+    },
+    source
+  };
+}
+
+async function listExtensions() {
+  const roots = [
+    { dir: path.join(EXTENSION_DIR, "skills"), type: "skill" },
+    { dir: path.join(EXTENSION_DIR, "plugins"), type: "plugin" }
+  ];
+  const extensions = [];
+  const errors = [];
+  for (const root of roots) {
+    const entries = await fs.readdir(root.dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const manifestPath = entry.isDirectory()
+        ? path.join(root.dir, entry.name, "manifest.json")
+        : entry.isFile() && entry.name.endsWith(".json")
+          ? path.join(root.dir, entry.name)
+          : "";
+      if (!manifestPath) continue;
+      try {
+        const raw = await fs.readFile(manifestPath, "utf8");
+        extensions.push(parseExtensionManifest(raw, toPosix(path.relative(APP_ROOT, manifestPath)), root.type));
+      } catch (error) {
+        errors.push({ source: toPosix(path.relative(APP_ROOT, manifestPath)), error: error.message });
+      }
+    }
+  }
+  const summary = extensions.reduce((acc, extension) => {
+    acc.total += 1;
+    acc[extension.type] = (acc[extension.type] || 0) + 1;
+    return acc;
+  }, { total: 0, skill: 0, plugin: 0 });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    root: toPosix(path.relative(APP_ROOT, EXTENSION_DIR)),
+    summary,
+    extensions,
+    errors,
+    gaps: [
+      "MCP server discovery",
+      "browser automation",
+      "remote extension marketplace",
+      "multimodal document/image tools"
+    ]
+  };
+}
+
+function normalizeMcpServer(name, config = {}, source) {
+  const command = typeof config.command === "string" ? config.command : "";
+  const args = Array.isArray(config.args) ? config.args.map(String) : [];
+  const url = typeof config.url === "string" ? config.url : "";
+  const transport = config.transport || (url ? "http" : "stdio");
+  const env = config.env && typeof config.env === "object" ? Object.keys(config.env).sort() : [];
+  return {
+    name,
+    transport,
+    command,
+    args,
+    url,
+    envKeys: env,
+    disabled: Boolean(config.disabled),
+    source,
+    policy: {
+      access: "configured",
+      source: "mcp",
+      scope: "currentWorkspace",
+      requiresApproval: true
+    },
+    status: config.disabled ? "disabled" : "configured"
+  };
+}
+
+async function readMcpConfigFile(filePath, source) {
+  const raw = await fs.readFile(filePath, "utf8");
+  const parsed = JSON.parse(raw);
+  const candidates = parsed.mcpServers || parsed.servers || parsed;
+  if (!candidates || typeof candidates !== "object" || Array.isArray(candidates)) return [];
+  return Object.entries(candidates)
+    .filter(([, config]) => config && typeof config === "object")
+    .map(([name, config]) => normalizeMcpServer(name, config, source));
+}
+
+async function discoverMcpServers() {
+  const sources = [
+    path.join(MCP_DIR, "servers.json"),
+    path.join(APP_ROOT, ".mcp.json"),
+    path.join(currentWorkspace, ".mcp.json")
+  ];
+  const servers = [];
+  const errors = [];
+  const seen = new Set();
+  for (const filePath of sources) {
+    const source = toPosix(path.relative(APP_ROOT, filePath));
+    try {
+      const discovered = await readMcpConfigFile(filePath, source);
+      for (const server of discovered) {
+        const key = `${server.name}:${server.source}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        servers.push(server);
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        errors.push({ source, error: error.message });
+      }
+    }
+  }
+  const summary = servers.reduce((acc, server) => {
+    acc.total += 1;
+    acc[server.transport] = (acc[server.transport] || 0) + 1;
+    if (server.disabled) acc.disabled += 1;
+    return acc;
+  }, { total: 0, stdio: 0, http: 0, disabled: 0 });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    sources: sources.map((filePath) => toPosix(path.relative(APP_ROOT, filePath))),
+    summary,
+    servers,
+    errors,
+    gaps: [
+      "runtime MCP connection handshake",
+      "resource and tool listing",
+      "browser automation",
+      "multimodal document/image tools"
+    ]
   };
 }
 
@@ -934,29 +1801,54 @@ async function callDeepSeekMessages(messages, tools) {
   if (!apiKey) {
     throw new Error("缺少 DEEPSEEK_API_KEY。请先在环境变量中配置 DeepSeek API Key。");
   }
-  const response = await fetch("https://api.deepseek.com/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      temperature: 0.15,
-      response_format: tools ? undefined : { type: "json_object" },
-      tools,
-      tool_choice: tools ? "auto" : undefined,
-      messages
-    })
-  });
-  if (!response.ok) {
-    const details = await response.text();
-    throw new Error(`DeepSeek 请求失败：${response.status} ${details.slice(0, 500)}`);
+  const fallbacks = [];
+  let lastError = "";
+  for (const model of MODEL_CANDIDATES) {
+    try {
+      const response = await fetch(MODEL_API_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.15,
+          response_format: tools ? undefined : { type: "json_object" },
+          tools,
+          tool_choice: tools ? "auto" : undefined,
+          messages
+        })
+      });
+      if (!response.ok) {
+        const details = await response.text();
+        throw new Error(`${response.status} ${details.slice(0, 500)}`);
+      }
+      const data = await response.json();
+      const message = data.choices?.[0]?.message;
+      if (!message) throw new Error("DeepSeek 没有返回消息。");
+      modelRuntime = {
+        ...modelRuntime,
+        candidates: MODEL_CANDIDATES,
+        lastModel: model,
+        lastFallbacks: fallbacks,
+        lastError: "",
+        lastUsedAt: new Date().toISOString()
+      };
+      return { ...message, _model: model, _fallbacks: fallbacks };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      fallbacks.push({ model, error: lastError });
+    }
   }
-  const data = await response.json();
-  const message = data.choices?.[0]?.message;
-  if (!message) throw new Error("DeepSeek 没有返回消息。");
-  return message;
+  modelRuntime = {
+    ...modelRuntime,
+    candidates: MODEL_CANDIDATES,
+    lastFallbacks: fallbacks,
+    lastError,
+    lastUsedAt: new Date().toISOString()
+  };
+  throw new Error(`模型请求失败：${fallbacks.map((item) => `${item.model}: ${item.error}`).join(" | ")}`);
 }
 
 async function generateRepairDiff({ prompt, applied, checks }) {
@@ -1032,76 +1924,7 @@ async function repairFromFailedCommand({ prompt = "", command = "", result = nul
 async function runAgentLoop(prompt) {
   const files = await listFiles();
   const toolLog = [];
-  const tools = [
-    {
-      type: "function",
-      function: {
-        name: "list_files",
-        description: "列出工作区内可读取的文本文件。",
-        parameters: {
-          type: "object",
-          properties: { limit: { type: "number" } }
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "repo_map",
-        description: "获取仓库地图、文件类型统计、package scripts 和符号索引。",
-        parameters: {
-          type: "object",
-          properties: {}
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "read_file",
-        description: "读取工作区内某个文本文件。",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string" },
-            maxChars: { type: "number" }
-          },
-          required: ["path"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "read_file_range",
-        description: "按行号读取文件片段，适合查看大文件中的局部实现。",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string" },
-            startLine: { type: "number" },
-            lineCount: { type: "number" }
-          },
-          required: ["path", "startLine"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "search_files",
-        description: "在工作区文本文件中搜索关键词。",
-        parameters: {
-          type: "object",
-          properties: {
-            query: { type: "string" },
-            limit: { type: "number" }
-          },
-          required: ["query"]
-        }
-      }
-    }
-  ];
+  const tools = getAgentTools();
 
   const messages = [
     {
@@ -1196,16 +2019,55 @@ async function handleApi(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
     if (req.method === "GET" && url.pathname === "/api/health") {
+      const capabilities = await buildCapabilityAudit();
       return send(res, 200, {
         ok: true,
-        model: MODEL,
+        model: modelRuntime.lastModel || MODEL_CANDIDATES[0] || DEFAULT_MODEL,
+        modelRuntime,
         hasApiKey: Boolean(process.env.DEEPSEEK_API_KEY),
         ...getWorkspaceInfo(),
         checkpoints: await listCheckpoints(),
         git: await getGitSummary(),
         tasks: await listTaskLogs(),
-        queue: await listQueuedTasks()
+        queue: await listQueuedTasks(),
+        reviews: await listReviewArtifacts(),
+        approvals: await listApprovalRequests(),
+        processes: await listManagedProcesses({ probe: true }),
+        tools: buildToolCatalog(),
+        extensions: await listExtensions(),
+        mcp: await discoverMcpServers(),
+        assets: await buildAssetCatalog(),
+        goal: await readGoalState(),
+        capabilities
       });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/capabilities") {
+      return send(res, 200, await buildCapabilityAudit());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/tools") {
+      return send(res, 200, buildToolCatalog());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/extensions") {
+      return send(res, 200, await listExtensions());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/mcp") {
+      return send(res, 200, await discoverMcpServers());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/assets") {
+      return send(res, 200, await buildAssetCatalog());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/approvals") {
+      return send(res, 200, { approvals: await listApprovalRequests() });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/approval") {
+      return send(res, 200, await readApprovalRequest(url.searchParams.get("id") || ""));
     }
 
     if (req.method === "POST" && url.pathname === "/api/workspace") {
@@ -1220,16 +2082,60 @@ async function handleApi(req, res) {
 
     if (req.method === "POST" && url.pathname === "/api/queue") {
       const { prompt = "" } = await readJson(req);
-      return send(res, 200, await enqueueTask(prompt));
+      const item = await enqueueTask(prompt);
+      await writeGoalState({
+        objective: prompt,
+        phase: "queued",
+        status: "queued",
+        lastPrompt: prompt,
+        nextStep: "激活队列任务并运行代理。"
+      });
+      return send(res, 200, item);
     }
 
     if (req.method === "PATCH" && url.pathname === "/api/queue") {
       const { id = "", status = "" } = await readJson(req);
-      return send(res, 200, await updateQueuedTask(id, status));
+      const item = await updateQueuedTask(id, status);
+      await writeGoalState({
+        objective: item.prompt || "",
+        phase: status === "done" ? "completed" : status,
+        status,
+        lastPrompt: item.prompt || "",
+        nextStep: status === "active"
+          ? "运行代理处理当前激活任务。"
+          : status === "done"
+            ? "任务已完成，可查看任务日志或生成交付草稿。"
+            : "继续处理队列任务。"
+      });
+      return send(res, 200, item);
     }
 
     if (req.method === "GET" && url.pathname === "/api/queue") {
       return send(res, 200, { queue: await listQueuedTasks() });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/processes") {
+      return send(res, 200, { processes: await listManagedProcesses({ probe: true }) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/processes") {
+      const { command = "" } = await readJson(req);
+      if (!command || typeof command !== "string") throw new Error("缺少 command。");
+      return send(res, 200, await startManagedProcess(command));
+    }
+
+    if (req.method === "DELETE" && url.pathname === "/api/processes") {
+      const id = url.searchParams.get("id") || "";
+      return send(res, 200, await stopManagedProcess(id));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/reviews") {
+      return send(res, 200, { reviews: await listReviewArtifacts() });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/review-artifact") {
+      const id = url.searchParams.get("id") || "";
+      return send(res, 200, await readReviewArtifact(id));
     }
 
     if (req.method === "GET" && url.pathname === "/api/files") {
@@ -1256,8 +2162,41 @@ async function handleApi(req, res) {
     if (req.method === "POST" && url.pathname === "/api/agent") {
       const { prompt } = await readJson(req);
       if (!prompt || typeof prompt !== "string") throw new Error("缺少 prompt。");
+      await writeGoalState({
+        objective: prompt,
+        phase: "agent_running",
+        status: "running",
+        lastPrompt: prompt,
+        nextStep: "等待代理生成计划、diff、审查发现和建议命令。"
+      });
       const result = await runAgentLoop(prompt);
-      return send(res, 200, { ...result, model: MODEL });
+      await writeGoalState({
+        objective: prompt,
+        phase: result.diff ? "awaiting_approval" : "agent_finished",
+        status: result.diff ? "awaiting_approval" : "needs_attention",
+        lastPrompt: prompt,
+        pendingProposal: result.diff ? {
+          id: `proposal-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+          type: "agent",
+          createdAt: new Date().toISOString(),
+          prompt,
+          reply: result.reply || "",
+          plan: result.plan || [],
+          diff: result.diff || "",
+          patches: result.patches || [],
+          commands: result.commands || [],
+          review: result.review || []
+        } : null,
+        nextStep: result.diff ? "复核 diff 后批准写入。" : "查看代理输出并补充任务要求。"
+      });
+      return send(res, 200, {
+        ...result,
+        model: currentModelName(),
+        modelRuntime: {
+          ...modelRuntime,
+          lastFallbacks: modelRuntime.lastFallbacks.slice(-3)
+        }
+      });
     }
 
     if (req.method === "POST" && url.pathname === "/api/apply") {
@@ -1310,6 +2249,37 @@ async function handleApi(req, res) {
         repairError,
         git
       });
+      await writeGoalState({
+        objective: prompt,
+        phase: status,
+        status,
+        lastPrompt: prompt,
+        lastTaskId: task.id,
+        lastVerification: {
+          ok: verification.ok,
+          skipped: verification.skipped,
+          checkCount: verification.checks.length
+        },
+        pendingProposal: repair?.diff ? {
+          id: `repair-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+          type: "repair",
+          createdAt: new Date().toISOString(),
+          prompt,
+          reply: repair.reply || "",
+          plan: repair.plan || [],
+          diff: repair.diff || "",
+          patches: repair.patches || [],
+          commands: repair.commands || [],
+          review: repair.review || []
+        } : null,
+        nextStep: status === "verified"
+          ? "生成交付草稿或继续下一项任务。"
+          : status === "repair_suggested"
+            ? "审查修复 diff 并再次批准写入。"
+            : status === "applied_unverified"
+              ? "手动运行建议命令或补充检查命令。"
+              : "查看失败输出并生成修复。"
+      });
       return send(res, 200, { applied, checkpoint, verification, repair, repairError, git, task });
     }
 
@@ -1322,7 +2292,7 @@ async function handleApi(req, res) {
     if (req.method === "POST" && url.pathname === "/api/command") {
       const { command } = await readJson(req);
       if (!command || typeof command !== "string") throw new Error("缺少 command。");
-      return send(res, 200, await executeCommand(command));
+      return send(res, 200, await executeUserCommand(command));
     }
 
     if (req.method === "POST" && url.pathname === "/api/repair-command") {
@@ -1376,7 +2346,8 @@ async function runSmokeTest() {
   const repoMap = await buildRepoMap();
   console.log(JSON.stringify({
     ok: true,
-    model: MODEL,
+    model: currentModelName(),
+    modelRuntime,
     hasApiKey: Boolean(process.env.DEEPSEEK_API_KEY),
     ...getWorkspaceInfo(),
     fileCount: context.files.length,
@@ -1406,24 +2377,195 @@ function assertSmoke(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function assertIncludes(source, needle, message) {
+  assertSmoke(source.includes(needle), message || `missing ${needle}`);
+}
+
+async function runUiSmokeTest() {
+  const [html, app, css] = await Promise.all([
+    fs.readFile(path.join(APP_ROOT, "index.html"), "utf8"),
+    fs.readFile(path.join(APP_ROOT, "app.js"), "utf8"),
+    fs.readFile(path.join(APP_ROOT, "styles.css"), "utf8")
+  ]);
+  const htmlIds = [
+    "promptForm",
+    "approveBtn",
+    "reviewBtn",
+    "goalState",
+    "capabilityList",
+    "toolCatalogList",
+    "extensionCatalogList",
+    "mcpCatalogList",
+    "assetCatalogList",
+    "approvalList",
+    "queueList",
+    "processForm",
+    "processList"
+  ];
+  for (const id of htmlIds) {
+    assertIncludes(html, `id="${id}"`, `index.html missing #${id}`);
+    assertIncludes(app, `#${id}`, `app.js missing #${id} binding`);
+  }
+  const appHooks = [
+    "function renderCapabilities",
+    "function renderToolCatalog",
+    "function renderExtensionCatalog",
+    "function renderMcpCatalog",
+    "function renderAssetCatalog",
+    "function renderGoal",
+    "function restorePendingProposal",
+    "function renderApprovals",
+    "function renderProcesses",
+    "/api/health",
+    "/api/tools",
+    "/api/extensions",
+    "/api/mcp",
+    "/api/assets",
+    "/api/approval?id=",
+    "/api/processes"
+  ];
+  for (const hook of appHooks) {
+    assertIncludes(app, hook, `app.js missing ${hook}`);
+  }
+  const cssClasses = [
+    ".capability-list",
+    ".capability-row",
+    ".goal-state",
+    ".process-form",
+    ".queue-row"
+  ];
+  for (const className of cssClasses) {
+    assertIncludes(css, className, `styles.css missing ${className}`);
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    uiSmoke: true,
+    checked: {
+      htmlIds,
+      appHooks,
+      cssClasses
+    }
+  }));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function snapshotApprovalDir() {
+  const entries = await fs.readdir(APPROVAL_DIR, { withFileTypes: true }).catch(() => null);
+  if (!entries) return null;
+  const files = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const content = await fs.readFile(path.join(APPROVAL_DIR, entry.name), "utf8").catch(() => null);
+    if (content !== null) files.push({ name: entry.name, content });
+  }
+  return files;
+}
+
+async function restoreApprovalDir(snapshot) {
+  await fs.rm(APPROVAL_DIR, { recursive: true, force: true }).catch(() => {});
+  if (snapshot === null) return;
+  await fs.mkdir(APPROVAL_DIR, { recursive: true });
+  for (const file of snapshot) {
+    await fs.writeFile(path.join(APPROVAL_DIR, file.name), file.content, "utf8");
+  }
+}
+
 async function runApiSmokeTest() {
+  const originalWorkspace = currentWorkspace;
+  currentWorkspace = APP_ROOT;
+  const originalGoalState = await fs.readFile(GOAL_STATE_PATH, "utf8").catch(() => null);
+  const originalApprovals = await snapshotApprovalDir();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
+  const cleanup = {
+    queuePath: "",
+    handoffPath: "",
+    processFixturePath: "",
+    extensionFixtureDir: "",
+    mcpFixturePath: "",
+    assetFixturePath: "",
+    processId: ""
+  };
   try {
     const health = await requestJson(baseUrl, "/api/health");
     assertSmoke(health.ok === true, "health did not return ok=true");
     assertSmoke(Array.isArray(health.queue), "health did not include queue");
+    assertSmoke(Array.isArray(health.reviews), "health did not include review artifacts");
+    assertSmoke(Array.isArray(health.approvals), "health did not include approval requests");
+    assertSmoke(Array.isArray(health.processes), "health did not include managed processes");
+    assertSmoke(health.goal && typeof health.goal === "object", "health did not include resumable goal state");
+    assertSmoke(Array.isArray(health.capabilities?.capabilities), "health did not include capability audit");
+    assertSmoke(Array.isArray(health.modelRuntime?.candidates), "health did not include model runtime candidates");
+    assertSmoke(Array.isArray(health.tools?.tools), "health did not include tool catalog");
+    assertSmoke(Array.isArray(health.extensions?.extensions), "health did not include extension catalog");
+    assertSmoke(Array.isArray(health.mcp?.servers), "health did not include MCP catalog");
+    assertSmoke(Array.isArray(health.assets?.assets), "health did not include asset catalog");
 
     const files = await requestJson(baseUrl, "/api/files");
     assertSmoke(Array.isArray(files.files), "files did not include file list");
     assertSmoke(files.repoMap && typeof files.repoMap === "object", "files did not include repoMap");
+
+    const capabilities = await requestJson(baseUrl, "/api/capabilities");
+    assertSmoke(capabilities.capabilities.some((item) => item.area === "可恢复状态"), "capabilities endpoint missing resumable state");
+    assertSmoke(capabilities.capabilities.some((item) => item.area === "模型运行层"), "capabilities endpoint missing model runtime layer");
+    assertSmoke(capabilities.capabilities.some((item) => item.status === "missing"), "capabilities endpoint should expose remaining gaps");
+
+    const tools = await requestJson(baseUrl, "/api/tools");
+    assertSmoke(tools.tools.some((item) => item.name === "repo_map"), "tools endpoint missing repo_map");
+    assertSmoke(tools.tools.every((item) => item.policy?.access === "read-only"), "tools endpoint missing read-only policy");
+
+    cleanup.extensionFixtureDir = path.join(EXTENSION_DIR, "skills", "api-smoke-skill");
+    await fs.mkdir(cleanup.extensionFixtureDir, { recursive: true });
+    await fs.writeFile(path.join(cleanup.extensionFixtureDir, "manifest.json"), JSON.stringify({
+      name: "api-smoke-skill",
+      type: "skill",
+      version: "0.0.0",
+      description: "API smoke extension fixture",
+      capabilities: ["smoke-test"],
+      tools: [{ name: "smoke_probe", description: "Fixture tool declaration" }],
+      policy: { access: "read-only", scope: "currentWorkspace", requiresApproval: true }
+    }, null, 2));
+    const extensions = await requestJson(baseUrl, "/api/extensions");
+    assertSmoke(extensions.extensions.some((item) => item.name === "api-smoke-skill"), "extensions endpoint missing fixture skill");
+    assertSmoke(extensions.summary.skill >= 1, "extensions endpoint missing skill summary");
+
+    cleanup.mcpFixturePath = path.join(MCP_DIR, "servers.json");
+    await fs.mkdir(MCP_DIR, { recursive: true });
+    const originalMcpFixture = await fs.readFile(cleanup.mcpFixturePath, "utf8").catch(() => null);
+    if (originalMcpFixture !== null) {
+      cleanup.mcpFixturePath = "";
+      throw new Error("api smoke refused to overwrite existing MCP fixture");
+    }
+    await fs.writeFile(path.join(MCP_DIR, "servers.json"), JSON.stringify({
+      mcpServers: {
+        "api-smoke-mcp": {
+          command: "node",
+          args: ["server.js", "--smoke-test"],
+          env: { API_SMOKE_MCP: "1" }
+        }
+      }
+    }, null, 2));
+    const mcp = await requestJson(baseUrl, "/api/mcp");
+    assertSmoke(mcp.servers.some((item) => item.name === "api-smoke-mcp"), "MCP endpoint missing fixture server");
+    assertSmoke(mcp.summary.stdio >= 1, "MCP endpoint missing stdio summary");
+
+    cleanup.assetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.png`);
+    await fs.writeFile(cleanup.assetFixturePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const assets = await requestJson(baseUrl, "/api/assets");
+    const assetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.assetFixturePath));
+    assertSmoke(assets.assets.some((item) => item.path === assetFixtureName && item.type === "image"), "assets endpoint missing image fixture");
+    assertSmoke(assets.policy?.access === "metadata-only", "assets endpoint missing metadata-only policy");
 
     const queued = await requestJson(baseUrl, "/api/queue", {
       method: "POST",
       body: JSON.stringify({ prompt: "api smoke queued task" })
     });
     assertSmoke(queued.id && queued.status === "queued", "queue create failed");
+    cleanup.queuePath = path.join(QUEUE_DIR, `${queued.id}.json`);
 
     const active = await requestJson(baseUrl, "/api/queue", {
       method: "PATCH",
@@ -1434,6 +2576,70 @@ async function runApiSmokeTest() {
     const queue = await requestJson(baseUrl, "/api/queue");
     assertSmoke(queue.queue.some((item) => item.id === queued.id), "queue list missing created item");
 
+    const queuedHealth = await requestJson(baseUrl, "/api/health");
+    assertSmoke(queuedHealth.goal?.status === "active", "queue activation did not update goal state");
+
+    const reviews = await requestJson(baseUrl, "/api/reviews");
+    assertSmoke(Array.isArray(reviews.reviews), "reviews endpoint did not include artifact list");
+
+    const blockedCommand = await requestJson(baseUrl, "/api/command", {
+      method: "POST",
+      body: JSON.stringify({ command: "curl http://example.com" })
+    });
+    assertSmoke(blockedCommand.blocked === true, "command policy did not block network command");
+    assertSmoke(blockedCommand.policy?.allowed === false, "blocked command missing policy evidence");
+    assertSmoke(blockedCommand.approval?.id, "blocked command missing approval request");
+
+    const processes = await requestJson(baseUrl, "/api/processes");
+    assertSmoke(Array.isArray(processes.processes), "process endpoint did not include process list");
+
+    const blockedProcess = await requestJson(baseUrl, "/api/processes", {
+      method: "POST",
+      body: JSON.stringify({ command: "curl http://example.com" })
+    });
+    assertSmoke(blockedProcess.blocked === true, "process policy did not block network command");
+    assertSmoke(blockedProcess.policy?.allowed === false, "blocked process missing policy evidence");
+    assertSmoke(blockedProcess.approval?.id, "blocked process missing approval request");
+
+    const approvals = await requestJson(baseUrl, "/api/approvals");
+    assertSmoke(approvals.approvals.some((item) => item.id === blockedCommand.approval.id), "approval list missing blocked command");
+    const approvalDetail = await requestJson(baseUrl, `/api/approval?id=${encodeURIComponent(blockedCommand.approval.id)}`);
+    assertSmoke(approvalDetail.policy?.allowed === false, "approval detail missing policy");
+
+    cleanup.processFixturePath = path.join(currentWorkspace, ".forge-process-smoke.js");
+    await fs.writeFile(cleanup.processFixturePath, [
+      "import http from 'node:http';",
+      "const server = http.createServer((req, res) => res.end('forge process smoke'));",
+      "server.listen(0, '127.0.0.1', () => {",
+      "  const { port } = server.address();",
+      "  console.log(`http://127.0.0.1:${port}`);",
+      "  setTimeout(() => server.close(() => process.exit(0)), 1500);",
+      "});",
+      ""
+    ].join("\n"), "utf8");
+    const startedProcess = await requestJson(baseUrl, "/api/processes", {
+      method: "POST",
+      body: JSON.stringify({ command: "node .forge-process-smoke.js" })
+    });
+    assertSmoke(startedProcess.id && ["running", "exited"].includes(startedProcess.status), "managed process did not start");
+    cleanup.processId = startedProcess.id;
+
+    let runningProcess = null;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await sleep(250);
+      const runningProcesses = await requestJson(baseUrl, "/api/processes");
+      runningProcess = runningProcesses.processes.find((item) => item.id === startedProcess.id);
+      if (runningProcess?.probe?.status === "healthy") break;
+    }
+    assertSmoke(runningProcess, "started process missing from process list");
+    assertSmoke(runningProcess.probe?.status === "healthy", "managed process probe did not become healthy");
+
+    const processEntry = managedProcesses.get(startedProcess.id);
+    if (processEntry) await waitForProcessExit(processEntry);
+    const exitedProcesses = await requestJson(baseUrl, "/api/processes");
+    const exitedProcess = exitedProcesses.processes.find((item) => item.id === startedProcess.id);
+    assertSmoke(exitedProcess && exitedProcess.status === "exited", "managed process did not record exit");
+
     const diff = await requestJson(baseUrl, "/api/diff");
     assertSmoke(typeof diff.available === "boolean", "diff endpoint missing availability flag");
 
@@ -1442,21 +2648,44 @@ async function runApiSmokeTest() {
       body: JSON.stringify({ prompt: "api smoke handoff" })
     });
     assertSmoke(handoff.id && handoff.body.includes("## Summary"), "handoff draft failed");
+    cleanup.handoffPath = handoff.path;
 
     console.log(JSON.stringify({
       ok: true,
       apiSmoke: true,
-      checked: ["health", "files", "queue", "diff", "handoff"],
+      checked: ["health", "files", "capabilities", "tools", "extensions", "mcp", "assets", "model-runtime", "queue", "goal-state", "reviews", "approvals", "command-policy", "processes", "process-lifecycle", "diff", "handoff"],
       queueId: queued.id,
       handoffId: handoff.id
     }));
   } finally {
+    if (cleanup.processId) await stopManagedProcess(cleanup.processId).catch(() => {});
+    if (cleanup.processFixturePath) await fs.rm(cleanup.processFixturePath, { force: true }).catch(() => {});
+    if (cleanup.extensionFixtureDir) await fs.rm(cleanup.extensionFixtureDir, { recursive: true, force: true }).catch(() => {});
+    if (cleanup.mcpFixturePath) await fs.rm(cleanup.mcpFixturePath, { force: true }).catch(() => {});
+    if (cleanup.assetFixturePath) await fs.rm(cleanup.assetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.queuePath) await fs.rm(cleanup.queuePath, { force: true }).catch(() => {});
+    if (cleanup.handoffPath) await fs.rm(cleanup.handoffPath, { force: true }).catch(() => {});
+    await restoreApprovalDir(originalApprovals);
+    if (originalGoalState === null) {
+      await fs.rm(GOAL_STATE_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(GOAL_STATE_PATH, originalGoalState, "utf8");
+    }
+    currentWorkspace = originalWorkspace;
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
   }
 }
 
 if (process.argv.includes("--api-smoke-test")) {
   runApiSmokeTest().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+} else if (process.argv.includes("--ui-smoke-test")) {
+  runUiSmokeTest().catch((error) => {
     console.error(error);
     process.exitCode = 1;
   });

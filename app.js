@@ -1,7 +1,9 @@
 const log = document.querySelector("#log");
 const form = document.querySelector("#promptForm");
 const workspaceForm = document.querySelector("#workspaceForm");
+const processForm = document.querySelector("#processForm");
 const workspaceInput = document.querySelector("#workspaceInput");
+const processCommandInput = document.querySelector("#processCommandInput");
 const input = document.querySelector("#promptInput");
 const toast = document.querySelector("#toast");
 const replayBtn = document.querySelector("#replayBtn");
@@ -12,16 +14,21 @@ const refreshFilesBtn = document.querySelector("#refreshFilesBtn");
 const newTaskBtn = document.querySelector("#newTaskBtn");
 const runAgentBtn = document.querySelector("#runAgentBtn");
 const runCommandsBtn = document.querySelector("#runCommandsBtn");
+const startProcessBtn = document.querySelector("#startProcessBtn");
 const worktreeBtn = document.querySelector("#worktreeBtn");
 const reviewBtn = document.querySelector("#reviewBtn");
 const queueBtn = document.querySelector("#queueBtn");
 const handoffBtn = document.querySelector("#handoffBtn");
 const planSteps = document.querySelector("#planSteps");
+const goalState = document.querySelector("#goalState");
 const diffList = document.querySelector("#diffList");
 const diffSummary = document.querySelector("#diffSummary");
 const checksList = document.querySelector("#checksList");
 const reviewList = document.querySelector("#reviewList");
+const reviewArtifactList = document.querySelector("#reviewArtifactList");
+const approvalList = document.querySelector("#approvalList");
 const queueList = document.querySelector("#queueList");
+const processList = document.querySelector("#processList");
 const fileList = document.querySelector("#fileList");
 const repoName = document.querySelector("#repoName");
 const branchName = document.querySelector("#branchName");
@@ -30,6 +37,11 @@ const contextMeter = document.querySelector("#contextMeter");
 const contextText = document.querySelector("#contextText");
 const gitStatus = document.querySelector("#gitStatus");
 const taskList = document.querySelector("#taskList");
+const capabilityList = document.querySelector("#capabilityList");
+const toolCatalogList = document.querySelector("#toolCatalogList");
+const extensionCatalogList = document.querySelector("#extensionCatalogList");
+const mcpCatalogList = document.querySelector("#mcpCatalogList");
+const assetCatalogList = document.querySelector("#assetCatalogList");
 const runState = document.querySelector("#runState");
 
 const state = {
@@ -39,6 +51,7 @@ const state = {
   pendingCommands: [],
   lastPrompt: "",
   checkpoints: [],
+  restoredProposalId: "",
   busy: false
 };
 
@@ -67,6 +80,7 @@ function setBusy(value, label = "待命") {
   approveBtn.disabled = value;
   rollbackBtn.disabled = value;
   runCommandsBtn.disabled = value;
+  if (startProcessBtn) startProcessBtn.disabled = value;
   if (reviewBtn) reviewBtn.disabled = value;
   if (worktreeBtn) worktreeBtn.disabled = value;
   if (queueBtn) queueBtn.disabled = value;
@@ -195,7 +209,11 @@ function renderCommands(commands = []) {
     row.className = "check-row queued command-row";
     row.innerHTML = `<span></span><code></code><small></small>`;
     row.querySelector("code").textContent = command.command || command;
-    row.querySelector("small").textContent = command.reason || "";
+    const policy = command.policy;
+    row.querySelector("small").textContent = [
+      command.reason || "",
+      policy ? `policy: ${policy.risk} · ${policy.reason}` : ""
+    ].filter(Boolean).join(" · ");
     checksList.appendChild(row);
   });
 }
@@ -217,6 +235,36 @@ function renderReview(review = []) {
   });
 }
 
+function renderReviewArtifacts(reviews = []) {
+  if (!reviewArtifactList) return;
+  reviewArtifactList.innerHTML = "";
+  if (!reviews.length) {
+    reviewArtifactList.innerHTML = `<div class="empty-state">暂无历史审查记录。</div>`;
+    return;
+  }
+  reviews.slice(0, 6).forEach((artifact) => {
+    const row = document.createElement("div");
+    row.className = `queue-row ${artifact.findingCount ? "active" : "done"}`;
+    row.innerHTML = `<strong></strong><small></small><button type="button">查看</button>`;
+    row.querySelector("strong").textContent = artifact.summary || artifact.prompt || artifact.id;
+    row.querySelector("small").textContent = `${artifact.findingCount || 0} 条发现 · ${artifact.commandCount || 0} 条命令 · ${artifact.createdAt?.slice(0, 19) || ""}`;
+    row.querySelector("button").addEventListener("click", async () => {
+      try {
+        const detail = await api(`/api/review-artifact?id=${encodeURIComponent(artifact.id)}`);
+        appendToolCall({
+          title: `审查记录：${artifact.id}`,
+          label: "review",
+          state: "完成",
+          body: JSON.stringify(detail, null, 2).slice(0, 12000)
+        });
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+    reviewArtifactList.appendChild(row);
+  });
+}
+
 function renderVerification(verification) {
   if (!verification?.checks?.length) {
     checksList.innerHTML = `
@@ -233,7 +281,10 @@ function renderVerification(verification) {
     row.className = `check-row command-row ${check.exitCode === 0 ? "passed" : "failed"}`;
     row.innerHTML = `<span></span><code></code><small></small>`;
     row.querySelector("code").textContent = check.command;
-    row.querySelector("small").textContent = check.exitCode === 0 ? "通过" : `失败 exit ${check.exitCode}`;
+    row.querySelector("small").textContent = [
+      check.exitCode === 0 ? "通过" : `失败 exit ${check.exitCode}`,
+      check.policy ? `policy: ${check.policy.risk}` : ""
+    ].filter(Boolean).join(" · ");
     checksList.appendChild(row);
   });
 }
@@ -280,6 +331,162 @@ function renderTasks(tasks = []) {
   });
 }
 
+function renderCapabilities(audit) {
+  if (!capabilityList) return;
+  capabilityList.innerHTML = "";
+  const capabilities = audit?.capabilities || [];
+  if (!capabilities.length) {
+    capabilityList.textContent = "暂无能力矩阵";
+    return;
+  }
+  capabilities.slice(0, 8).forEach((capability) => {
+    const row = document.createElement("div");
+    row.className = `capability-row ${capability.status || "partial"}`;
+    row.innerHTML = `<strong></strong><small></small>`;
+    row.querySelector("strong").textContent = capability.area || "能力";
+    row.querySelector("small").textContent = `${capability.status || "unknown"} · ${capability.next || ""}`;
+    row.addEventListener("click", () => {
+      appendToolCall({
+        title: `能力详情：${capability.area}`,
+        label: "audit",
+        state: capability.status || "unknown",
+        body: JSON.stringify(capability, null, 2)
+      });
+    });
+    capabilityList.appendChild(row);
+  });
+}
+
+function renderToolCatalog(catalog) {
+  if (!toolCatalogList) return;
+  toolCatalogList.innerHTML = "";
+  const tools = catalog?.tools || [];
+  if (!tools.length) {
+    toolCatalogList.textContent = "暂无工具目录";
+    return;
+  }
+  tools.slice(0, 8).forEach((tool) => {
+    const row = document.createElement("div");
+    row.className = "capability-row implemented";
+    row.innerHTML = `<strong></strong><small></small>`;
+    row.querySelector("strong").textContent = tool.name || "tool";
+    row.querySelector("small").textContent = `${tool.policy?.access || "unknown"} · ${tool.description || ""}`;
+    row.addEventListener("click", () => {
+      appendToolCall({
+        title: `工具详情：${tool.name}`,
+        label: "tool",
+        state: tool.policy?.source || "builtin",
+        body: JSON.stringify(tool, null, 2)
+      });
+    });
+    toolCatalogList.appendChild(row);
+  });
+}
+
+function renderExtensionCatalog(catalog) {
+  if (!extensionCatalogList) return;
+  extensionCatalogList.innerHTML = "";
+  const extensions = catalog?.extensions || [];
+  if (!extensions.length) {
+    extensionCatalogList.textContent = "暂无本地扩展";
+    return;
+  }
+  extensions.slice(0, 8).forEach((extension) => {
+    const row = document.createElement("div");
+    row.className = "capability-row partial";
+    row.innerHTML = `<strong></strong><small></small>`;
+    row.querySelector("strong").textContent = extension.name || "extension";
+    row.querySelector("small").textContent = `${extension.type || "extension"} · ${extension.policy?.access || "declared"} · ${extension.description || ""}`;
+    row.addEventListener("click", () => {
+      appendToolCall({
+        title: `扩展详情：${extension.name}`,
+        label: "extension",
+        state: extension.type || "local",
+        body: JSON.stringify(extension, null, 2)
+      });
+    });
+    extensionCatalogList.appendChild(row);
+  });
+}
+
+function renderMcpCatalog(catalog) {
+  if (!mcpCatalogList) return;
+  mcpCatalogList.innerHTML = "";
+  const servers = catalog?.servers || [];
+  if (!servers.length) {
+    mcpCatalogList.textContent = "暂无 MCP 配置";
+    return;
+  }
+  servers.slice(0, 8).forEach((server) => {
+    const row = document.createElement("div");
+    row.className = `capability-row ${server.disabled ? "missing" : "partial"}`;
+    row.innerHTML = `<strong></strong><small></small>`;
+    row.querySelector("strong").textContent = server.name || "mcp-server";
+    row.querySelector("small").textContent = `${server.transport || "stdio"} · ${server.status || "configured"} · ${server.source || ""}`;
+    row.addEventListener("click", () => {
+      appendToolCall({
+        title: `MCP 详情：${server.name}`,
+        label: "mcp",
+        state: server.status || "configured",
+        body: JSON.stringify(server, null, 2)
+      });
+    });
+    mcpCatalogList.appendChild(row);
+  });
+}
+
+function renderAssetCatalog(catalog) {
+  if (!assetCatalogList) return;
+  assetCatalogList.innerHTML = "";
+  const assets = catalog?.assets || [];
+  if (!assets.length) {
+    assetCatalogList.textContent = "暂无多模态资产";
+    return;
+  }
+  assets.slice(0, 8).forEach((asset) => {
+    const row = document.createElement("div");
+    row.className = "capability-row partial";
+    row.innerHTML = `<strong></strong><small></small>`;
+    row.querySelector("strong").textContent = asset.path || "asset";
+    row.querySelector("small").textContent = `${asset.type || "asset"} · ${asset.ext || ""} · ${Math.round((asset.size || 0) / 1024)} KB`;
+    row.addEventListener("click", () => {
+      appendToolCall({
+        title: `资产详情：${asset.path}`,
+        label: "asset",
+        state: asset.type || "metadata",
+        body: JSON.stringify(asset, null, 2)
+      });
+    });
+    assetCatalogList.appendChild(row);
+  });
+}
+
+function renderGoal(goal) {
+  if (!goalState) return;
+  const objective = goal?.objective || "暂无目标";
+  const phase = goal?.phase || "idle";
+  const status = goal?.status || "idle";
+  const nextStep = goal?.nextStep || "输入任务并运行代理。";
+  const verification = goal?.lastVerification
+    ? `验证：${goal.lastVerification.skipped ? "跳过" : goal.lastVerification.ok ? "通过" : "失败"} · ${goal.lastVerification.checkCount || 0} 项`
+    : "验证：暂无";
+  goalState.querySelector("p").textContent = objective;
+  goalState.querySelector("small").textContent = `${phase} / ${status} · ${verification} · 下一步：${nextStep}`;
+}
+
+function restorePendingProposal(goal) {
+  const proposal = goal?.pendingProposal;
+  if (!proposal?.diff || proposal.id === state.restoredProposalId || state.pendingDiff) return;
+  state.restoredProposalId = proposal.id;
+  state.lastPrompt = proposal.prompt || goal.lastPrompt || "";
+  state.pendingDiff = proposal.diff || "";
+  renderPlan(proposal.plan || []);
+  renderDiff(proposal.patches || []);
+  renderCommands(proposal.commands || []);
+  renderReview(proposal.review || []);
+  appendMessage("agent", `已恢复待审批方案：${proposal.type === "repair" ? "修复 diff" : "代理 diff"}。`);
+}
+
 function renderQueue(queue = []) {
   if (!queueList) return;
   queueList.innerHTML = "";
@@ -314,17 +521,131 @@ function renderQueue(queue = []) {
   });
 }
 
+function renderProcesses(processes = []) {
+  if (!processList) return;
+  processList.innerHTML = "";
+  if (!processes.length) {
+    processList.innerHTML = `<div class="empty-state">暂无受管进程。</div>`;
+    return;
+  }
+  processes.slice(0, 6).forEach((item) => {
+    const row = document.createElement("div");
+    row.className = `queue-row ${item.status === "running" ? "active" : "done"}`;
+    row.innerHTML = `<strong></strong><small></small><button type="button"></button>`;
+    row.querySelector("strong").textContent = item.command || item.id;
+    row.querySelector("small").textContent = [
+      item.status || "unknown",
+      `pid ${item.pid || "-"}`,
+      `policy: ${item.policy?.risk || "-"}`,
+      item.probe ? `probe: ${item.probe.status} ${item.probe.url}` : ""
+    ].filter(Boolean).join(" · ");
+    const button = row.querySelector("button");
+    button.textContent = item.status === "running" ? "停止" : "输出";
+    button.addEventListener("click", async () => {
+      try {
+        if (item.status === "running") {
+          const stopped = await api(`/api/processes?id=${encodeURIComponent(item.id)}`, { method: "DELETE" });
+          appendToolCall({
+            title: `已停止进程：${item.command}`,
+            label: "proc",
+            state: stopped.status,
+            body: stopped.outputTail || "(无输出)"
+          });
+          await refreshHealth();
+        } else {
+          appendToolCall({
+            title: `进程输出：${item.command}`,
+            label: "proc",
+            state: item.status || "unknown",
+            body: [
+              item.probe ? `probe: ${item.probe.status} · ${item.probe.url}${item.probe.statusCode ? ` · HTTP ${item.probe.statusCode}` : ""}` : "",
+              "",
+              item.outputTail || "(无输出)"
+            ].filter((line) => line !== "").join("\n")
+          });
+        }
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+    processList.appendChild(row);
+  });
+}
+
+function renderApprovals(approvals = []) {
+  if (!approvalList) return;
+  approvalList.innerHTML = "";
+  if (!approvals.length) {
+    approvalList.innerHTML = `<div class="empty-state">暂无审批请求。</div>`;
+    return;
+  }
+  approvals.slice(0, 6).forEach((approval) => {
+    const row = document.createElement("div");
+    row.className = "queue-row failed";
+    row.innerHTML = `<strong></strong><small></small><button type="button">查看</button>`;
+    row.querySelector("strong").textContent = approval.command || approval.type || approval.id;
+    row.querySelector("small").textContent = `${approval.type || "command"} · ${approval.risk || "blocked"} · ${approval.reason || ""}`;
+    row.querySelector("button").addEventListener("click", async () => {
+      try {
+        const detail = await api(`/api/approval?id=${encodeURIComponent(approval.id)}`);
+        appendToolCall({
+          title: `审批请求：${approval.id}`,
+          label: "policy",
+          state: detail.status || "blocked",
+          body: JSON.stringify(detail, null, 2).slice(0, 12000)
+        });
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+    approvalList.appendChild(row);
+  });
+}
+
 async function refreshHealth() {
   const data = await api("/api/health");
   repoName.textContent = data.workspaceName;
-  branchName.textContent = data.hasApiKey ? "DeepSeek：已配置" : "DeepSeek：缺少 DEEPSEEK_API_KEY";
+  const modelLabel = data.modelRuntime?.candidates?.length > 1
+    ? `${data.model} · fallback ${data.modelRuntime.candidates.length}`
+    : data.model || "deepseek-v4-pro";
+  branchName.textContent = data.hasApiKey ? `模型：${modelLabel}` : "DeepSeek：缺少 DEEPSEEK_API_KEY";
   workspaceStatus.textContent = data.workspace;
   workspaceInput.value = data.workspace;
   runState.lastChild.textContent = data.hasApiKey ? "待命" : "缺少密钥";
   renderCheckpoints(data.checkpoints || []);
   renderGit(data.git);
   renderTasks(data.tasks || []);
+  renderCapabilities(data.capabilities);
+  renderToolCatalog(data.tools);
+  renderExtensionCatalog(data.extensions);
+  renderMcpCatalog(data.mcp);
+  renderAssetCatalog(data.assets);
+  renderGoal(data.goal);
+  restorePendingProposal(data.goal);
+  renderReviewArtifacts(data.reviews || []);
+  renderApprovals(data.approvals || []);
   renderQueue(data.queue || []);
+  renderProcesses(data.processes || []);
+}
+
+async function refreshToolCatalog() {
+  const data = await api("/api/tools");
+  renderToolCatalog(data);
+}
+
+async function refreshExtensionCatalog() {
+  const data = await api("/api/extensions");
+  renderExtensionCatalog(data);
+}
+
+async function refreshMcpCatalog() {
+  const data = await api("/api/mcp");
+  renderMcpCatalog(data);
+}
+
+async function refreshAssetCatalog() {
+  const data = await api("/api/assets");
+  renderAssetCatalog(data);
 }
 
 async function refreshFiles() {
@@ -339,6 +660,10 @@ async function refreshFiles() {
 async function refreshAll() {
   try {
     await refreshHealth();
+    await refreshToolCatalog();
+    await refreshExtensionCatalog();
+    await refreshMcpCatalog();
+    await refreshAssetCatalog();
     await refreshFiles();
   } catch (error) {
     runState.lastChild.textContent = "后端离线";
@@ -384,10 +709,18 @@ form.addEventListener("submit", async (event) => {
       .map((item) => `${item.name} ${JSON.stringify(item.args)}`)
       .join("\n");
     appendToolCall({
-      title: "DeepSeek 工具循环完成",
+      title: "模型工具循环完成",
       label: "ai",
       state: "完成",
-      body: `模型：${result.model}\n工具调用：${(result.toolLog || []).length} 次\n建议修改：${result.patches.length} 个文件\n检查命令：${result.commands.length} 条\n审查发现：${(result.review || []).length} 条${toolLogText ? `\n\n${toolLogText}` : ""}`
+      body: [
+        `模型：${result.model}`,
+        `fallback：${(result.modelRuntime?.lastFallbacks || []).length} 次`,
+        `工具调用：${(result.toolLog || []).length} 次`,
+        `建议修改：${result.patches.length} 个文件`,
+        `检查命令：${result.commands.length} 条`,
+        `审查发现：${(result.review || []).length} 条`,
+        toolLogText ? `\n${toolLogText}` : ""
+      ].filter(Boolean).join("\n")
     });
     setBusy(false, "待审批");
   } catch (error) {
@@ -581,10 +914,19 @@ runCommandsBtn.addEventListener("click", async () => {
       appendToolCall({
         title: `命令完成：${command}`,
         label: "$",
-        state: result.exitCode === 0 ? "完成" : "失败",
-        body: result.output || "(无输出)"
+        state: result.exitCode === 0 ? "完成" : result.blocked ? "已拒绝" : "失败",
+        body: [
+          result.policy ? `policy: ${result.policy.risk} · ${result.policy.reason}` : "",
+          result.approval ? `approval: ${result.approval.id}` : "",
+          "",
+          result.output || "(无输出)"
+        ].join("\n").trim()
       });
       if (result.exitCode !== 0) {
+        if (result.blocked) {
+          appendMessage("agent", `命令被安全策略拒绝：${result.policy?.reason || "未通过策略"}`);
+          break;
+        }
         const repair = await api("/api/repair-command", {
           method: "POST",
           body: JSON.stringify({
@@ -622,6 +964,14 @@ reviewBtn?.addEventListener("click", async () => {
     renderReview(result.review || []);
     renderCommands(result.commands || []);
     appendMessage("agent", result.reply || "代码审查完成。");
+    if (result.artifact) {
+      appendToolCall({
+        title: "审查 artifact 已保存",
+        label: "review",
+        state: "完成",
+        body: `id: ${result.artifact.id}\npath: ${result.artifact.path || "(未返回路径)"}\n发现：${result.artifact.findingCount || 0}\n命令：${result.artifact.commandCount || 0}`
+      });
+    }
     appendToolCall({
       title: "当前 Git diff 证据",
       label: "git",
@@ -632,6 +982,7 @@ reviewBtn?.addEventListener("click", async () => {
         (result.evidence?.diff || "").slice(0, 12000)
       ].join("\n")
     });
+    await refreshHealth();
     setBusy(false, "已复核");
   } catch (error) {
     showToast(error.message);
@@ -658,6 +1009,43 @@ handoffBtn?.addEventListener("click", async () => {
     showToast(error.message);
     appendToolCall({ title: "生成交付草稿失败", label: "pr", state: "失败", body: error.message });
     setBusy(false, "生成失败");
+  }
+});
+
+processForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const command = processCommandInput?.value.trim();
+  if (!command) {
+    showToast("请输入要启动的受管进程命令。");
+    return;
+  }
+  setBusy(true, "启动进程");
+  try {
+    const process = await api("/api/processes", {
+      method: "POST",
+      body: JSON.stringify({ command })
+    });
+    appendToolCall({
+      title: process.blocked ? `进程命令已拒绝：${command}` : `已启动受管进程：${command}`,
+      label: "proc",
+      state: process.status || "unknown",
+      body: [
+        process.id ? `id: ${process.id}` : "",
+        process.pid ? `pid: ${process.pid}` : "",
+        process.policy ? `policy: ${process.policy.risk} · ${process.policy.reason}` : "",
+        process.probe ? `probe: ${process.probe.status} · ${process.probe.url}` : "",
+        process.approval ? `approval: ${process.approval.id}` : "",
+        "",
+        process.outputTail || "(暂无输出)"
+      ].filter((line) => line !== "").join("\n")
+    });
+    if (!process.blocked && processCommandInput) processCommandInput.value = "";
+    await refreshHealth();
+    setBusy(false, process.blocked ? "已拒绝" : "已启动");
+  } catch (error) {
+    showToast(error.message);
+    appendToolCall({ title: `启动进程失败：${command}`, label: "proc", state: "失败", body: error.message });
+    setBusy(false, "启动失败");
   }
 });
 

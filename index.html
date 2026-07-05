@@ -74,6 +74,41 @@
           <div id="taskList" class="task-list">等待任务记录</div>
         </section>
 
+        <section class="repo-card parity-card" aria-label="Codex 对标">
+          <div class="section-title compact">
+            <span>Codex 对标</span>
+          </div>
+          <div id="capabilityList" class="capability-list">等待能力矩阵</div>
+        </section>
+
+        <section class="repo-card tool-card" aria-label="工具目录">
+          <div class="section-title compact">
+            <span>工具目录</span>
+          </div>
+          <div id="toolCatalogList" class="capability-list">等待工具目录</div>
+        </section>
+
+        <section class="repo-card extension-card" aria-label="扩展目录">
+          <div class="section-title compact">
+            <span>扩展目录</span>
+          </div>
+          <div id="extensionCatalogList" class="capability-list">等待扩展目录</div>
+        </section>
+
+        <section class="repo-card mcp-card" aria-label="MCP 服务">
+          <div class="section-title compact">
+            <span>MCP 服务</span>
+          </div>
+          <div id="mcpCatalogList" class="capability-list">等待 MCP 配置</div>
+        </section>
+
+        <section class="repo-card asset-card" aria-label="资产目录">
+          <div class="section-title compact">
+            <span>资产目录</span>
+          </div>
+          <div id="assetCatalogList" class="capability-list">等待资产索引</div>
+        </section>
+
         <section class="repo-card files-card" aria-label="工作区文件">
           <div class="section-title compact">
             <span>文件</span>
@@ -134,6 +169,11 @@
             <li>生成修改方案</li>
             <li>审批后应用补丁</li>
           </ol>
+          <div class="goal-state" id="goalState">
+            <strong>可恢复状态</strong>
+            <p>等待任务状态。</p>
+            <small></small>
+          </div>
         </section>
 
         <section class="diff-card">
@@ -163,8 +203,30 @@
           <div id="reviewList" class="review-list">
             <div class="empty-state">审查发现和自动验证结果会显示在这里。</div>
           </div>
+          <div class="section-title compact inline-title">
+            <span>审查记录</span>
+          </div>
+          <div id="reviewArtifactList" class="queue-list">
+            <div class="empty-state">历史审查 artifact 会显示在这里。</div>
+          </div>
+          <div class="section-title compact inline-title">
+            <span>审批请求</span>
+          </div>
+          <div id="approvalList" class="queue-list">
+            <div class="empty-state">被策略拒绝的动作会显示在这里。</div>
+          </div>
           <div id="queueList" class="queue-list">
             <div class="empty-state">任务队列会显示在这里。</div>
+          </div>
+          <div class="section-title compact inline-title">
+            <span>受管进程</span>
+          </div>
+          <form id="processForm" class="process-form">
+            <input id="processCommandInput" type="text" placeholder="npm run dev 或 npm start" />
+            <button type="submit" id="startProcessBtn">启动</button>
+          </form>
+          <div id="processList" class="queue-list">
+            <div class="empty-state">开发服务和长任务会显示在这里。</div>
           </div>
         </section>
       </aside>

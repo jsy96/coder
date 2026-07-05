@@ -8,6 +8,10 @@ PowerShell:
 
 ```powershell
 $env:DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+# 可选：按顺序配置模型 fallback
+$env:FORGE_MODELS="deepseek-v4-pro,deepseek-chat"
+# 可选：指向 DeepSeek-compatible Chat Completions endpoint
+$env:FORGE_MODEL_API_URL="https://api.deepseek.com/chat/completions"
 node server.js
 ```
 
@@ -48,8 +52,10 @@ node server.js
 - 每次写入后会记录任务日志，包括 prompt、checkpoint、修改文件、检查结果、修复建议和 Git 状态。
 - 支持点击任务日志查看完整任务证据；支持基于当前 Git diff 一键复核改动。
 - 支持本地任务队列，可先排队多个 prompt，再逐个激活处理。
+- 支持可恢复目标状态，记录当前目标、阶段、最近验证、待审批 diff 和建议下一步。
 - 支持生成 PR/交付草稿，汇总工作区、分支、改动文件、检查记录、任务证据和 diff。
 - 可以点击“运行建议命令”在工作区内执行白名单内的检查命令。
+- 支持启动、查看和停止受管开发服务进程，例如 `npm run dev`、`npm start`。
 - 支持点击左侧文件列表查看文件内容。
 
 ## Codex 对标进展
@@ -59,11 +65,20 @@ node server.js
 - **审查输出**：模型返回 `review` 数组，前端展示风险、测试缺口和关键验证点。
 - **Git 隔离**：支持读取 Git 分支/改动状态，并在干净仓库中创建 `forge/...` 任务 worktree。
 - **任务证据**：`.forge/tasks` 保存写入、检查和修复证据，便于回看任务历史。
-- **审查闭环**：新增 `/api/review` 和 `/api/diff`，可基于当前 Git diff 输出审查发现和建议检查命令。
+- **审查闭环**：新增 `/api/review`、`/api/reviews`、`/api/review-artifact` 和 `/api/diff`，可基于当前 Git diff 输出审查发现、建议检查命令，并持久化审查 artifact。
 - **任务队列**：新增 `/api/queue`，支持本地排队、激活和完成任务。
+- **可恢复状态**：新增 `.forge/state/goal.json`，健康接口返回当前目标、阶段、最近验证、待审批 proposal 和下一步。
 - **交付草稿**：新增 `/api/handoff`，生成 `.forge/handoffs/*.md` 交付说明。
 - **上下文索引**：新增仓库地图、符号索引和按行读取工具，减少大文件整段读取和误改概率。
-- **安全收口**：命令执行限制在检查类白名单；没有可安全运行的检查命令时标记为 `applied_unverified`，不会误报失败。
+- **安全收口**：命令执行先经过可审计 policy 分类，返回允许/拒绝、风险等级和原因；没有可安全运行的检查命令时标记为 `applied_unverified`，不会误报失败。
+- **审批请求**：被 policy 拒绝的命令和进程会写入 `.forge/approvals`，并在侧栏展示为可查看的审计记录。
+- **长任务管理**：新增 `/api/processes`，可按 policy 启动受管开发服务、识别本地端口、探测健康状态、查看输出尾部并停止进程。
+- **能力矩阵**：新增 `/api/capabilities` 和侧栏“Codex 对标”，展示已实现、部分实现和缺失能力。
+- **工具目录**：新增 `/api/tools` 和侧栏“工具目录”，展示内置 agent 工具、参数 schema 和只读策略。
+- **扩展目录**：新增 `/api/extensions` 和侧栏“扩展目录”，扫描 `.forge/extensions/{skills,plugins}` 下的本地 manifest，展示技能/插件声明、能力和审批策略。
+- **MCP 发现**：新增 `/api/mcp` 和侧栏“MCP 服务”，只读发现 `.forge/mcp/servers.json`、应用根目录 `.mcp.json` 与工作区 `.mcp.json` 中声明的 MCP server。
+- **资产目录**：新增 `/api/assets` 和侧栏“资产目录”，只读索引工作区图片、PDF/Office、CSV/JSONL 和媒体文件的元数据，为多模态处理闭环打底。
+- **模型运行层**：支持 `FORGE_MODELS` 逗号分隔候选模型，模型请求失败时按顺序 fallback，并在健康接口和会话日志记录运行时证据。
 
 ## 本地检查
 
@@ -71,6 +86,7 @@ node server.js
 node --check server.js
 node --check app.js
 node server.js --smoke-test
+node server.js --ui-smoke-test
 node server.js --api-smoke-test
 ```
 
@@ -83,13 +99,16 @@ node server.js --api-smoke-test
 - `.git`、`node_modules`、构建产物和 `.env` 默认不会进入上下文。
 - `.forge/checkpoints` 存储写入前快照，默认不会进入上下文。
 - `.forge/tasks` 存储任务证据，`.forge/worktrees` 存储由界面创建的隔离任务 worktree。
-- `.forge/queue` 存储本地任务队列，`.forge/handoffs` 存储 PR/交付草稿。
-- 命令执行是真实本地执行，但后端只允许检查类命令通过白名单。
+- `.forge/queue` 存储本地任务队列，`.forge/reviews` 存储审查 artifact，`.forge/handoffs` 存储 PR/交付草稿。
+- `.forge/state/goal.json` 存储当前工作区的可恢复目标状态。
+- `.forge/approvals` 存储被命令/进程 policy 拒绝的审批请求审计记录。
+- 命令执行是真实本地执行，但后端会先进行命令 policy 评估，只允许检查/构建类命令通过，并把风险等级和拒绝原因返回给前端。
+- 受管进程同样经过 policy 评估，只允许开发服务类命令；会从命令或输出识别 `localhost` 端口并执行轻量健康探测，输出只保留尾部供界面查看。
 - 创建隔离 worktree 要求当前工作区是 Git 仓库且没有未提交改动；否则会拒绝创建。
 
 ## 文件说明
 
-- `server.js`：零依赖 Node 后端和 DeepSeek 接入。
+- `server.js`：零依赖 Node 后端和 DeepSeek-compatible 模型接入。
 - `index.html`：产品结构。
 - `styles.css`：视觉系统和响应式布局。
 - `app.js`：前端状态管理和 API 调用。
