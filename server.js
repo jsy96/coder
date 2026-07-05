@@ -43,6 +43,8 @@ const GOAL_STATE_PATH = path.join(STATE_DIR, "goal.json");
 const APPROVAL_DIR = path.join(APP_ROOT, ".forge", "approvals");
 const EXTENSION_DIR = path.join(APP_ROOT, ".forge", "extensions");
 const MCP_DIR = path.join(APP_ROOT, ".forge", "mcp");
+const BROWSER_BASELINE_DIR = path.join(APP_ROOT, ".forge", "browser-baselines");
+const BROWSER_SCREENSHOT_DIR = path.join(APP_ROOT, ".forge", "browser-screenshots");
 const SKIP_DIRS = new Set([".git", ".forge", "node_modules", "dist", "build", ".next", ".turbo", "coverage"]);
 const SKIP_FILES = new Set([".env", ".env.local"]);
 const TEXT_EXTS = new Set([
@@ -740,6 +742,272 @@ function waitForProcessExit(entry, timeoutMs = 5000) {
   });
 }
 
+function normalizeLocalBrowserTarget(rawUrl = "") {
+  const value = String(rawUrl || "").trim();
+  if (!value) throw new Error("缺少 url。");
+  const target = new URL(value);
+  if (!["http:", "https:"].includes(target.protocol)) {
+    throw new Error("只允许检查 http/https URL。");
+  }
+  const hostname = target.hostname.toLowerCase();
+  const localHosts = new Set(["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"]);
+  if (!localHosts.has(hostname)) {
+    throw new Error("浏览器检查仅允许本机 URL。");
+  }
+  if (hostname === "0.0.0.0") target.hostname = "127.0.0.1";
+  return target.toString();
+}
+
+function extractHtmlEvidence(html = "") {
+  const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1]
+    ?.replace(/\s+/g, " ")
+    .trim() || "";
+  const headings = [...html.matchAll(/<h([1-3])[^>]*>([\s\S]*?)<\/h\1>/gi)]
+    .slice(0, 12)
+    .map((match) => ({
+      level: Number(match[1]),
+      text: match[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim()
+    }))
+    .filter((item) => item.text);
+  const scripts = (html.match(/<script\b/gi) || []).length;
+  const stylesheets = (html.match(/<link\b[^>]*rel=["']?stylesheet/gi) || []).length;
+  return {
+    title,
+    headings,
+    counts: {
+      scripts,
+      stylesheets,
+      buttons: (html.match(/<button\b/gi) || []).length,
+      forms: (html.match(/<form\b/gi) || []).length,
+      inputs: (html.match(/<input\b/gi) || []).length,
+      images: (html.match(/<img\b/gi) || []).length
+    }
+  };
+}
+
+async function checkBrowserTarget(rawUrl) {
+  const url = normalizeLocalBrowserTarget(rawUrl);
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      signal: controller.signal,
+      headers: { "User-Agent": "Forge-Code-Browser-Check/1.0" }
+    });
+    const contentType = response.headers.get("content-type") || "";
+    const text = await response.text();
+    const html = contentType.includes("text/html") ? extractHtmlEvidence(text.slice(0, 500000)) : extractHtmlEvidence("");
+    return {
+      ok: response.ok,
+      url,
+      finalUrl: response.url,
+      status: response.status,
+      statusText: response.statusText,
+      contentType,
+      bytes: Buffer.byteLength(text),
+      elapsedMs: Date.now() - startedAt,
+      checkedAt: new Date().toISOString(),
+      title: html.title,
+      headings: html.headings,
+      counts: html.counts,
+      policy: {
+        access: "local-url-only",
+        scope: "localhost",
+        screenshots: false,
+        domInteraction: false
+      }
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function browserBaselineId(url) {
+  return Buffer.from(url).toString("base64url").slice(0, 80);
+}
+
+function buildBrowserFingerprint(check) {
+  return {
+    title: check.title || "",
+    status: check.status || 0,
+    contentType: check.contentType || "",
+    headings: (check.headings || []).map((item) => `${item.level}:${item.text}`),
+    counts: check.counts || {}
+  };
+}
+
+function compareBrowserFingerprints(previous, current) {
+  const diffs = [];
+  if ((previous.title || "") !== (current.title || "")) {
+    diffs.push({ field: "title", before: previous.title || "", after: current.title || "" });
+  }
+  if ((previous.status || 0) !== (current.status || 0)) {
+    diffs.push({ field: "status", before: previous.status || 0, after: current.status || 0 });
+  }
+  const previousHeadings = JSON.stringify(previous.headings || []);
+  const currentHeadings = JSON.stringify(current.headings || []);
+  if (previousHeadings !== currentHeadings) {
+    diffs.push({ field: "headings", before: previous.headings || [], after: current.headings || [] });
+  }
+  const keys = new Set([...Object.keys(previous.counts || {}), ...Object.keys(current.counts || {})]);
+  for (const key of [...keys].sort()) {
+    const before = previous.counts?.[key] || 0;
+    const after = current.counts?.[key] || 0;
+    if (before !== after) diffs.push({ field: `counts.${key}`, before, after });
+  }
+  return diffs;
+}
+
+async function compareBrowserBaseline(rawUrl, { update = false, name = "" } = {}) {
+  const check = await checkBrowserTarget(rawUrl);
+  const fingerprint = buildBrowserFingerprint(check);
+  const id = browserBaselineId(check.url);
+  const baselinePath = path.join(BROWSER_BASELINE_DIR, `${id}.json`);
+  const previous = JSON.parse(await fs.readFile(baselinePath, "utf8").catch(() => "null"));
+  const diffs = previous?.fingerprint ? compareBrowserFingerprints(previous.fingerprint, fingerprint) : [];
+  const result = {
+    ok: check.ok && (!previous || diffs.length === 0 || update),
+    status: previous ? (diffs.length ? "changed" : "matched") : "created",
+    id,
+    name: name || previous?.name || check.title || check.url,
+    url: check.url,
+    checkedAt: check.checkedAt,
+    baselinePath: toPosix(path.relative(APP_ROOT, baselinePath)),
+    hasBaseline: Boolean(previous),
+    updated: Boolean(update || !previous),
+    diffs,
+    previous: previous?.fingerprint || null,
+    current: fingerprint,
+    check,
+    policy: {
+      access: "local-url-only",
+      scope: "localhost",
+      screenshots: false,
+      domInteraction: false,
+      baseline: true
+    }
+  };
+  if (update || !previous) {
+    await fs.mkdir(BROWSER_BASELINE_DIR, { recursive: true });
+    await fs.writeFile(baselinePath, JSON.stringify({
+      id,
+      name: result.name,
+      url: check.url,
+      createdAt: previous?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      fingerprint
+    }, null, 2), "utf8");
+  }
+  return result;
+}
+
+async function findBrowserExecutable() {
+  const candidates = [
+    process.env.FORGE_BROWSER_PATH,
+    process.platform === "win32" ? path.join(process.env.ProgramFiles || "", "Google", "Chrome", "Application", "chrome.exe") : "",
+    process.platform === "win32" ? path.join(process.env["ProgramFiles(x86)"] || "", "Google", "Chrome", "Application", "chrome.exe") : "",
+    process.platform === "win32" ? path.join(process.env.ProgramFiles || "", "Microsoft", "Edge", "Application", "msedge.exe") : "",
+    process.platform === "win32" ? path.join(process.env["ProgramFiles(x86)"] || "", "Microsoft", "Edge", "Application", "msedge.exe") : "",
+    process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "",
+    process.platform === "darwin" ? "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" : "",
+    process.platform !== "win32" && process.platform !== "darwin" ? "/usr/bin/google-chrome" : "",
+    process.platform !== "win32" && process.platform !== "darwin" ? "/usr/bin/chromium-browser" : "",
+    process.platform !== "win32" && process.platform !== "darwin" ? "/usr/bin/chromium" : ""
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (await fs.stat(candidate).then((stat) => stat.isFile()).catch(() => false)) return candidate;
+  }
+  return "";
+}
+
+function runBrowserCapture(browserPath, args, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(browserPath, args, { windowsHide: true });
+    let output = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("浏览器截图超时。"));
+    }, timeoutMs);
+    child.stdout?.on("data", (chunk) => { output = `${output}${chunk.toString("utf8")}`.slice(-12000); });
+    child.stderr?.on("data", (chunk) => { output = `${output}${chunk.toString("utf8")}`.slice(-12000); });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve(output);
+      } else {
+        reject(new Error(`浏览器截图失败，exitCode=${code}\n${output}`));
+      }
+    });
+  });
+}
+
+async function captureBrowserScreenshot(rawUrl, { width = 1365, height = 768 } = {}) {
+  const url = normalizeLocalBrowserTarget(rawUrl);
+  const browserPath = await findBrowserExecutable();
+  if (!browserPath) throw new Error("未找到可用的 Edge/Chrome 浏览器。");
+  const safeWidth = Math.min(3840, Math.max(320, Number(width) || 1365));
+  const safeHeight = Math.min(2160, Math.max(240, Number(height) || 768));
+  await fs.mkdir(BROWSER_SCREENSHOT_DIR, { recursive: true });
+  const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${browserBaselineId(url).slice(0, 24)}`;
+  const screenshotPath = path.join(BROWSER_SCREENSHOT_DIR, `${id}.png`);
+  const profilePath = path.join(BROWSER_SCREENSHOT_DIR, `${id}-profile`);
+  const baseArgs = [
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-popup-blocking",
+    "--hide-scrollbars",
+    "--mute-audio",
+    "--no-sandbox",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--allow-insecure-localhost",
+    "--run-all-compositor-stages-before-draw",
+    "--virtual-time-budget=2000",
+    `--user-data-dir=${profilePath}`,
+    `--window-size=${safeWidth},${safeHeight}`,
+    `--screenshot=${screenshotPath}`,
+    url
+  ];
+  try {
+    try {
+      await runBrowserCapture(browserPath, ["--headless=new", ...baseArgs]);
+    } catch (error) {
+      await fs.rm(screenshotPath, { force: true }).catch(() => {});
+      await runBrowserCapture(browserPath, ["--headless", ...baseArgs]);
+    }
+    const stat = await fs.stat(screenshotPath);
+    return {
+      ok: stat.size > 0,
+      id,
+      url,
+      browserPath,
+      path: toPosix(path.relative(APP_ROOT, screenshotPath)),
+      size: stat.size,
+      width: safeWidth,
+      height: safeHeight,
+      capturedAt: new Date().toISOString(),
+      policy: {
+        access: "local-url-only",
+        scope: "localhost",
+        screenshots: true,
+        domInteraction: false
+      }
+    };
+  } finally {
+    await fs.rm(profilePath, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function listManagedProcesses({ probe = false } = {}) {
   const entries = Array.from(managedProcesses.values())
     .filter((entry) => entry.workspace === currentWorkspace)
@@ -1421,8 +1689,8 @@ async function buildCapabilityAudit() {
     {
       area: "外部工具与浏览器自动化",
       status: "partial",
-      evidence: ["/api/mcp", "未接入 browser automation", "未接入多模态文档/图片工具"],
-      next: "下一步接入浏览器自动化和多模态文件处理。"
+      evidence: ["/api/mcp", "/api/browser-check", "未接入完整 browser automation", "未接入多模态文档/图片工具"],
+      next: "已补本地页面检查；继续接入完整浏览器自动化和多模态文件处理。"
     },
     {
       area: "多模态与浏览器执行",
@@ -1432,9 +1700,21 @@ async function buildCapabilityAudit() {
     },
     {
       area: "浏览器自动化与视觉回归",
+      status: "partial",
+      evidence: ["/api/browser-check", "/api/browser-baseline", "/api/browser-screenshot", "本地 URL 状态/标题/结构检查", "页面结构基线对比", "真实浏览器截图产物", "未接入 DOM 交互"],
+      next: "已补页面结构基线和真实浏览器截图；继续补 DOM 交互与像素级断言。"
+    },
+    {
+      area: "真实浏览器交互与截图",
+      status: "partial",
+      evidence: ["/api/browser-screenshot", ".forge/browser-screenshots", "未接入 DOM 点击/输入", "未接入像素级视觉断言"],
+      next: "补浏览器会话控制、交互动作和像素/布局断言。"
+    },
+    {
+      area: "浏览器 DOM 交互",
       status: "missing",
-      evidence: ["未接入 browser automation", "未接入页面截图验证", "未接入视觉回归断言"],
-      next: "补本地浏览器控制、截图采样和 UI 视觉 smoke。"
+      evidence: ["未接入点击/输入/等待选择器", "未接入浏览器会话复用", "未接入交互脚本审计"],
+      next: "补受控 DOM 动作、会话隔离和交互步骤审计。"
     },
     {
       area: "模型运行层",
@@ -2062,6 +2342,21 @@ async function handleApi(req, res) {
       return send(res, 200, await buildAssetCatalog());
     }
 
+    if (req.method === "POST" && url.pathname === "/api/browser-check") {
+      const { url: targetUrl = "" } = await readJson(req);
+      return send(res, 200, await checkBrowserTarget(targetUrl));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/browser-baseline") {
+      const { url: targetUrl = "", update = false, name = "" } = await readJson(req);
+      return send(res, 200, await compareBrowserBaseline(targetUrl, { update: Boolean(update), name }));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/browser-screenshot") {
+      const { url: targetUrl = "", width = 1365, height = 768 } = await readJson(req);
+      return send(res, 200, await captureBrowserScreenshot(targetUrl, { width, height }));
+    }
+
     if (req.method === "GET" && url.pathname === "/api/approvals") {
       return send(res, 200, { approvals: await listApprovalRequests() });
     }
@@ -2400,7 +2695,12 @@ async function runUiSmokeTest() {
     "approvalList",
     "queueList",
     "processForm",
-    "processList"
+    "processList",
+    "browserCheckForm",
+    "browserCheckUrlInput",
+    "browserBaselineBtn",
+    "browserScreenshotBtn",
+    "browserCheckResult"
   ];
   for (const id of htmlIds) {
     assertIncludes(html, `id="${id}"`, `index.html missing #${id}`);
@@ -2416,11 +2716,17 @@ async function runUiSmokeTest() {
     "function restorePendingProposal",
     "function renderApprovals",
     "function renderProcesses",
+    "function renderBrowserCheck",
+    "function renderBrowserBaseline",
+    "function renderBrowserScreenshot",
     "/api/health",
     "/api/tools",
     "/api/extensions",
     "/api/mcp",
     "/api/assets",
+    "/api/browser-check",
+    "/api/browser-baseline",
+    "/api/browser-screenshot",
     "/api/approval?id=",
     "/api/processes"
   ];
@@ -2488,6 +2794,8 @@ async function runApiSmokeTest() {
     extensionFixtureDir: "",
     mcpFixturePath: "",
     assetFixturePath: "",
+    browserBaselinePath: "",
+    browserScreenshotPath: "",
     processId: ""
   };
   try {
@@ -2504,6 +2812,37 @@ async function runApiSmokeTest() {
     assertSmoke(Array.isArray(health.extensions?.extensions), "health did not include extension catalog");
     assertSmoke(Array.isArray(health.mcp?.servers), "health did not include MCP catalog");
     assertSmoke(Array.isArray(health.assets?.assets), "health did not include asset catalog");
+
+    const browserCheck = await requestJson(baseUrl, "/api/browser-check", {
+      method: "POST",
+      body: JSON.stringify({ url: `${baseUrl}/` })
+    });
+    assertSmoke(browserCheck.ok === true, "browser check did not return ok=true for local app");
+    assertSmoke(browserCheck.title, "browser check missing page title");
+    assertSmoke(browserCheck.policy?.access === "local-url-only", "browser check missing local-url-only policy");
+
+    const browserBaseline = await requestJson(baseUrl, "/api/browser-baseline", {
+      method: "POST",
+      body: JSON.stringify({ url: `${baseUrl}/`, name: "api smoke app shell" })
+    });
+    assertSmoke(browserBaseline.ok === true, "browser baseline did not create cleanly");
+    assertSmoke(browserBaseline.updated === true, "browser baseline did not save initial fingerprint");
+    cleanup.browserBaselinePath = path.join(APP_ROOT, browserBaseline.baselinePath);
+    const browserBaselineMatch = await requestJson(baseUrl, "/api/browser-baseline", {
+      method: "POST",
+      body: JSON.stringify({ url: `${baseUrl}/` })
+    });
+    assertSmoke(browserBaselineMatch.status === "matched", "browser baseline did not match saved fingerprint");
+    assertSmoke(browserBaselineMatch.diffs.length === 0, "browser baseline reported unexpected diffs");
+
+    const browserScreenshot = await requestJson(baseUrl, "/api/browser-screenshot", {
+      method: "POST",
+      body: JSON.stringify({ url: `${baseUrl}/`, width: 800, height: 600 })
+    });
+    assertSmoke(browserScreenshot.ok === true, "browser screenshot did not complete");
+    assertSmoke(browserScreenshot.path.endsWith(".png"), "browser screenshot did not return png path");
+    assertSmoke(browserScreenshot.size > 0, "browser screenshot was empty");
+    cleanup.browserScreenshotPath = path.join(APP_ROOT, browserScreenshot.path);
 
     const files = await requestJson(baseUrl, "/api/files");
     assertSmoke(Array.isArray(files.files), "files did not include file list");
@@ -2653,7 +2992,7 @@ async function runApiSmokeTest() {
     console.log(JSON.stringify({
       ok: true,
       apiSmoke: true,
-      checked: ["health", "files", "capabilities", "tools", "extensions", "mcp", "assets", "model-runtime", "queue", "goal-state", "reviews", "approvals", "command-policy", "processes", "process-lifecycle", "diff", "handoff"],
+      checked: ["health", "files", "capabilities", "tools", "extensions", "mcp", "assets", "browser-check", "browser-baseline", "browser-screenshot", "model-runtime", "queue", "goal-state", "reviews", "approvals", "command-policy", "processes", "process-lifecycle", "diff", "handoff"],
       queueId: queued.id,
       handoffId: handoff.id
     }));
@@ -2663,6 +3002,8 @@ async function runApiSmokeTest() {
     if (cleanup.extensionFixtureDir) await fs.rm(cleanup.extensionFixtureDir, { recursive: true, force: true }).catch(() => {});
     if (cleanup.mcpFixturePath) await fs.rm(cleanup.mcpFixturePath, { force: true }).catch(() => {});
     if (cleanup.assetFixturePath) await fs.rm(cleanup.assetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.browserBaselinePath) await fs.rm(cleanup.browserBaselinePath, { force: true }).catch(() => {});
+    if (cleanup.browserScreenshotPath) await fs.rm(cleanup.browserScreenshotPath, { force: true }).catch(() => {});
     if (cleanup.queuePath) await fs.rm(cleanup.queuePath, { force: true }).catch(() => {});
     if (cleanup.handoffPath) await fs.rm(cleanup.handoffPath, { force: true }).catch(() => {});
     await restoreApprovalDir(originalApprovals);

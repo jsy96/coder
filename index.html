@@ -228,6 +228,18 @@
           <div id="processList" class="queue-list">
             <div class="empty-state">开发服务和长任务会显示在这里。</div>
           </div>
+          <div class="section-title compact inline-title">
+            <span>页面检查</span>
+          </div>
+          <form id="browserCheckForm" class="process-form">
+            <input id="browserCheckUrlInput" type="url" placeholder="http://127.0.0.1:4173/" />
+            <button type="submit" id="browserCheckBtn">检查</button>
+            <button type="button" id="browserBaselineBtn">基线</button>
+            <button type="button" id="browserScreenshotBtn">截图</button>
+          </form>
+          <div id="browserCheckResult" class="queue-list">
+            <div class="empty-state">本地页面检查结果会显示在这里。</div>
+          </div>
         </section>
       </aside>
     </div>

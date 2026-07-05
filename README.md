@@ -78,6 +78,9 @@ node server.js
 - **扩展目录**：新增 `/api/extensions` 和侧栏“扩展目录”，扫描 `.forge/extensions/{skills,plugins}` 下的本地 manifest，展示技能/插件声明、能力和审批策略。
 - **MCP 发现**：新增 `/api/mcp` 和侧栏“MCP 服务”，只读发现 `.forge/mcp/servers.json`、应用根目录 `.mcp.json` 与工作区 `.mcp.json` 中声明的 MCP server。
 - **资产目录**：新增 `/api/assets` 和侧栏“资产目录”，只读索引工作区图片、PDF/Office、CSV/JSONL 和媒体文件的元数据，为多模态处理闭环打底。
+- **页面检查**：新增 `/api/browser-check` 和侧栏“页面检查”，仅允许本机 URL，采集状态码、标题、基础 heading/form/button 结构和本地访问策略证据。
+- **页面结构基线**：新增 `/api/browser-baseline` 和“基线”按钮，保存本地页面标题、heading 和 form/button/input/image 计数指纹，并在后续检查中输出结构 diff。
+- **真实页面截图**：新增 `/api/browser-screenshot` 和“截图”按钮，调用本机 Edge/Chrome headless 为本地 URL 生成 PNG 证据，产物保存在 `.forge/browser-screenshots`。
 - **模型运行层**：支持 `FORGE_MODELS` 逗号分隔候选模型，模型请求失败时按顺序 fallback，并在健康接口和会话日志记录运行时证据。
 
 ## 本地检查

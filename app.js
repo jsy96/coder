@@ -2,8 +2,10 @@ const log = document.querySelector("#log");
 const form = document.querySelector("#promptForm");
 const workspaceForm = document.querySelector("#workspaceForm");
 const processForm = document.querySelector("#processForm");
+const browserCheckForm = document.querySelector("#browserCheckForm");
 const workspaceInput = document.querySelector("#workspaceInput");
 const processCommandInput = document.querySelector("#processCommandInput");
+const browserCheckUrlInput = document.querySelector("#browserCheckUrlInput");
 const input = document.querySelector("#promptInput");
 const toast = document.querySelector("#toast");
 const replayBtn = document.querySelector("#replayBtn");
@@ -15,6 +17,8 @@ const newTaskBtn = document.querySelector("#newTaskBtn");
 const runAgentBtn = document.querySelector("#runAgentBtn");
 const runCommandsBtn = document.querySelector("#runCommandsBtn");
 const startProcessBtn = document.querySelector("#startProcessBtn");
+const browserBaselineBtn = document.querySelector("#browserBaselineBtn");
+const browserScreenshotBtn = document.querySelector("#browserScreenshotBtn");
 const worktreeBtn = document.querySelector("#worktreeBtn");
 const reviewBtn = document.querySelector("#reviewBtn");
 const queueBtn = document.querySelector("#queueBtn");
@@ -29,6 +33,7 @@ const reviewArtifactList = document.querySelector("#reviewArtifactList");
 const approvalList = document.querySelector("#approvalList");
 const queueList = document.querySelector("#queueList");
 const processList = document.querySelector("#processList");
+const browserCheckResult = document.querySelector("#browserCheckResult");
 const fileList = document.querySelector("#fileList");
 const repoName = document.querySelector("#repoName");
 const branchName = document.querySelector("#branchName");
@@ -572,6 +577,80 @@ function renderProcesses(processes = []) {
   });
 }
 
+function renderBrowserCheck(result) {
+  if (!browserCheckResult) return;
+  if (!result) {
+    browserCheckResult.innerHTML = `<div class="empty-state">本地页面检查结果会显示在这里。</div>`;
+    return;
+  }
+  browserCheckResult.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
+  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
+  row.querySelector("strong").textContent = result.title || result.finalUrl || result.url || "页面检查";
+  row.querySelector("small").textContent = [
+    `HTTP ${result.status || "-"}`,
+    `${result.elapsedMs || 0}ms`,
+    `${result.counts?.buttons || 0} buttons`,
+    `${result.counts?.forms || 0} forms`
+  ].join(" · ");
+  row.querySelector("button").addEventListener("click", () => {
+    appendToolCall({
+      title: `页面检查：${result.finalUrl || result.url}`,
+      label: "browser",
+      state: result.ok ? "通过" : "失败",
+      body: JSON.stringify(result, null, 2).slice(0, 12000)
+    });
+  });
+  browserCheckResult.appendChild(row);
+}
+
+function renderBrowserBaseline(result) {
+  if (!browserCheckResult) return;
+  browserCheckResult.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
+  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
+  row.querySelector("strong").textContent = result.name || result.url || "页面基线";
+  row.querySelector("small").textContent = [
+    result.status || "unknown",
+    `${result.diffs?.length || 0} diffs`,
+    result.updated ? "baseline saved" : "baseline checked"
+  ].join(" · ");
+  row.querySelector("button").addEventListener("click", () => {
+    appendToolCall({
+      title: `页面基线：${result.url}`,
+      label: "visual",
+      state: result.status || "unknown",
+      body: JSON.stringify(result, null, 2).slice(0, 12000)
+    });
+  });
+  browserCheckResult.appendChild(row);
+}
+
+function renderBrowserScreenshot(result) {
+  if (!browserCheckResult) return;
+  browserCheckResult.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
+  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
+  row.querySelector("strong").textContent = result.path || result.url || "页面截图";
+  row.querySelector("small").textContent = [
+    `${result.width || "-"}x${result.height || "-"}`,
+    `${Math.round((result.size || 0) / 1024)} KB`,
+    result.policy?.screenshots ? "screenshot saved" : "no screenshot"
+  ].join(" · ");
+  row.querySelector("button").addEventListener("click", () => {
+    appendToolCall({
+      title: `页面截图：${result.url}`,
+      label: "visual",
+      state: result.ok ? "完成" : "失败",
+      body: JSON.stringify(result, null, 2).slice(0, 12000)
+    });
+  });
+  browserCheckResult.appendChild(row);
+}
+
 function renderApprovals(approvals = []) {
   if (!approvalList) return;
   approvalList.innerHTML = "";
@@ -1046,6 +1125,88 @@ processForm?.addEventListener("submit", async (event) => {
     showToast(error.message);
     appendToolCall({ title: `启动进程失败：${command}`, label: "proc", state: "失败", body: error.message });
     setBusy(false, "启动失败");
+  }
+});
+
+browserCheckForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const targetUrl = browserCheckUrlInput?.value.trim();
+  if (!targetUrl) {
+    showToast("请输入本地页面 URL。");
+    return;
+  }
+  setBusy(true, "检查页面");
+  try {
+    const result = await api("/api/browser-check", {
+      method: "POST",
+      body: JSON.stringify({ url: targetUrl })
+    });
+    renderBrowserCheck(result);
+    appendToolCall({
+      title: `页面检查：${targetUrl}`,
+      label: "browser",
+      state: result.ok ? "通过" : "失败",
+      body: JSON.stringify(result, null, 2).slice(0, 12000)
+    });
+    setBusy(false, result.ok ? "页面正常" : "页面异常");
+  } catch (error) {
+    showToast(error.message);
+    appendToolCall({ title: `页面检查失败：${targetUrl}`, label: "browser", state: "失败", body: error.message });
+    setBusy(false, "检查失败");
+  }
+});
+
+browserBaselineBtn?.addEventListener("click", async () => {
+  const targetUrl = browserCheckUrlInput?.value.trim();
+  if (!targetUrl) {
+    showToast("请输入本地页面 URL。");
+    return;
+  }
+  setBusy(true, "对比基线");
+  try {
+    const result = await api("/api/browser-baseline", {
+      method: "POST",
+      body: JSON.stringify({ url: targetUrl })
+    });
+    renderBrowserBaseline(result);
+    appendToolCall({
+      title: `页面结构基线：${targetUrl}`,
+      label: "visual",
+      state: result.status || "unknown",
+      body: JSON.stringify(result, null, 2).slice(0, 12000)
+    });
+    setBusy(false, result.ok ? "基线通过" : "基线变化");
+  } catch (error) {
+    showToast(error.message);
+    appendToolCall({ title: `页面基线失败：${targetUrl}`, label: "visual", state: "失败", body: error.message });
+    setBusy(false, "基线失败");
+  }
+});
+
+browserScreenshotBtn?.addEventListener("click", async () => {
+  const targetUrl = browserCheckUrlInput?.value.trim();
+  if (!targetUrl) {
+    showToast("请输入本地页面 URL。");
+    return;
+  }
+  setBusy(true, "生成截图");
+  try {
+    const result = await api("/api/browser-screenshot", {
+      method: "POST",
+      body: JSON.stringify({ url: targetUrl })
+    });
+    renderBrowserScreenshot(result);
+    appendToolCall({
+      title: `页面截图：${targetUrl}`,
+      label: "visual",
+      state: result.ok ? "完成" : "失败",
+      body: JSON.stringify(result, null, 2).slice(0, 12000)
+    });
+    setBusy(false, result.ok ? "截图完成" : "截图失败");
+  } catch (error) {
+    showToast(error.message);
+    appendToolCall({ title: `页面截图失败：${targetUrl}`, label: "visual", state: "失败", body: error.message });
+    setBusy(false, "截图失败");
   }
 });
 
