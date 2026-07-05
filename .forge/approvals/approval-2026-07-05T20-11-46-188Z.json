@@ -1,0 +1,30 @@
+{
+  "id": "approval-2026-07-05T20-11-46-188Z",
+  "workspace": "D:\\cc-picture\\aaa\\coder",
+  "createdAt": "2026-07-05T20:11:46.188Z",
+  "status": "approved",
+  "type": "command",
+  "command": "curl http://example.com",
+  "policy": {
+    "allowed": false,
+    "risk": "blocked",
+    "reason": "包含删除、写入或网络下载类命令，已拒绝。",
+    "command": "curl http://example.com"
+  },
+  "reason": "包含删除、写入或网络下载类命令，已拒绝。",
+  "decidedAt": "2026-07-05T20:11:46.267Z",
+  "decisionNote": "api smoke approval state transition",
+  "execution": {
+    "allowedByApproval": true,
+    "executed": false,
+    "blocked": true,
+    "policy": {
+      "allowed": false,
+      "risk": "blocked",
+      "reason": "包含删除、写入或网络下载类命令，已拒绝。",
+      "command": "curl http://example.com"
+    },
+    "reason": "批准已记录，但命令仍未通过本地命令安全策略，未执行。",
+    "checkedAt": "2026-07-05T20:11:46.291Z"
+  }
+}

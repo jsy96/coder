@@ -1,0 +1,11 @@
+{
+  "id": "2026-07-05T20-11-10-047Z",
+  "prompt": "api smoke next queued task",
+  "workspace": "D:\\cc-picture\\aaa\\coder",
+  "status": "active",
+  "priority": 9,
+  "retryCount": 1,
+  "retryLimit": 1,
+  "createdAt": "2026-07-05T20:11:10.048Z",
+  "updatedAt": "2026-07-05T20:11:10.582Z"
+}

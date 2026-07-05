@@ -43,3 +43,6 @@ scripts/.token_cache
 scripts/*.xlsx
 scripts/notice.txt
 scripts/ai_place_candidates*.json
+
+# bat
+*.bat

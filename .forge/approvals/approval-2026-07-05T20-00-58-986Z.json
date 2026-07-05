@@ -1,0 +1,44 @@
+{
+  "id": "approval-2026-07-05T20-00-58-986Z",
+  "workspace": "D:\\cc-picture\\aaa\\coder",
+  "createdAt": "2026-07-05T20:00:58.986Z",
+  "status": "approved",
+  "type": "mcp_tool_call",
+  "command": "debug-mcp.smoke_tool",
+  "reason": "MCP tool execution requires explicit approval.",
+  "policy": {
+    "allowed": false,
+    "risk": "medium",
+    "reason": "MCP 工具调用可能触发外部能力或写操作，必须先审批。",
+    "requiresApproval": true
+  },
+  "mcp": {
+    "serverName": "debug-mcp",
+    "toolName": "smoke_tool",
+    "arguments": {
+      "value": "approved-call"
+    }
+  },
+  "decidedAt": "2026-07-05T20:00:58.999Z",
+  "decisionNote": "debug",
+  "execution": {
+    "allowedByApproval": true,
+    "executed": true,
+    "blocked": false,
+    "result": {
+      "serverName": "debug-mcp",
+      "toolName": "smoke_tool",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "smoke:smoke_tool:approved-call"
+          }
+        ],
+        "isError": false
+      },
+      "calledAt": "2026-07-05T20:00:59.675Z"
+    },
+    "checkedAt": "2026-07-05T20:00:59.675Z"
+  }
+}

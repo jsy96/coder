@@ -1,0 +1,5266 @@
+{
+  "workspace": "D:\\cc-picture\\aaa\\coder",
+  "generatedAt": "2026-07-05T22:07:33.775Z",
+  "fileCount": 6,
+  "indexedFiles": 4,
+  "summary": {
+    "declarations": 123,
+    "imports": 7,
+    "routes": 2,
+    "selectors": 240,
+    "callEdges": 91
+  },
+  "records": [
+    {
+      "path": "app.js",
+      "language": "js",
+      "imports": [],
+      "exports": [],
+      "declarations": [
+        {
+          "kind": "function",
+          "name": "api",
+          "line": 72
+        },
+        {
+          "kind": "function",
+          "name": "showToast",
+          "line": 84
+        },
+        {
+          "kind": "function",
+          "name": "setBusy",
+          "line": 91
+        },
+        {
+          "kind": "function",
+          "name": "appendMessage",
+          "line": 108
+        },
+        {
+          "kind": "function",
+          "name": "appendToolCall",
+          "line": 117
+        },
+        {
+          "kind": "function",
+          "name": "renderPlan",
+          "line": 136
+        },
+        {
+          "kind": "function",
+          "name": "renderFiles",
+          "line": 148
+        },
+        {
+          "kind": "function",
+          "name": "summarizeRepoMap",
+          "line": 177
+        },
+        {
+          "kind": "function",
+          "name": "renderDiff",
+          "line": 188
+        },
+        {
+          "kind": "function",
+          "name": "renderCheckpoints",
+          "line": 207
+        },
+        {
+          "kind": "function",
+          "name": "renderCommands",
+          "line": 212
+        },
+        {
+          "kind": "function",
+          "name": "renderReview",
+          "line": 238
+        },
+        {
+          "kind": "function",
+          "name": "renderReviewArtifacts",
+          "line": 255
+        },
+        {
+          "kind": "function",
+          "name": "renderVerification",
+          "line": 301
+        },
+        {
+          "kind": "function",
+          "name": "renderGit",
+          "line": 325
+        },
+        {
+          "kind": "function",
+          "name": "renderTasks",
+          "line": 337
+        },
+        {
+          "kind": "function",
+          "name": "renderCapabilities",
+          "line": 367
+        },
+        {
+          "kind": "function",
+          "name": "renderToolCatalog",
+          "line": 393
+        },
+        {
+          "kind": "function",
+          "name": "renderExtensionCatalog",
+          "line": 419
+        },
+        {
+          "kind": "function",
+          "name": "renderMcpCatalog",
+          "line": 445
+        },
+        {
+          "kind": "function",
+          "name": "renderAssetCatalog",
+          "line": 496
+        },
+        {
+          "kind": "function",
+          "name": "renderGoal",
+          "line": 532
+        },
+        {
+          "kind": "function",
+          "name": "restorePendingProposal",
+          "line": 545
+        },
+        {
+          "kind": "function",
+          "name": "renderQueue",
+          "line": 558
+        },
+        {
+          "kind": "function",
+          "name": "renderProcesses",
+          "line": 603
+        },
+        {
+          "kind": "function",
+          "name": "renderBrowserCheck",
+          "line": 654
+        },
+        {
+          "kind": "function",
+          "name": "renderBrowserBaseline",
+          "line": 682
+        },
+        {
+          "kind": "function",
+          "name": "renderBrowserScreenshot",
+          "line": 705
+        },
+        {
+          "kind": "function",
+          "name": "renderBrowserDom",
+          "line": 728
+        },
+        {
+          "kind": "function",
+          "name": "renderBrowserInteract",
+          "line": 751
+        },
+        {
+          "kind": "function",
+          "name": "renderBrowserVisual",
+          "line": 774
+        },
+        {
+          "kind": "function",
+          "name": "renderApprovals",
+          "line": 798
+        },
+        {
+          "kind": "function",
+          "name": "refreshHealth",
+          "line": 880
+        },
+        {
+          "kind": "function",
+          "name": "refreshToolCatalog",
+          "line": 907
+        },
+        {
+          "kind": "function",
+          "name": "refreshExtensionCatalog",
+          "line": 912
+        },
+        {
+          "kind": "function",
+          "name": "refreshMcpCatalog",
+          "line": 917
+        },
+        {
+          "kind": "function",
+          "name": "refreshAssetCatalog",
+          "line": 940
+        },
+        {
+          "kind": "function",
+          "name": "refreshFiles",
+          "line": 945
+        },
+        {
+          "kind": "function",
+          "name": "refreshAll",
+          "line": 957
+        },
+        {
+          "kind": "function",
+          "name": "data",
+          "line": 77
+        },
+        {
+          "kind": "function",
+          "name": "types",
+          "line": 181
+        },
+        {
+          "kind": "function",
+          "name": "toolLogText",
+          "line": 1005
+        },
+        {
+          "kind": "function",
+          "name": "remoteStatus",
+          "line": 1354
+        }
+      ],
+      "calls": [
+        {
+          "name": "querySelector",
+          "line": 1
+        },
+        {
+          "name": "querySelector",
+          "line": 2
+        },
+        {
+          "name": "querySelector",
+          "line": 3
+        },
+        {
+          "name": "querySelector",
+          "line": 4
+        },
+        {
+          "name": "querySelector",
+          "line": 5
+        },
+        {
+          "name": "querySelector",
+          "line": 6
+        },
+        {
+          "name": "querySelector",
+          "line": 7
+        },
+        {
+          "name": "querySelector",
+          "line": 8
+        },
+        {
+          "name": "querySelector",
+          "line": 9
+        },
+        {
+          "name": "querySelector",
+          "line": 10
+        },
+        {
+          "name": "querySelector",
+          "line": 11
+        },
+        {
+          "name": "querySelector",
+          "line": 12
+        },
+        {
+          "name": "querySelector",
+          "line": 13
+        },
+        {
+          "name": "querySelector",
+          "line": 14
+        },
+        {
+          "name": "querySelector",
+          "line": 15
+        },
+        {
+          "name": "querySelector",
+          "line": 16
+        },
+        {
+          "name": "querySelector",
+          "line": 17
+        },
+        {
+          "name": "querySelector",
+          "line": 18
+        },
+        {
+          "name": "querySelector",
+          "line": 19
+        },
+        {
+          "name": "querySelector",
+          "line": 20
+        },
+        {
+          "name": "querySelector",
+          "line": 21
+        },
+        {
+          "name": "querySelector",
+          "line": 22
+        },
+        {
+          "name": "querySelector",
+          "line": 23
+        },
+        {
+          "name": "querySelector",
+          "line": 24
+        },
+        {
+          "name": "querySelector",
+          "line": 25
+        },
+        {
+          "name": "querySelector",
+          "line": 26
+        },
+        {
+          "name": "querySelector",
+          "line": 27
+        },
+        {
+          "name": "querySelector",
+          "line": 28
+        },
+        {
+          "name": "querySelector",
+          "line": 29
+        },
+        {
+          "name": "querySelector",
+          "line": 30
+        },
+        {
+          "name": "querySelector",
+          "line": 31
+        },
+        {
+          "name": "querySelector",
+          "line": 32
+        },
+        {
+          "name": "querySelector",
+          "line": 33
+        },
+        {
+          "name": "querySelector",
+          "line": 34
+        },
+        {
+          "name": "querySelector",
+          "line": 35
+        },
+        {
+          "name": "querySelector",
+          "line": 36
+        },
+        {
+          "name": "querySelector",
+          "line": 37
+        },
+        {
+          "name": "querySelector",
+          "line": 38
+        },
+        {
+          "name": "querySelector",
+          "line": 39
+        },
+        {
+          "name": "querySelector",
+          "line": 40
+        },
+        {
+          "name": "querySelector",
+          "line": 41
+        },
+        {
+          "name": "querySelector",
+          "line": 42
+        },
+        {
+          "name": "querySelector",
+          "line": 43
+        },
+        {
+          "name": "querySelector",
+          "line": 44
+        },
+        {
+          "name": "querySelector",
+          "line": 45
+        },
+        {
+          "name": "querySelector",
+          "line": 46
+        },
+        {
+          "name": "querySelector",
+          "line": 47
+        },
+        {
+          "name": "querySelector",
+          "line": 48
+        },
+        {
+          "name": "querySelector",
+          "line": 49
+        },
+        {
+          "name": "querySelector",
+          "line": 50
+        },
+        {
+          "name": "querySelector",
+          "line": 51
+        },
+        {
+          "name": "querySelector",
+          "line": 52
+        },
+        {
+          "name": "querySelector",
+          "line": 53
+        },
+        {
+          "name": "querySelector",
+          "line": 54
+        },
+        {
+          "name": "querySelector",
+          "line": 55
+        },
+        {
+          "name": "querySelector",
+          "line": 56
+        },
+        {
+          "name": "querySelector",
+          "line": 57
+        },
+        {
+          "name": "querySelector",
+          "line": 58
+        },
+        {
+          "name": "api",
+          "line": 72
+        },
+        {
+          "name": "fetch",
+          "line": 73
+        },
+        {
+          "name": "json",
+          "line": 77
+        },
+        {
+          "name": "Error",
+          "line": 79
+        },
+        {
+          "name": "showToast",
+          "line": 84
+        },
+        {
+          "name": "add",
+          "line": 86
+        },
+        {
+          "name": "clearTimeout",
+          "line": 87
+        },
+        {
+          "name": "setTimeout",
+          "line": 88
+        },
+        {
+          "name": "remove",
+          "line": 88
+        },
+        {
+          "name": "setBusy",
+          "line": 91
+        },
+        {
+          "name": "appendMessage",
+          "line": 108
+        },
+        {
+          "name": "createElement",
+          "line": 109
+        },
+        {
+          "name": "querySelector",
+          "line": 112
+        },
+        {
+          "name": "appendChild",
+          "line": 113
+        },
+        {
+          "name": "appendToolCall",
+          "line": 117
+        },
+        {
+          "name": "createElement",
+          "line": 118
+        },
+        {
+          "name": "querySelector",
+          "line": 128
+        },
+        {
+          "name": "querySelector",
+          "line": 129
+        },
+        {
+          "name": "querySelector",
+          "line": 130
+        },
+        {
+          "name": "querySelector",
+          "line": 131
+        },
+        {
+          "name": "appendChild",
+          "line": 132
+        },
+        {
+          "name": "renderPlan",
+          "line": 136
+        },
+        {
+          "name": "forEach",
+          "line": 140
+        },
+        {
+          "name": "createElement",
+          "line": 141
+        },
+        {
+          "name": "appendChild",
+          "line": 144
+        },
+        {
+          "name": "renderFiles",
+          "line": 148
+        },
+        {
+          "name": "slice",
+          "line": 155
+        },
+        {
+          "name": "forEach",
+          "line": 155
+        },
+        {
+          "name": "createElement",
+          "line": 156
+        },
+        {
+          "name": "addEventListener",
+          "line": 160
+        },
+        {
+          "name": "async",
+          "line": 160
+        },
+        {
+          "name": "api",
+          "line": 162
+        },
+        {
+          "name": "encodeURIComponent",
+          "line": 162
+        },
+        {
+          "name": "appendToolCall",
+          "line": 163
+        },
+        {
+          "name": "slice",
+          "line": 167
+        },
+        {
+          "name": "showToast",
+          "line": 170
+        },
+        {
+          "name": "appendChild",
+          "line": 173
+        },
+        {
+          "name": "summarizeRepoMap",
+          "line": 177
+        },
+        {
+          "name": "keys",
+          "line": 180
+        },
+        {
+          "name": "entries",
+          "line": 181
+        },
+        {
+          "name": "slice",
+          "line": 182
+        },
+        {
+          "name": "map",
+          "line": 183
+        },
+        {
+          "name": "join",
+          "line": 184
+        },
+        {
+          "name": "renderDiff",
+          "line": 188
+        },
+        {
+          "name": "forEach",
+          "line": 197
+        },
+        {
+          "name": "createElement",
+          "line": 198
+        },
+        {
+          "name": "querySelector",
+          "line": 201
+        },
+        {
+          "name": "querySelector",
+          "line": 202
+        },
+        {
+          "name": "appendChild",
+          "line": 203
+        },
+        {
+          "name": "renderCheckpoints",
+          "line": 207
+        },
+        {
+          "name": "slice",
+          "line": 209
+        },
+        {
+          "name": "renderCommands",
+          "line": 212
+        },
+        {
+          "name": "forEach",
+          "line": 224
+        },
+        {
+          "name": "createElement",
+          "line": 225
+        },
+        {
+          "name": "querySelector",
+          "line": 228
+        },
+        {
+          "name": "querySelector",
+          "line": 230
+        },
+        {
+          "name": "filter",
+          "line": 233
+        },
+        {
+          "name": "join",
+          "line": 233
+        },
+        {
+          "name": "appendChild",
+          "line": 234
+        },
+        {
+          "name": "renderReview",
+          "line": 238
+        },
+        {
+          "name": "forEach",
+          "line": 244
+        },
+        {
+          "name": "createElement",
+          "line": 245
+        }
+      ],
+      "selectors": [],
+      "routes": [],
+      "entrypoints": [
+        "app.js"
+      ]
+    },
+    {
+      "path": "index.html",
+      "language": "html",
+      "imports": [],
+      "exports": [],
+      "declarations": [],
+      "calls": [],
+      "selectors": [
+        {
+          "selector": ".shell",
+          "line": 10
+        },
+        {
+          "selector": ".sidebar",
+          "line": 11
+        },
+        {
+          "selector": ".brand",
+          "line": 12
+        },
+        {
+          "selector": ".brand-mark",
+          "line": 13
+        },
+        {
+          "selector": "#newTaskBtn",
+          "line": 20
+        },
+        {
+          "selector": ".new-task",
+          "line": 20
+        },
+        {
+          "selector": ".thread-list",
+          "line": 25
+        },
+        {
+          "selector": ".thread",
+          "line": 26
+        },
+        {
+          "selector": ".active",
+          "line": 26
+        },
+        {
+          "selector": ".status-dot",
+          "line": 27
+        },
+        {
+          "selector": ".live",
+          "line": 27
+        },
+        {
+          "selector": "#workspaceStatus",
+          "line": 30
+        },
+        {
+          "selector": ".thread",
+          "line": 33
+        },
+        {
+          "selector": ".status-dot",
+          "line": 34
+        },
+        {
+          "selector": ".idle",
+          "line": 34
+        },
+        {
+          "selector": ".thread",
+          "line": 40
+        },
+        {
+          "selector": ".status-dot",
+          "line": 41
+        },
+        {
+          "selector": ".idle",
+          "line": 41
+        },
+        {
+          "selector": ".repo-card",
+          "line": 49
+        },
+        {
+          "selector": ".repo-head",
+          "line": 50
+        },
+        {
+          "selector": ".folder",
+          "line": 51
+        },
+        {
+          "selector": "#repoName",
+          "line": 53
+        },
+        {
+          "selector": "#branchName",
+          "line": 54
+        },
+        {
+          "selector": "#workspaceForm",
+          "line": 57
+        },
+        {
+          "selector": ".workspace-form",
+          "line": 57
+        },
+        {
+          "selector": ".sr-only",
+          "line": 58
+        },
+        {
+          "selector": "#workspaceInput",
+          "line": 59
+        },
+        {
+          "selector": "#worktreeBtn",
+          "line": 62
+        },
+        {
+          "selector": ".worktree-btn",
+          "line": 62
+        },
+        {
+          "selector": "#contextSnapshotBtn",
+          "line": 63
+        },
+        {
+          "selector": ".worktree-btn",
+          "line": 63
+        },
+        {
+          "selector": "#semanticIndexBtn",
+          "line": 64
+        },
+        {
+          "selector": ".worktree-btn",
+          "line": 64
+        },
+        {
+          "selector": ".meter",
+          "line": 65
+        },
+        {
+          "selector": "#contextMeter",
+          "line": 66
+        },
+        {
+          "selector": "#contextText",
+          "line": 68
+        },
+        {
+          "selector": "#gitStatus",
+          "line": 69
+        },
+        {
+          "selector": ".repo-meta",
+          "line": 69
+        },
+        {
+          "selector": ".repo-card",
+          "line": 72
+        },
+        {
+          "selector": ".task-card",
+          "line": 72
+        },
+        {
+          "selector": ".section-title",
+          "line": 73
+        },
+        {
+          "selector": ".compact",
+          "line": 73
+        },
+        {
+          "selector": "#taskList",
+          "line": 76
+        },
+        {
+          "selector": ".task-list",
+          "line": 76
+        },
+        {
+          "selector": ".repo-card",
+          "line": 79
+        },
+        {
+          "selector": ".parity-card",
+          "line": 79
+        },
+        {
+          "selector": ".section-title",
+          "line": 80
+        },
+        {
+          "selector": ".compact",
+          "line": 80
+        },
+        {
+          "selector": "#capabilityList",
+          "line": 83
+        },
+        {
+          "selector": ".capability-list",
+          "line": 83
+        },
+        {
+          "selector": ".repo-card",
+          "line": 86
+        },
+        {
+          "selector": ".tool-card",
+          "line": 86
+        },
+        {
+          "selector": ".section-title",
+          "line": 87
+        },
+        {
+          "selector": ".compact",
+          "line": 87
+        },
+        {
+          "selector": "#toolCatalogList",
+          "line": 90
+        },
+        {
+          "selector": ".capability-list",
+          "line": 90
+        },
+        {
+          "selector": ".repo-card",
+          "line": 93
+        },
+        {
+          "selector": ".extension-card",
+          "line": 93
+        },
+        {
+          "selector": ".section-title",
+          "line": 94
+        },
+        {
+          "selector": ".compact",
+          "line": 94
+        },
+        {
+          "selector": "#extensionCatalogList",
+          "line": 97
+        },
+        {
+          "selector": ".capability-list",
+          "line": 97
+        },
+        {
+          "selector": ".repo-card",
+          "line": 100
+        },
+        {
+          "selector": ".mcp-card",
+          "line": 100
+        },
+        {
+          "selector": ".section-title",
+          "line": 101
+        },
+        {
+          "selector": ".compact",
+          "line": 101
+        },
+        {
+          "selector": "#mcpProbeBtn",
+          "line": 103
+        },
+        {
+          "selector": ".ghost-btn",
+          "line": 103
+        },
+        {
+          "selector": "#mcpCatalogList",
+          "line": 105
+        },
+        {
+          "selector": ".capability-list",
+          "line": 105
+        },
+        {
+          "selector": ".repo-card",
+          "line": 108
+        },
+        {
+          "selector": ".asset-card",
+          "line": 108
+        },
+        {
+          "selector": ".section-title",
+          "line": 109
+        },
+        {
+          "selector": ".compact",
+          "line": 109
+        },
+        {
+          "selector": "#assetCatalogList",
+          "line": 112
+        },
+        {
+          "selector": ".capability-list",
+          "line": 112
+        },
+        {
+          "selector": ".repo-card",
+          "line": 115
+        },
+        {
+          "selector": ".files-card",
+          "line": 115
+        },
+        {
+          "selector": ".section-title",
+          "line": 116
+        },
+        {
+          "selector": ".compact",
+          "line": 116
+        },
+        {
+          "selector": "#refreshFilesBtn",
+          "line": 118
+        },
+        {
+          "selector": "#fileList",
+          "line": 120
+        },
+        {
+          "selector": ".file-list",
+          "line": 120
+        },
+        {
+          "selector": ".main",
+          "line": 124
+        },
+        {
+          "selector": ".terminal-panel",
+          "line": 125
+        },
+        {
+          "selector": ".terminal-head",
+          "line": 126
+        },
+        {
+          "selector": ".traffic",
+          "line": 127
+        },
+        {
+          "selector": "#runState",
+          "line": 133
+        },
+        {
+          "selector": ".run-state",
+          "line": 133
+        },
+        {
+          "selector": ".compact",
+          "line": 133
+        },
+        {
+          "selector": ".pulse",
+          "line": 134
+        },
+        {
+          "selector": "#replayBtn",
+          "line": 137
+        },
+        {
+          "selector": "#log",
+          "line": 140
+        },
+        {
+          "selector": ".log",
+          "line": 140
+        },
+        {
+          "selector": ".message",
+          "line": 141
+        },
+        {
+          "selector": ".agent",
+          "line": 141
+        },
+        {
+          "selector": "#promptForm",
+          "line": 147
+        },
+        {
+          "selector": ".prompt-box",
+          "line": 147
+        },
+        {
+          "selector": ".sr-only",
+          "line": 148
+        },
+        {
+          "selector": "#promptInput",
+          "line": 149
+        },
+        {
+          "selector": ".prompt-actions",
+          "line": 150
+        },
+        {
+          "selector": "#attachBtn",
+          "line": 151
+        },
+        {
+          "selector": ".ghost",
+          "line": 151
+        },
+        {
+          "selector": "#queueBtn",
+          "line": 152
+        },
+        {
+          "selector": ".ghost",
+          "line": 152
+        },
+        {
+          "selector": "#runAgentBtn",
+          "line": 153
+        },
+        {
+          "selector": ".inspector",
+          "line": 159
+        },
+        {
+          "selector": ".plan-card",
+          "line": 160
+        },
+        {
+          "selector": ".section-title",
+          "line": 161
+        },
+        {
+          "selector": ".button-row",
+          "line": 163
+        },
+        {
+          "selector": "#prReadinessBtn",
+          "line": 164
+        },
+        {
+          "selector": "#remotePublishPlanBtn",
+          "line": 165
+        },
+        {
+          "selector": "#handoffBtn",
+          "line": 166
+        },
+        {
+          "selector": "#rollbackBtn",
+          "line": 167
+        },
+        {
+          "selector": "#approveBtn",
+          "line": 168
+        },
+        {
+          "selector": "#planSteps",
+          "line": 171
+        },
+        {
+          "selector": ".steps",
+          "line": 171
+        },
+        {
+          "selector": ".active",
+          "line": 172
+        },
+        {
+          "selector": "#goalState",
+          "line": 177
+        },
+        {
+          "selector": ".goal-state",
+          "line": 177
+        }
+      ],
+      "routes": [],
+      "entrypoints": [
+        "index.html"
+      ]
+    },
+    {
+      "path": "server.js",
+      "language": "js",
+      "imports": [
+        {
+          "source": "node:http",
+          "line": 1,
+          "names": [
+            "http"
+          ]
+        },
+        {
+          "source": "node:crypto",
+          "line": 2,
+          "names": [
+            "crypto"
+          ]
+        },
+        {
+          "source": "node:child_process",
+          "line": 3,
+          "names": [
+            "exec",
+            "spawn"
+          ]
+        },
+        {
+          "source": "node:fs",
+          "line": 4,
+          "names": [
+            "promises",
+            "as",
+            "fs"
+          ]
+        },
+        {
+          "source": "node:path",
+          "line": 5,
+          "names": [
+            "path"
+          ]
+        },
+        {
+          "source": "node:url",
+          "line": 6,
+          "names": [
+            "fileURLToPath"
+          ]
+        },
+        {
+          "source": "node:zlib",
+          "line": 7,
+          "names": [
+            "zlib"
+          ]
+        }
+      ],
+      "exports": [],
+      "declarations": [
+        {
+          "kind": "function",
+          "name": "currentModelName",
+          "line": 31
+        },
+        {
+          "kind": "function",
+          "name": "send",
+          "line": 84
+        },
+        {
+          "kind": "function",
+          "name": "sendError",
+          "line": 93
+        },
+        {
+          "kind": "function",
+          "name": "readJson",
+          "line": 97
+        },
+        {
+          "kind": "function",
+          "name": "toPosix",
+          "line": 104
+        },
+        {
+          "kind": "function",
+          "name": "normalizeWorkspacePath",
+          "line": 108
+        },
+        {
+          "kind": "function",
+          "name": "setWorkspace",
+          "line": 140
+        },
+        {
+          "kind": "function",
+          "name": "getWorkspaceInfo",
+          "line": 153
+        },
+        {
+          "kind": "function",
+          "name": "safePath",
+          "line": 161
+        },
+        {
+          "kind": "function",
+          "name": "isTextFile",
+          "line": 175
+        },
+        {
+          "kind": "function",
+          "name": "classifyAsset",
+          "line": 181
+        },
+        {
+          "kind": "function",
+          "name": "listFiles",
+          "line": 190
+        },
+        {
+          "kind": "function",
+          "name": "listSemanticFiles",
+          "line": 208
+        },
+        {
+          "kind": "function",
+          "name": "listAssetFiles",
+          "line": 227
+        },
+        {
+          "kind": "function",
+          "name": "buildAssetCatalog",
+          "line": 252
+        },
+        {
+          "kind": "function",
+          "name": "splitDelimitedLine",
+          "line": 279
+        },
+        {
+          "kind": "function",
+          "name": "extractReadableStrings",
+          "line": 303
+        },
+        {
+          "kind": "function",
+          "name": "decodeXmlEntities",
+          "line": 310
+        },
+        {
+          "kind": "function",
+          "name": "extractXmlText",
+          "line": 319
+        },
+        {
+          "kind": "function",
+          "name": "findEndOfCentralDirectory",
+          "line": 328
+        },
+        {
+          "kind": "function",
+          "name": "readZipEntries",
+          "line": 336
+        },
+        {
+          "kind": "function",
+          "name": "inspectOfficeOpenXml",
+          "line": 371
+        },
+        {
+          "kind": "function",
+          "name": "inspectPdfBuffer",
+          "line": 396
+        },
+        {
+          "kind": "function",
+          "name": "inspectImageBuffer",
+          "line": 411
+        },
+        {
+          "kind": "function",
+          "name": "rgbToHex",
+          "line": 438
+        },
+        {
+          "kind": "function",
+          "name": "summarizeImagePixels",
+          "line": 442
+        },
+        {
+          "kind": "function",
+          "name": "inspectImageVision",
+          "line": 501
+        },
+        {
+          "kind": "function",
+          "name": "inspectImageOcr",
+          "line": 523
+        },
+        {
+          "kind": "function",
+          "name": "inspectWavBuffer",
+          "line": 552
+        },
+        {
+          "kind": "function",
+          "name": "inspectMp4LikeBuffer",
+          "line": 586
+        },
+        {
+          "kind": "function",
+          "name": "inspectMp3Buffer",
+          "line": 603
+        },
+        {
+          "kind": "function",
+          "name": "inspectMediaBuffer",
+          "line": 623
+        },
+        {
+          "kind": "function",
+          "name": "inspectMediaTools",
+          "line": 641
+        },
+        {
+          "kind": "function",
+          "name": "inspectMediaTranscription",
+          "line": 662
+        },
+        {
+          "kind": "function",
+          "name": "inspectAsset",
+          "line": 713
+        },
+        {
+          "kind": "function",
+          "name": "readWorkspaceFile",
+          "line": 817
+        },
+        {
+          "kind": "function",
+          "name": "readWorkspaceFileRange",
+          "line": 822
+        },
+        {
+          "kind": "function",
+          "name": "searchFiles",
+          "line": 833
+        },
+        {
+          "kind": "function",
+          "name": "extractSymbols",
+          "line": 856
+        },
+        {
+          "kind": "function",
+          "name": "findLineNumber",
+          "line": 892
+        },
+        {
+          "kind": "function",
+          "name": "uniqueLimited",
+          "line": 901
+        },
+        {
+          "kind": "function",
+          "name": "extractSemanticSignals",
+          "line": 905
+        },
+        {
+          "kind": "function",
+          "name": "buildSemanticIndex",
+          "line": 1008
+        },
+        {
+          "kind": "function",
+          "name": "readSemanticIndex",
+          "line": 1055
+        },
+        {
+          "kind": "function",
+          "name": "semanticMatch",
+          "line": 1063
+        },
+        {
+          "kind": "function",
+          "name": "searchSemanticIndex",
+          "line": 1067
+        },
+        {
+          "kind": "function",
+          "name": "attachReferenceContext",
+          "line": 1126
+        },
+        {
+          "kind": "function",
+          "name": "buildSemanticReferences",
+          "line": 1144
+        },
+        {
+          "kind": "function",
+          "name": "buildRepoMap",
+          "line": 1193
+        },
+        {
+          "kind": "function",
+          "name": "collectContext",
+          "line": 1217
+        },
+        {
+          "kind": "function",
+          "name": "buildContextSnapshot",
+          "line": 1231
+        },
+        {
+          "kind": "function",
+          "name": "readContextSnapshot",
+          "line": 1312
+        },
+        {
+          "kind": "function",
+          "name": "parseUnifiedDiff",
+          "line": 1318
+        },
+        {
+          "kind": "function",
+          "name": "applyUnifiedDiffToContent",
+          "line": 1361
+        },
+        {
+          "kind": "function",
+          "name": "previewUnifiedDiff",
+          "line": 1394
+        },
+        {
+          "kind": "function",
+          "name": "renderSingleFileDiff",
+          "line": 1409
+        },
+        {
+          "kind": "function",
+          "name": "createCheckpoint",
+          "line": 1420
+        },
+        {
+          "kind": "function",
+          "name": "listCheckpoints",
+          "line": 1440
+        },
+        {
+          "kind": "function",
+          "name": "rollbackCheckpoint",
+          "line": 1455
+        },
+        {
+          "kind": "function",
+          "name": "evaluateCommandPolicy",
+          "line": 1474
+        },
+        {
+          "kind": "function",
+          "name": "isSafeCommand",
+          "line": 1496
+        },
+        {
+          "kind": "function",
+          "name": "evaluateProcessPolicy",
+          "line": 1500
+        },
+        {
+          "kind": "function",
+          "name": "readPackageScripts",
+          "line": 1514
+        },
+        {
+          "kind": "function",
+          "name": "extractSafeScriptCommands",
+          "line": 1520
+        },
+        {
+          "kind": "function",
+          "name": "packageScriptNameFromCommand",
+          "line": 1529
+        },
+        {
+          "kind": "function",
+          "name": "discoverCheckCommands",
+          "line": 1537
+        },
+        {
+          "kind": "function",
+          "name": "executeCommand",
+          "line": 1580
+        },
+        {
+          "kind": "function",
+          "name": "executeUserCommand",
+          "line": 1604
+        },
+        {
+          "kind": "function",
+          "name": "summarizeManagedProcess",
+          "line": 1624
+        },
+        {
+          "kind": "function",
+          "name": "inferProcessProbe",
+          "line": 1640
+        },
+        {
+          "kind": "function",
+          "name": "probeManagedProcess",
+          "line": 1658
+        },
+        {
+          "kind": "function",
+          "name": "waitForProcessExit",
+          "line": 1688
+        },
+        {
+          "kind": "function",
+          "name": "normalizeLocalBrowserTarget",
+          "line": 1699
+        },
+        {
+          "kind": "function",
+          "name": "extractHtmlEvidence",
+          "line": 1715
+        },
+        {
+          "kind": "function",
+          "name": "checkBrowserTarget",
+          "line": 1742
+        },
+        {
+          "kind": "function",
+          "name": "browserBaselineId",
+          "line": 1781
+        },
+        {
+          "kind": "function",
+          "name": "hashBuffer",
+          "line": 1785
+        },
+        {
+          "kind": "function",
+          "name": "buildBrowserFingerprint",
+          "line": 1789
+        },
+        {
+          "kind": "function",
+          "name": "compareBrowserFingerprints",
+          "line": 1799
+        },
+        {
+          "kind": "function",
+          "name": "compareBrowserBaseline",
+          "line": 1821
+        }
+      ],
+      "calls": [
+        {
+          "name": "fileURLToPath",
+          "line": 9
+        },
+        {
+          "name": "dirname",
+          "line": 10
+        },
+        {
+          "name": "resolve",
+          "line": 12
+        },
+        {
+          "name": "Number",
+          "line": 14
+        },
+        {
+          "name": "split",
+          "line": 18
+        },
+        {
+          "name": "map",
+          "line": 19
+        },
+        {
+          "name": "trim",
+          "line": 19
+        },
+        {
+          "name": "filter",
+          "line": 20
+        },
+        {
+          "name": "currentModelName",
+          "line": 31
+        },
+        {
+          "name": "join",
+          "line": 38
+        },
+        {
+          "name": "join",
+          "line": 39
+        },
+        {
+          "name": "join",
+          "line": 40
+        },
+        {
+          "name": "join",
+          "line": 41
+        },
+        {
+          "name": "join",
+          "line": 42
+        },
+        {
+          "name": "join",
+          "line": 43
+        },
+        {
+          "name": "join",
+          "line": 44
+        },
+        {
+          "name": "join",
+          "line": 45
+        },
+        {
+          "name": "join",
+          "line": 46
+        },
+        {
+          "name": "join",
+          "line": 47
+        },
+        {
+          "name": "join",
+          "line": 48
+        },
+        {
+          "name": "join",
+          "line": 49
+        },
+        {
+          "name": "join",
+          "line": 50
+        },
+        {
+          "name": "join",
+          "line": 51
+        },
+        {
+          "name": "join",
+          "line": 52
+        },
+        {
+          "name": "join",
+          "line": 53
+        },
+        {
+          "name": "Set",
+          "line": 54
+        },
+        {
+          "name": "Set",
+          "line": 55
+        },
+        {
+          "name": "Set",
+          "line": 56
+        },
+        {
+          "name": "Set",
+          "line": 61
+        },
+        {
+          "name": "Set",
+          "line": 62
+        },
+        {
+          "name": "Set",
+          "line": 63
+        },
+        {
+          "name": "Set",
+          "line": 64
+        },
+        {
+          "name": "npm",
+          "line": 67
+        },
+        {
+          "name": "test",
+          "line": 68
+        },
+        {
+          "name": "pnpm",
+          "line": 69
+        },
+        {
+          "name": "yarn",
+          "line": 70
+        },
+        {
+          "name": "npm",
+          "line": 76
+        },
+        {
+          "name": "pnpm",
+          "line": 77
+        },
+        {
+          "name": "yarn",
+          "line": 78
+        },
+        {
+          "name": "Map",
+          "line": 82
+        },
+        {
+          "name": "send",
+          "line": 84
+        },
+        {
+          "name": "stringify",
+          "line": 85
+        },
+        {
+          "name": "writeHead",
+          "line": 86
+        },
+        {
+          "name": "end",
+          "line": 90
+        },
+        {
+          "name": "sendError",
+          "line": 93
+        },
+        {
+          "name": "send",
+          "line": 94
+        },
+        {
+          "name": "String",
+          "line": 94
+        },
+        {
+          "name": "readJson",
+          "line": 97
+        },
+        {
+          "name": "await",
+          "line": 99
+        },
+        {
+          "name": "push",
+          "line": 99
+        },
+        {
+          "name": "parse",
+          "line": 101
+        },
+        {
+          "name": "concat",
+          "line": 101
+        },
+        {
+          "name": "toString",
+          "line": 101
+        },
+        {
+          "name": "toPosix",
+          "line": 104
+        },
+        {
+          "name": "replaceAll",
+          "line": 105
+        },
+        {
+          "name": "replace",
+          "line": 105
+        },
+        {
+          "name": "normalizeWorkspacePath",
+          "line": 108
+        },
+        {
+          "name": "String",
+          "line": 109
+        },
+        {
+          "name": "trim",
+          "line": 109
+        },
+        {
+          "name": "replace",
+          "line": 109
+        },
+        {
+          "name": "replace",
+          "line": 110
+        },
+        {
+          "name": "replace",
+          "line": 110
+        },
+        {
+          "name": "replaceAll",
+          "line": 111
+        },
+        {
+          "name": "replace",
+          "line": 111
+        },
+        {
+          "name": "replace",
+          "line": 112
+        },
+        {
+          "name": "replaceAll",
+          "line": 116
+        },
+        {
+          "name": "toLowerCase",
+          "line": 117
+        },
+        {
+          "name": "toLowerCase",
+          "line": 118
+        },
+        {
+          "name": "startsWith",
+          "line": 120
+        },
+        {
+          "name": "toPosix",
+          "line": 121
+        },
+        {
+          "name": "relative",
+          "line": 121
+        },
+        {
+          "name": "resolve",
+          "line": 121
+        },
+        {
+          "name": "test",
+          "line": 124
+        },
+        {
+          "name": "startsWith",
+          "line": 124
+        },
+        {
+          "name": "resolve",
+          "line": 125
+        },
+        {
+          "name": "toLowerCase",
+          "line": 126
+        },
+        {
+          "name": "toLowerCase",
+          "line": 127
+        },
+        {
+          "name": "startsWith",
+          "line": 128
+        },
+        {
+          "name": "Error",
+          "line": 129
+        },
+        {
+          "name": "toPosix",
+          "line": 131
+        },
+        {
+          "name": "relative",
+          "line": 131
+        },
+        {
+          "name": "replace",
+          "line": 134
+        },
+        {
+          "name": "normalize",
+          "line": 135
+        },
+        {
+          "name": "replace",
+          "line": 135
+        },
+        {
+          "name": "replace",
+          "line": 136
+        },
+        {
+          "name": "setWorkspace",
+          "line": 140
+        },
+        {
+          "name": "Error",
+          "line": 142
+        },
+        {
+          "name": "resolve",
+          "line": 144
+        },
+        {
+          "name": "stat",
+          "line": 145
+        },
+        {
+          "name": "isDirectory",
+          "line": 146
+        },
+        {
+          "name": "Error",
+          "line": 147
+        },
+        {
+          "name": "getWorkspaceInfo",
+          "line": 150
+        },
+        {
+          "name": "getWorkspaceInfo",
+          "line": 153
+        },
+        {
+          "name": "basename",
+          "line": 156
+        },
+        {
+          "name": "safePath",
+          "line": 161
+        },
+        {
+          "name": "normalizeWorkspacePath",
+          "line": 162
+        },
+        {
+          "name": "Error",
+          "line": 164
+        },
+        {
+          "name": "resolve",
+          "line": 166
+        },
+        {
+          "name": "toLowerCase",
+          "line": 167
+        },
+        {
+          "name": "toLowerCase",
+          "line": 168
+        },
+        {
+          "name": "startsWith",
+          "line": 169
+        },
+        {
+          "name": "Error",
+          "line": 170
+        },
+        {
+          "name": "isTextFile",
+          "line": 175
+        },
+        {
+          "name": "has",
+          "line": 176
+        },
+        {
+          "name": "extname",
+          "line": 177
+        },
+        {
+          "name": "toLowerCase",
+          "line": 177
+        },
+        {
+          "name": "has",
+          "line": 178
+        },
+        {
+          "name": "includes",
+          "line": 178
+        },
+        {
+          "name": "classifyAsset",
+          "line": 181
+        },
+        {
+          "name": "extname",
+          "line": 182
+        },
+        {
+          "name": "toLowerCase",
+          "line": 182
+        },
+        {
+          "name": "has",
+          "line": 183
+        },
+        {
+          "name": "has",
+          "line": 184
+        },
+        {
+          "name": "has",
+          "line": 185
+        },
+        {
+          "name": "has",
+          "line": 186
+        },
+        {
+          "name": "listFiles",
+          "line": 190
+        },
+        {
+          "name": "readdir",
+          "line": 191
+        },
+        {
+          "name": "isDirectory",
+          "line": 194
+        },
+        {
+          "name": "has",
+          "line": 195
+        },
+        {
+          "name": "push",
+          "line": 196
+        }
+      ],
+      "selectors": [],
+      "routes": [
+        {
+          "method": "FETCH",
+          "path": "http://127.0.0.1:${port}/json/list",
+          "line": 2116
+        },
+        {
+          "method": "FETCH",
+          "path": "${baseUrl}${route}",
+          "line": 5974
+        }
+      ],
+      "entrypoints": [
+        "server.js"
+      ]
+    },
+    {
+      "path": "styles.css",
+      "language": "css",
+      "imports": [],
+      "exports": [],
+      "declarations": [],
+      "calls": [
+        {
+          "name": "rgba",
+          "line": 7
+        },
+        {
+          "name": "rgba",
+          "line": 14
+        },
+        {
+          "name": "rgba",
+          "line": 17
+        },
+        {
+          "name": "var",
+          "line": 37
+        },
+        {
+          "name": "gradient",
+          "line": 39
+        },
+        {
+          "name": "rgba",
+          "line": 39
+        },
+        {
+          "name": "gradient",
+          "line": 40
+        },
+        {
+          "name": "rgba",
+          "line": 40
+        },
+        {
+          "name": "gradient",
+          "line": 41
+        },
+        {
+          "name": "rgba",
+          "line": 41
+        },
+        {
+          "name": "gradient",
+          "line": 42
+        },
+        {
+          "name": "var",
+          "line": 43
+        },
+        {
+          "name": "var",
+          "line": 44
+        },
+        {
+          "name": "gradient",
+          "line": 60
+        },
+        {
+          "name": "rgba",
+          "line": 60
+        },
+        {
+          "name": "gradient",
+          "line": 61
+        },
+        {
+          "name": "rgba",
+          "line": 61
+        },
+        {
+          "name": "gradient",
+          "line": 63
+        },
+        {
+          "name": "gradient",
+          "line": 69
+        },
+        {
+          "name": "rgba",
+          "line": 69
+        },
+        {
+          "name": "gradient",
+          "line": 70
+        },
+        {
+          "name": "rgba",
+          "line": 70
+        },
+        {
+          "name": "rgba",
+          "line": 92
+        },
+        {
+          "name": "rgba",
+          "line": 103
+        },
+        {
+          "name": "minmax",
+          "line": 129
+        },
+        {
+          "name": "var",
+          "line": 139
+        },
+        {
+          "name": "gradient",
+          "line": 141
+        },
+        {
+          "name": "rgba",
+          "line": 141
+        },
+        {
+          "name": "rgba",
+          "line": 141
+        },
+        {
+          "name": "rgba",
+          "line": 142
+        },
+        {
+          "name": "rgba",
+          "line": 143
+        },
+        {
+          "name": "blur",
+          "line": 144
+        },
+        {
+          "name": "var",
+          "line": 153
+        },
+        {
+          "name": "var",
+          "line": 165
+        },
+        {
+          "name": "var",
+          "line": 165
+        },
+        {
+          "name": "gradient",
+          "line": 166
+        },
+        {
+          "name": "rgba",
+          "line": 166
+        },
+        {
+          "name": "rgba",
+          "line": 166
+        },
+        {
+          "name": "var",
+          "line": 189
+        },
+        {
+          "name": "gradient",
+          "line": 192
+        },
+        {
+          "name": "rgba",
+          "line": 194
+        },
+        {
+          "name": "rgba",
+          "line": 195
+        },
+        {
+          "name": "var",
+          "line": 196
+        },
+        {
+          "name": "var",
+          "line": 197
+        },
+        {
+          "name": "var",
+          "line": 210
+        },
+        {
+          "name": "var",
+          "line": 211
+        },
+        {
+          "name": "var",
+          "line": 221
+        },
+        {
+          "name": "var",
+          "line": 222
+        },
+        {
+          "name": "var",
+          "line": 232
+        },
+        {
+          "name": "gradient",
+          "line": 234
+        },
+        {
+          "name": "var",
+          "line": 234
+        },
+        {
+          "name": "var",
+          "line": 234
+        },
+        {
+          "name": "rgba",
+          "line": 235
+        },
+        {
+          "name": "var",
+          "line": 237
+        },
+        {
+          "name": "translateY",
+          "line": 242
+        },
+        {
+          "name": "brightness",
+          "line": 243
+        },
+        {
+          "name": "var",
+          "line": 258
+        },
+        {
+          "name": "var",
+          "line": 259
+        },
+        {
+          "name": "var",
+          "line": 265
+        },
+        {
+          "name": "gradient",
+          "line": 267
+        },
+        {
+          "name": "rgba",
+          "line": 267
+        },
+        {
+          "name": "rgba",
+          "line": 267
+        },
+        {
+          "name": "var",
+          "line": 268
+        },
+        {
+          "name": "var",
+          "line": 277
+        },
+        {
+          "name": "var",
+          "line": 283
+        },
+        {
+          "name": "var",
+          "line": 290
+        },
+        {
+          "name": "var",
+          "line": 294
+        },
+        {
+          "name": "rgba",
+          "line": 295
+        },
+        {
+          "name": "var",
+          "line": 299
+        },
+        {
+          "name": "var",
+          "line": 305
+        },
+        {
+          "name": "var",
+          "line": 306
+        },
+        {
+          "name": "gradient",
+          "line": 308
+        },
+        {
+          "name": "rgba",
+          "line": 308
+        },
+        {
+          "name": "rgba",
+          "line": 308
+        },
+        {
+          "name": "rgba",
+          "line": 309
+        },
+        {
+          "name": "var",
+          "line": 327
+        },
+        {
+          "name": "calc",
+          "line": 334
+        },
+        {
+          "name": "var",
+          "line": 337
+        },
+        {
+          "name": "var",
+          "line": 338
+        },
+        {
+          "name": "var",
+          "line": 346
+        },
+        {
+          "name": "var",
+          "line": 356
+        },
+        {
+          "name": "var",
+          "line": 357
+        },
+        {
+          "name": "rgba",
+          "line": 358
+        },
+        {
+          "name": "translateX",
+          "line": 359
+        },
+        {
+          "name": "var",
+          "line": 368
+        },
+        {
+          "name": "var",
+          "line": 372
+        },
+        {
+          "name": "var",
+          "line": 373
+        },
+        {
+          "name": "gradient",
+          "line": 380
+        },
+        {
+          "name": "rgba",
+          "line": 382
+        },
+        {
+          "name": "rgba",
+          "line": 400
+        },
+        {
+          "name": "rgba",
+          "line": 402
+        },
+        {
+          "name": "minmax",
+          "line": 407
+        },
+        {
+          "name": "var",
+          "line": 415
+        },
+        {
+          "name": "var",
+          "line": 419
+        },
+        {
+          "name": "var",
+          "line": 421
+        },
+        {
+          "name": "var",
+          "line": 422
+        },
+        {
+          "name": "rgba",
+          "line": 426
+        },
+        {
+          "name": "rgba",
+          "line": 427
+        },
+        {
+          "name": "var",
+          "line": 433
+        },
+        {
+          "name": "var",
+          "line": 435
+        },
+        {
+          "name": "rgba",
+          "line": 436
+        },
+        {
+          "name": "var",
+          "line": 437
+        },
+        {
+          "name": "var",
+          "line": 444
+        },
+        {
+          "name": "var",
+          "line": 446
+        },
+        {
+          "name": "rgba",
+          "line": 447
+        },
+        {
+          "name": "var",
+          "line": 448
+        },
+        {
+          "name": "gradient",
+          "line": 460
+        },
+        {
+          "name": "var",
+          "line": 460
+        },
+        {
+          "name": "var",
+          "line": 460
+        },
+        {
+          "name": "var",
+          "line": 460
+        },
+        {
+          "name": "rgba",
+          "line": 461
+        },
+        {
+          "name": "minmax",
+          "line": 468
+        },
+        {
+          "name": "var",
+          "line": 490
+        },
+        {
+          "name": "var",
+          "line": 491
+        },
+        {
+          "name": "var",
+          "line": 502
+        },
+        {
+          "name": "var",
+          "line": 504
+        },
+        {
+          "name": "gradient",
+          "line": 506
+        },
+        {
+          "name": "rgba",
+          "line": 506
+        },
+        {
+          "name": "rgba",
+          "line": 506
+        },
+        {
+          "name": "var",
+          "line": 507
+        }
+      ],
+      "selectors": [
+        {
+          "selector": "#checksList::-webkit-scrollbar",
+          "line": 80
+        },
+        {
+          "selector": "#checksList::-webkit-scrollbar-track",
+          "line": 91
+        },
+        {
+          "selector": "#checksList::-webkit-scrollbar-thumb",
+          "line": 102
+        },
+        {
+          "selector": ".shell",
+          "line": 125
+        },
+        {
+          "selector": ".inspector > section",
+          "line": 138
+        },
+        {
+          "selector": ".sidebar",
+          "line": 147
+        },
+        {
+          "selector": ".inspector > section::before",
+          "line": 160
+        },
+        {
+          "selector": ".run-state",
+          "line": 174
+        },
+        {
+          "selector": ".brand",
+          "line": 179
+        },
+        {
+          "selector": ".brand-mark",
+          "line": 184
+        },
+        {
+          "selector": ".eyebrow",
+          "line": 205
+        },
+        {
+          "selector": ".brand p",
+          "line": 209
+        },
+        {
+          "selector": ".message span",
+          "line": 220
+        },
+        {
+          "selector": ".new-task",
+          "line": 225
+        },
+        {
+          "selector": ".new-task:hover",
+          "line": 241
+        },
+        {
+          "selector": ".thread-list",
+          "line": 246
+        },
+        {
+          "selector": ".thread",
+          "line": 252
+        },
+        {
+          "selector": ".thread.active",
+          "line": 264
+        },
+        {
+          "selector": ".thread.active::after",
+          "line": 271
+        },
+        {
+          "selector": ".thread strong",
+          "line": 280
+        },
+        {
+          "selector": ".status-dot",
+          "line": 286
+        },
+        {
+          "selector": ".status-dot.live",
+          "line": 293
+        },
+        {
+          "selector": ".status-dot.done",
+          "line": 298
+        },
+        {
+          "selector": ".repo-card",
+          "line": 302
+        },
+        {
+          "selector": ".files-card",
+          "line": 312
+        },
+        {
+          "selector": ".section-title.compact",
+          "line": 320
+        },
+        {
+          "selector": ".section-title.compact button",
+          "line": 324
+        },
+        {
+          "selector": ".file-list",
+          "line": 330
+        },
+        {
+          "selector": ".file-row",
+          "line": 341
+        },
+        {
+          "selector": ".file-row:hover",
+          "line": 355
+        },
+        {
+          "selector": ".repo-head",
+          "line": 362
+        },
+        {
+          "selector": ".repo-head strong",
+          "line": 366
+        },
+        {
+          "selector": ".repo-head small",
+          "line": 371
+        },
+        {
+          "selector": ".folder",
+          "line": 376
+        },
+        {
+          "selector": ".folder::before",
+          "line": 385
+        },
+        {
+          "selector": ".meter",
+          "line": 396
+        },
+        {
+          "selector": ".workspace-form",
+          "line": 405
+        },
+        {
+          "selector": ".workspace-form input",
+          "line": 412
+        },
+        {
+          "selector": ".workspace-form input:focus",
+          "line": 425
+        },
+        {
+          "selector": ".workspace-form button",
+          "line": 430
+        },
+        {
+          "selector": ".worktree-btn",
+          "line": 440
+        },
+        {
+          "selector": ".worktree-btn:disabled",
+          "line": 451
+        },
+        {
+          "selector": ".meter span",
+          "line": 456
+        },
+        {
+          "selector": ".main",
+          "line": 464
+        },
+        {
+          "selector": ".topbar",
+          "line": 472
+        },
+        {
+          "selector": ".eyebrow",
+          "line": 480
+        },
+        {
+          "selector": ".run-state",
+          "line": 498
+        },
+        {
+          "selector": ".run-state.compact",
+          "line": 511
+        },
+        {
+          "selector": ".run-state.compact .pulse",
+          "line": 519
+        },
+        {
+          "selector": ".pulse",
+          "line": 524
+        },
+        {
+          "selector": ".terminal-panel",
+          "line": 532
+        },
+        {
+          "selector": ".terminal-head",
+          "line": 541
+        },
+        {
+          "selector": ".terminal-head strong",
+          "line": 552
+        },
+        {
+          "selector": ".ghost",
+          "line": 562
+        },
+        {
+          "selector": ".terminal-head button",
+          "line": 571
+        },
+        {
+          "selector": ".traffic",
+          "line": 582
+        },
+        {
+          "selector": ".traffic span",
+          "line": 587
+        },
+        {
+          "selector": ".traffic span:nth-child(2)",
+          "line": 594
+        },
+        {
+          "selector": ".traffic span:nth-child(3)",
+          "line": 598
+        },
+        {
+          "selector": ".log",
+          "line": 602
+        },
+        {
+          "selector": ".tool-call",
+          "line": 610
+        },
+        {
+          "selector": ".message",
+          "line": 618
+        },
+        {
+          "selector": ".message.user",
+          "line": 622
+        },
+        {
+          "selector": ".message.agent",
+          "line": 629
+        },
+        {
+          "selector": ".message p",
+          "line": 635
+        },
+        {
+          "selector": ".tool-call",
+          "line": 642
+        },
+        {
+          "selector": ".tool-call header",
+          "line": 649
+        },
+        {
+          "selector": ".tool-call header strong",
+          "line": 658
+        },
+        {
+          "selector": ".tool-call em",
+          "line": 663
+        },
+        {
+          "selector": ".tool-call.running em",
+          "line": 669
+        },
+        {
+          "selector": ".tool-icon",
+          "line": 673
+        },
+        {
+          "selector": ".prompt-box",
+          "line": 700
+        },
+        {
+          "selector": ".prompt-actions",
+          "line": 731
+        },
+        {
+          "selector": ".prompt-actions button",
+          "line": 738
+        },
+        {
+          "selector": ".prompt-actions .ghost",
+          "line": 748
+        },
+        {
+          "selector": ".inspector",
+          "line": 755
+        },
+        {
+          "selector": ".inspector > section",
+          "line": 764
+        },
+        {
+          "selector": ".section-title",
+          "line": 770
+        },
+        {
+          "selector": ".button-row",
+          "line": 776
+        },
+        {
+          "selector": ".process-form",
+          "line": 781
+        },
+        {
+          "selector": ".process-form input",
+          "line": 788
+        },
+        {
+          "selector": ".process-form input:focus",
+          "line": 800
+        },
+        {
+          "selector": ".section-title span",
+          "line": 805
+        },
+        {
+          "selector": ".section-title strong",
+          "line": 811
+        },
+        {
+          "selector": ".section-title strong.ok",
+          "line": 816
+        },
+        {
+          "selector": ".section-title button",
+          "line": 820
+        },
+        {
+          "selector": ".steps",
+          "line": 824
+        },
+        {
+          "selector": ".steps li",
+          "line": 833
+        },
+        {
+          "selector": ".steps li::before",
+          "line": 847
+        },
+        {
+          "selector": ".steps .active",
+          "line": 863
+        },
+        {
+          "selector": ".steps .complete::before",
+          "line": 867
+        },
+        {
+          "selector": ".steps .active",
+          "line": 873
+        },
+        {
+          "selector": ".diff-card",
+          "line": 879
+        },
+        {
+          "selector": ".diff-list",
+          "line": 886
+        },
+        {
+          "selector": ".diff-file",
+          "line": 893
+        },
+        {
+          "selector": ".diff-file header",
+          "line": 901
+        },
+        {
+          "selector": ".plus",
+          "line": 910
+        },
+        {
+          "selector": ".minus",
+          "line": 915
+        },
+        {
+          "selector": ".preview-card",
+          "line": 920
+        },
+        {
+          "selector": "#checksList",
+          "line": 927
+        },
+        {
+          "selector": ".preview-card .section-title button",
+          "line": 933
+        },
+        {
+          "selector": ".check-row",
+          "line": 939
+        },
+        {
+          "selector": ".command-row code",
+          "line": 950
+        },
+        {
+          "selector": ".empty-state",
+          "line": 959
+        },
+        {
+          "selector": ".check-row span",
+          "line": 969
+        },
+        {
+          "selector": ".check-row.passed",
+          "line": 976
+        },
+        {
+          "selector": ".check-row.passed span",
+          "line": 980
+        },
+        {
+          "selector": ".check-row.queued span",
+          "line": 984
+        },
+        {
+          "selector": ".repo-meta",
+          "line": 988
+        },
+        {
+          "selector": ".task-card",
+          "line": 997
+        },
+        {
+          "selector": ".task-list",
+          "line": 1002
+        },
+        {
+          "selector": ".task-row",
+          "line": 1011
+        },
+        {
+          "selector": ".task-row strong",
+          "line": 1021
+        },
+        {
+          "selector": ".task-row small",
+          "line": 1029
+        },
+        {
+          "selector": ".task-row.passed",
+          "line": 1036
+        },
+        {
+          "selector": ".command-row small",
+          "line": 1040
+        },
+        {
+          "selector": ".check-row.failed",
+          "line": 1050
+        },
+        {
+          "selector": ".check-row.failed span",
+          "line": 1054
+        },
+        {
+          "selector": ".review-list",
+          "line": 1058
+        },
+        {
+          "selector": ".queue-list",
+          "line": 1065
+        }
+      ],
+      "routes": [],
+      "entrypoints": []
+    }
+  ],
+  "declarations": [
+    {
+      "kind": "function",
+      "name": "api",
+      "line": 72,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "showToast",
+      "line": 84,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "setBusy",
+      "line": 91,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "appendMessage",
+      "line": 108,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "appendToolCall",
+      "line": 117,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderPlan",
+      "line": 136,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderFiles",
+      "line": 148,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "summarizeRepoMap",
+      "line": 177,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderDiff",
+      "line": 188,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderCheckpoints",
+      "line": 207,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderCommands",
+      "line": 212,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderReview",
+      "line": 238,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderReviewArtifacts",
+      "line": 255,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderVerification",
+      "line": 301,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderGit",
+      "line": 325,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderTasks",
+      "line": 337,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderCapabilities",
+      "line": 367,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderToolCatalog",
+      "line": 393,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderExtensionCatalog",
+      "line": 419,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderMcpCatalog",
+      "line": 445,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderAssetCatalog",
+      "line": 496,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderGoal",
+      "line": 532,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "restorePendingProposal",
+      "line": 545,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderQueue",
+      "line": 558,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderProcesses",
+      "line": 603,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderBrowserCheck",
+      "line": 654,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderBrowserBaseline",
+      "line": 682,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderBrowserScreenshot",
+      "line": 705,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderBrowserDom",
+      "line": 728,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderBrowserInteract",
+      "line": 751,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderBrowserVisual",
+      "line": 774,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderApprovals",
+      "line": 798,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "refreshHealth",
+      "line": 880,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "refreshToolCatalog",
+      "line": 907,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "refreshExtensionCatalog",
+      "line": 912,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "refreshMcpCatalog",
+      "line": 917,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "refreshAssetCatalog",
+      "line": 940,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "refreshFiles",
+      "line": 945,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "refreshAll",
+      "line": 957,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "data",
+      "line": 77,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "types",
+      "line": 181,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "toolLogText",
+      "line": 1005,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "remoteStatus",
+      "line": 1354,
+      "path": "app.js"
+    },
+    {
+      "kind": "function",
+      "name": "currentModelName",
+      "line": 31,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "send",
+      "line": 84,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "sendError",
+      "line": 93,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "readJson",
+      "line": 97,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "toPosix",
+      "line": 104,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "normalizeWorkspacePath",
+      "line": 108,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "setWorkspace",
+      "line": 140,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "getWorkspaceInfo",
+      "line": 153,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "safePath",
+      "line": 161,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "isTextFile",
+      "line": 175,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "classifyAsset",
+      "line": 181,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "listFiles",
+      "line": 190,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "listSemanticFiles",
+      "line": 208,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "listAssetFiles",
+      "line": 227,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "buildAssetCatalog",
+      "line": 252,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "splitDelimitedLine",
+      "line": 279,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "extractReadableStrings",
+      "line": 303,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "decodeXmlEntities",
+      "line": 310,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "extractXmlText",
+      "line": 319,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "findEndOfCentralDirectory",
+      "line": 328,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "readZipEntries",
+      "line": 336,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectOfficeOpenXml",
+      "line": 371,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectPdfBuffer",
+      "line": 396,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectImageBuffer",
+      "line": 411,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "rgbToHex",
+      "line": 438,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "summarizeImagePixels",
+      "line": 442,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectImageVision",
+      "line": 501,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectImageOcr",
+      "line": 523,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectWavBuffer",
+      "line": 552,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectMp4LikeBuffer",
+      "line": 586,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectMp3Buffer",
+      "line": 603,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectMediaBuffer",
+      "line": 623,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectMediaTools",
+      "line": 641,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectMediaTranscription",
+      "line": 662,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inspectAsset",
+      "line": 713,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "readWorkspaceFile",
+      "line": 817,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "readWorkspaceFileRange",
+      "line": 822,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "searchFiles",
+      "line": 833,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "extractSymbols",
+      "line": 856,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "findLineNumber",
+      "line": 892,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "uniqueLimited",
+      "line": 901,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "extractSemanticSignals",
+      "line": 905,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "buildSemanticIndex",
+      "line": 1008,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "readSemanticIndex",
+      "line": 1055,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "semanticMatch",
+      "line": 1063,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "searchSemanticIndex",
+      "line": 1067,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "attachReferenceContext",
+      "line": 1126,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "buildSemanticReferences",
+      "line": 1144,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "buildRepoMap",
+      "line": 1193,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "collectContext",
+      "line": 1217,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "buildContextSnapshot",
+      "line": 1231,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "readContextSnapshot",
+      "line": 1312,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "parseUnifiedDiff",
+      "line": 1318,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "applyUnifiedDiffToContent",
+      "line": 1361,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "previewUnifiedDiff",
+      "line": 1394,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "renderSingleFileDiff",
+      "line": 1409,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "createCheckpoint",
+      "line": 1420,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "listCheckpoints",
+      "line": 1440,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "rollbackCheckpoint",
+      "line": 1455,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "evaluateCommandPolicy",
+      "line": 1474,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "isSafeCommand",
+      "line": 1496,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "evaluateProcessPolicy",
+      "line": 1500,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "readPackageScripts",
+      "line": 1514,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "extractSafeScriptCommands",
+      "line": 1520,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "packageScriptNameFromCommand",
+      "line": 1529,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "discoverCheckCommands",
+      "line": 1537,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "executeCommand",
+      "line": 1580,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "executeUserCommand",
+      "line": 1604,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "summarizeManagedProcess",
+      "line": 1624,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "inferProcessProbe",
+      "line": 1640,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "probeManagedProcess",
+      "line": 1658,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "waitForProcessExit",
+      "line": 1688,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "normalizeLocalBrowserTarget",
+      "line": 1699,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "extractHtmlEvidence",
+      "line": 1715,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "checkBrowserTarget",
+      "line": 1742,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "browserBaselineId",
+      "line": 1781,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "hashBuffer",
+      "line": 1785,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "buildBrowserFingerprint",
+      "line": 1789,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "compareBrowserFingerprints",
+      "line": 1799,
+      "path": "server.js"
+    },
+    {
+      "kind": "function",
+      "name": "compareBrowserBaseline",
+      "line": 1821,
+      "path": "server.js"
+    }
+  ],
+  "imports": [
+    {
+      "source": "node:http",
+      "line": 1,
+      "names": [
+        "http"
+      ],
+      "path": "server.js"
+    },
+    {
+      "source": "node:crypto",
+      "line": 2,
+      "names": [
+        "crypto"
+      ],
+      "path": "server.js"
+    },
+    {
+      "source": "node:child_process",
+      "line": 3,
+      "names": [
+        "exec",
+        "spawn"
+      ],
+      "path": "server.js"
+    },
+    {
+      "source": "node:fs",
+      "line": 4,
+      "names": [
+        "promises",
+        "as",
+        "fs"
+      ],
+      "path": "server.js"
+    },
+    {
+      "source": "node:path",
+      "line": 5,
+      "names": [
+        "path"
+      ],
+      "path": "server.js"
+    },
+    {
+      "source": "node:url",
+      "line": 6,
+      "names": [
+        "fileURLToPath"
+      ],
+      "path": "server.js"
+    },
+    {
+      "source": "node:zlib",
+      "line": 7,
+      "names": [
+        "zlib"
+      ],
+      "path": "server.js"
+    }
+  ],
+  "routes": [
+    {
+      "method": "FETCH",
+      "path": "server.js",
+      "line": 2116
+    },
+    {
+      "method": "FETCH",
+      "path": "server.js",
+      "line": 5974
+    }
+  ],
+  "selectors": [
+    {
+      "selector": ".shell",
+      "line": 10,
+      "path": "index.html"
+    },
+    {
+      "selector": ".sidebar",
+      "line": 11,
+      "path": "index.html"
+    },
+    {
+      "selector": ".brand",
+      "line": 12,
+      "path": "index.html"
+    },
+    {
+      "selector": ".brand-mark",
+      "line": 13,
+      "path": "index.html"
+    },
+    {
+      "selector": "#newTaskBtn",
+      "line": 20,
+      "path": "index.html"
+    },
+    {
+      "selector": ".new-task",
+      "line": 20,
+      "path": "index.html"
+    },
+    {
+      "selector": ".thread-list",
+      "line": 25,
+      "path": "index.html"
+    },
+    {
+      "selector": ".thread",
+      "line": 26,
+      "path": "index.html"
+    },
+    {
+      "selector": ".active",
+      "line": 26,
+      "path": "index.html"
+    },
+    {
+      "selector": ".status-dot",
+      "line": 27,
+      "path": "index.html"
+    },
+    {
+      "selector": ".live",
+      "line": 27,
+      "path": "index.html"
+    },
+    {
+      "selector": "#workspaceStatus",
+      "line": 30,
+      "path": "index.html"
+    },
+    {
+      "selector": ".thread",
+      "line": 33,
+      "path": "index.html"
+    },
+    {
+      "selector": ".status-dot",
+      "line": 34,
+      "path": "index.html"
+    },
+    {
+      "selector": ".idle",
+      "line": 34,
+      "path": "index.html"
+    },
+    {
+      "selector": ".thread",
+      "line": 40,
+      "path": "index.html"
+    },
+    {
+      "selector": ".status-dot",
+      "line": 41,
+      "path": "index.html"
+    },
+    {
+      "selector": ".idle",
+      "line": 41,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 49,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-head",
+      "line": 50,
+      "path": "index.html"
+    },
+    {
+      "selector": ".folder",
+      "line": 51,
+      "path": "index.html"
+    },
+    {
+      "selector": "#repoName",
+      "line": 53,
+      "path": "index.html"
+    },
+    {
+      "selector": "#branchName",
+      "line": 54,
+      "path": "index.html"
+    },
+    {
+      "selector": "#workspaceForm",
+      "line": 57,
+      "path": "index.html"
+    },
+    {
+      "selector": ".workspace-form",
+      "line": 57,
+      "path": "index.html"
+    },
+    {
+      "selector": ".sr-only",
+      "line": 58,
+      "path": "index.html"
+    },
+    {
+      "selector": "#workspaceInput",
+      "line": 59,
+      "path": "index.html"
+    },
+    {
+      "selector": "#worktreeBtn",
+      "line": 62,
+      "path": "index.html"
+    },
+    {
+      "selector": ".worktree-btn",
+      "line": 62,
+      "path": "index.html"
+    },
+    {
+      "selector": "#contextSnapshotBtn",
+      "line": 63,
+      "path": "index.html"
+    },
+    {
+      "selector": ".worktree-btn",
+      "line": 63,
+      "path": "index.html"
+    },
+    {
+      "selector": "#semanticIndexBtn",
+      "line": 64,
+      "path": "index.html"
+    },
+    {
+      "selector": ".worktree-btn",
+      "line": 64,
+      "path": "index.html"
+    },
+    {
+      "selector": ".meter",
+      "line": 65,
+      "path": "index.html"
+    },
+    {
+      "selector": "#contextMeter",
+      "line": 66,
+      "path": "index.html"
+    },
+    {
+      "selector": "#contextText",
+      "line": 68,
+      "path": "index.html"
+    },
+    {
+      "selector": "#gitStatus",
+      "line": 69,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-meta",
+      "line": 69,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 72,
+      "path": "index.html"
+    },
+    {
+      "selector": ".task-card",
+      "line": 72,
+      "path": "index.html"
+    },
+    {
+      "selector": ".section-title",
+      "line": 73,
+      "path": "index.html"
+    },
+    {
+      "selector": ".compact",
+      "line": 73,
+      "path": "index.html"
+    },
+    {
+      "selector": "#taskList",
+      "line": 76,
+      "path": "index.html"
+    },
+    {
+      "selector": ".task-list",
+      "line": 76,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 79,
+      "path": "index.html"
+    },
+    {
+      "selector": ".parity-card",
+      "line": 79,
+      "path": "index.html"
+    },
+    {
+      "selector": ".section-title",
+      "line": 80,
+      "path": "index.html"
+    },
+    {
+      "selector": ".compact",
+      "line": 80,
+      "path": "index.html"
+    },
+    {
+      "selector": "#capabilityList",
+      "line": 83,
+      "path": "index.html"
+    },
+    {
+      "selector": ".capability-list",
+      "line": 83,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 86,
+      "path": "index.html"
+    },
+    {
+      "selector": ".tool-card",
+      "line": 86,
+      "path": "index.html"
+    },
+    {
+      "selector": ".section-title",
+      "line": 87,
+      "path": "index.html"
+    },
+    {
+      "selector": ".compact",
+      "line": 87,
+      "path": "index.html"
+    },
+    {
+      "selector": "#toolCatalogList",
+      "line": 90,
+      "path": "index.html"
+    },
+    {
+      "selector": ".capability-list",
+      "line": 90,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 93,
+      "path": "index.html"
+    },
+    {
+      "selector": ".extension-card",
+      "line": 93,
+      "path": "index.html"
+    },
+    {
+      "selector": ".section-title",
+      "line": 94,
+      "path": "index.html"
+    },
+    {
+      "selector": ".compact",
+      "line": 94,
+      "path": "index.html"
+    },
+    {
+      "selector": "#extensionCatalogList",
+      "line": 97,
+      "path": "index.html"
+    },
+    {
+      "selector": ".capability-list",
+      "line": 97,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 100,
+      "path": "index.html"
+    },
+    {
+      "selector": ".mcp-card",
+      "line": 100,
+      "path": "index.html"
+    },
+    {
+      "selector": ".section-title",
+      "line": 101,
+      "path": "index.html"
+    },
+    {
+      "selector": ".compact",
+      "line": 101,
+      "path": "index.html"
+    },
+    {
+      "selector": "#mcpProbeBtn",
+      "line": 103,
+      "path": "index.html"
+    },
+    {
+      "selector": ".ghost-btn",
+      "line": 103,
+      "path": "index.html"
+    },
+    {
+      "selector": "#mcpCatalogList",
+      "line": 105,
+      "path": "index.html"
+    },
+    {
+      "selector": ".capability-list",
+      "line": 105,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 108,
+      "path": "index.html"
+    },
+    {
+      "selector": ".asset-card",
+      "line": 108,
+      "path": "index.html"
+    },
+    {
+      "selector": ".section-title",
+      "line": 109,
+      "path": "index.html"
+    },
+    {
+      "selector": ".compact",
+      "line": 109,
+      "path": "index.html"
+    },
+    {
+      "selector": "#assetCatalogList",
+      "line": 112,
+      "path": "index.html"
+    },
+    {
+      "selector": ".capability-list",
+      "line": 112,
+      "path": "index.html"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 115,
+      "path": "index.html"
+    },
+    {
+      "selector": ".files-card",
+      "line": 115,
+      "path": "index.html"
+    },
+    {
+      "selector": ".section-title",
+      "line": 116,
+      "path": "index.html"
+    },
+    {
+      "selector": ".compact",
+      "line": 116,
+      "path": "index.html"
+    },
+    {
+      "selector": "#refreshFilesBtn",
+      "line": 118,
+      "path": "index.html"
+    },
+    {
+      "selector": "#fileList",
+      "line": 120,
+      "path": "index.html"
+    },
+    {
+      "selector": ".file-list",
+      "line": 120,
+      "path": "index.html"
+    },
+    {
+      "selector": ".main",
+      "line": 124,
+      "path": "index.html"
+    },
+    {
+      "selector": ".terminal-panel",
+      "line": 125,
+      "path": "index.html"
+    },
+    {
+      "selector": ".terminal-head",
+      "line": 126,
+      "path": "index.html"
+    },
+    {
+      "selector": ".traffic",
+      "line": 127,
+      "path": "index.html"
+    },
+    {
+      "selector": "#runState",
+      "line": 133,
+      "path": "index.html"
+    },
+    {
+      "selector": ".run-state",
+      "line": 133,
+      "path": "index.html"
+    },
+    {
+      "selector": ".compact",
+      "line": 133,
+      "path": "index.html"
+    },
+    {
+      "selector": ".pulse",
+      "line": 134,
+      "path": "index.html"
+    },
+    {
+      "selector": "#replayBtn",
+      "line": 137,
+      "path": "index.html"
+    },
+    {
+      "selector": "#log",
+      "line": 140,
+      "path": "index.html"
+    },
+    {
+      "selector": ".log",
+      "line": 140,
+      "path": "index.html"
+    },
+    {
+      "selector": ".message",
+      "line": 141,
+      "path": "index.html"
+    },
+    {
+      "selector": ".agent",
+      "line": 141,
+      "path": "index.html"
+    },
+    {
+      "selector": "#promptForm",
+      "line": 147,
+      "path": "index.html"
+    },
+    {
+      "selector": ".prompt-box",
+      "line": 147,
+      "path": "index.html"
+    },
+    {
+      "selector": ".sr-only",
+      "line": 148,
+      "path": "index.html"
+    },
+    {
+      "selector": "#promptInput",
+      "line": 149,
+      "path": "index.html"
+    },
+    {
+      "selector": ".prompt-actions",
+      "line": 150,
+      "path": "index.html"
+    },
+    {
+      "selector": "#attachBtn",
+      "line": 151,
+      "path": "index.html"
+    },
+    {
+      "selector": ".ghost",
+      "line": 151,
+      "path": "index.html"
+    },
+    {
+      "selector": "#queueBtn",
+      "line": 152,
+      "path": "index.html"
+    },
+    {
+      "selector": ".ghost",
+      "line": 152,
+      "path": "index.html"
+    },
+    {
+      "selector": "#runAgentBtn",
+      "line": 153,
+      "path": "index.html"
+    },
+    {
+      "selector": ".inspector",
+      "line": 159,
+      "path": "index.html"
+    },
+    {
+      "selector": ".plan-card",
+      "line": 160,
+      "path": "index.html"
+    },
+    {
+      "selector": ".section-title",
+      "line": 161,
+      "path": "index.html"
+    },
+    {
+      "selector": ".button-row",
+      "line": 163,
+      "path": "index.html"
+    },
+    {
+      "selector": "#prReadinessBtn",
+      "line": 164,
+      "path": "index.html"
+    },
+    {
+      "selector": "#remotePublishPlanBtn",
+      "line": 165,
+      "path": "index.html"
+    },
+    {
+      "selector": "#handoffBtn",
+      "line": 166,
+      "path": "index.html"
+    },
+    {
+      "selector": "#rollbackBtn",
+      "line": 167,
+      "path": "index.html"
+    },
+    {
+      "selector": "#approveBtn",
+      "line": 168,
+      "path": "index.html"
+    },
+    {
+      "selector": "#planSteps",
+      "line": 171,
+      "path": "index.html"
+    },
+    {
+      "selector": ".steps",
+      "line": 171,
+      "path": "index.html"
+    },
+    {
+      "selector": ".active",
+      "line": 172,
+      "path": "index.html"
+    },
+    {
+      "selector": "#goalState",
+      "line": 177,
+      "path": "index.html"
+    },
+    {
+      "selector": ".goal-state",
+      "line": 177,
+      "path": "index.html"
+    },
+    {
+      "selector": "#checksList::-webkit-scrollbar",
+      "line": 80,
+      "path": "styles.css"
+    },
+    {
+      "selector": "#checksList::-webkit-scrollbar-track",
+      "line": 91,
+      "path": "styles.css"
+    },
+    {
+      "selector": "#checksList::-webkit-scrollbar-thumb",
+      "line": 102,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".shell",
+      "line": 125,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".inspector > section",
+      "line": 138,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".sidebar",
+      "line": 147,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".inspector > section::before",
+      "line": 160,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".run-state",
+      "line": 174,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".brand",
+      "line": 179,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".brand-mark",
+      "line": 184,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".eyebrow",
+      "line": 205,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".brand p",
+      "line": 209,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".message span",
+      "line": 220,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".new-task",
+      "line": 225,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".new-task:hover",
+      "line": 241,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".thread-list",
+      "line": 246,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".thread",
+      "line": 252,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".thread.active",
+      "line": 264,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".thread.active::after",
+      "line": 271,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".thread strong",
+      "line": 280,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".status-dot",
+      "line": 286,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".status-dot.live",
+      "line": 293,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".status-dot.done",
+      "line": 298,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".repo-card",
+      "line": 302,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".files-card",
+      "line": 312,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".section-title.compact",
+      "line": 320,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".section-title.compact button",
+      "line": 324,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".file-list",
+      "line": 330,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".file-row",
+      "line": 341,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".file-row:hover",
+      "line": 355,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".repo-head",
+      "line": 362,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".repo-head strong",
+      "line": 366,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".repo-head small",
+      "line": 371,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".folder",
+      "line": 376,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".folder::before",
+      "line": 385,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".meter",
+      "line": 396,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".workspace-form",
+      "line": 405,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".workspace-form input",
+      "line": 412,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".workspace-form input:focus",
+      "line": 425,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".workspace-form button",
+      "line": 430,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".worktree-btn",
+      "line": 440,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".worktree-btn:disabled",
+      "line": 451,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".meter span",
+      "line": 456,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".main",
+      "line": 464,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".topbar",
+      "line": 472,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".eyebrow",
+      "line": 480,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".run-state",
+      "line": 498,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".run-state.compact",
+      "line": 511,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".run-state.compact .pulse",
+      "line": 519,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".pulse",
+      "line": 524,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".terminal-panel",
+      "line": 532,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".terminal-head",
+      "line": 541,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".terminal-head strong",
+      "line": 552,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".ghost",
+      "line": 562,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".terminal-head button",
+      "line": 571,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".traffic",
+      "line": 582,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".traffic span",
+      "line": 587,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".traffic span:nth-child(2)",
+      "line": 594,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".traffic span:nth-child(3)",
+      "line": 598,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".log",
+      "line": 602,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".tool-call",
+      "line": 610,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".message",
+      "line": 618,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".message.user",
+      "line": 622,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".message.agent",
+      "line": 629,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".message p",
+      "line": 635,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".tool-call",
+      "line": 642,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".tool-call header",
+      "line": 649,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".tool-call header strong",
+      "line": 658,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".tool-call em",
+      "line": 663,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".tool-call.running em",
+      "line": 669,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".tool-icon",
+      "line": 673,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".prompt-box",
+      "line": 700,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".prompt-actions",
+      "line": 731,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".prompt-actions button",
+      "line": 738,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".prompt-actions .ghost",
+      "line": 748,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".inspector",
+      "line": 755,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".inspector > section",
+      "line": 764,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".section-title",
+      "line": 770,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".button-row",
+      "line": 776,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".process-form",
+      "line": 781,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".process-form input",
+      "line": 788,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".process-form input:focus",
+      "line": 800,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".section-title span",
+      "line": 805,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".section-title strong",
+      "line": 811,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".section-title strong.ok",
+      "line": 816,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".section-title button",
+      "line": 820,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".steps",
+      "line": 824,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".steps li",
+      "line": 833,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".steps li::before",
+      "line": 847,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".steps .active",
+      "line": 863,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".steps .complete::before",
+      "line": 867,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".steps .active",
+      "line": 873,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".diff-card",
+      "line": 879,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".diff-list",
+      "line": 886,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".diff-file",
+      "line": 893,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".diff-file header",
+      "line": 901,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".plus",
+      "line": 910,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".minus",
+      "line": 915,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".preview-card",
+      "line": 920,
+      "path": "styles.css"
+    },
+    {
+      "selector": "#checksList",
+      "line": 927,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".preview-card .section-title button",
+      "line": 933,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".check-row",
+      "line": 939,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".command-row code",
+      "line": 950,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".empty-state",
+      "line": 959,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".check-row span",
+      "line": 969,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".check-row.passed",
+      "line": 976,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".check-row.passed span",
+      "line": 980,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".check-row.queued span",
+      "line": 984,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".repo-meta",
+      "line": 988,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".task-card",
+      "line": 997,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".task-list",
+      "line": 1002,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".task-row",
+      "line": 1011,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".task-row strong",
+      "line": 1021,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".task-row small",
+      "line": 1029,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".task-row.passed",
+      "line": 1036,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".command-row small",
+      "line": 1040,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".check-row.failed",
+      "line": 1050,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".check-row.failed span",
+      "line": 1054,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".review-list",
+      "line": 1058,
+      "path": "styles.css"
+    },
+    {
+      "selector": ".queue-list",
+      "line": 1065,
+      "path": "styles.css"
+    }
+  ],
+  "callGraph": {
+    "app.js": [
+      "querySelector",
+      "api",
+      "fetch",
+      "json",
+      "Error",
+      "showToast",
+      "add",
+      "clearTimeout",
+      "setTimeout",
+      "remove",
+      "setBusy",
+      "appendMessage",
+      "createElement",
+      "appendChild",
+      "appendToolCall",
+      "renderPlan",
+      "forEach",
+      "renderFiles",
+      "slice",
+      "addEventListener",
+      "async",
+      "encodeURIComponent",
+      "summarizeRepoMap",
+      "keys",
+      "entries",
+      "map",
+      "join",
+      "renderDiff",
+      "renderCheckpoints",
+      "renderCommands",
+      "filter",
+      "renderReview"
+    ],
+    "index.html": [],
+    "server.js": [
+      "fileURLToPath",
+      "dirname",
+      "resolve",
+      "Number",
+      "split",
+      "map",
+      "trim",
+      "filter",
+      "currentModelName",
+      "join",
+      "Set",
+      "npm",
+      "test",
+      "pnpm",
+      "yarn",
+      "Map",
+      "send",
+      "stringify",
+      "writeHead",
+      "end",
+      "sendError",
+      "String",
+      "readJson",
+      "await",
+      "push",
+      "parse",
+      "concat",
+      "toString",
+      "toPosix",
+      "replaceAll",
+      "replace",
+      "normalizeWorkspacePath",
+      "toLowerCase",
+      "startsWith",
+      "relative",
+      "Error",
+      "normalize",
+      "setWorkspace",
+      "stat",
+      "isDirectory",
+      "getWorkspaceInfo",
+      "basename",
+      "safePath",
+      "isTextFile",
+      "has",
+      "extname",
+      "includes",
+      "classifyAsset",
+      "listFiles",
+      "readdir"
+    ],
+    "styles.css": [
+      "rgba",
+      "var",
+      "gradient",
+      "minmax",
+      "blur",
+      "translateY",
+      "brightness",
+      "calc",
+      "translateX"
+    ]
+  }
+}

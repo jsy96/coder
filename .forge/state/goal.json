@@ -1,12 +1,12 @@
 {
   "workspace": "D:\\cc-picture\\aaa\\coder",
-  "objective": "api smoke queued task",
+  "objective": "api smoke next queued task",
   "phase": "active",
   "status": "active",
-  "updatedAt": "2026-07-05T02:43:52.405Z",
-  "lastPrompt": "api smoke queued task",
+  "updatedAt": "2026-07-05T20:11:10.588Z",
+  "lastPrompt": "api smoke next queued task",
   "lastTaskId": "",
   "lastVerification": null,
   "pendingProposal": null,
-  "nextStep": "运行代理处理当前激活任务。"
+  "nextStep": "已自动激活下一项队列任务。"
 }

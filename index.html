@@ -60,6 +60,8 @@
             <button type="submit">切换</button>
           </form>
           <button class="worktree-btn" id="worktreeBtn" type="button">创建隔离任务分支</button>
+          <button class="worktree-btn" id="contextSnapshotBtn" type="button">保存上下文摘要</button>
+          <button class="worktree-btn" id="semanticIndexBtn" type="button">生成语义索引</button>
           <div class="meter" aria-label="上下文使用量">
             <span id="contextMeter" style="width: 0%"></span>
           </div>
@@ -98,6 +100,7 @@
         <section class="repo-card mcp-card" aria-label="MCP 服务">
           <div class="section-title compact">
             <span>MCP 服务</span>
+            <button class="ghost-btn" id="mcpProbeBtn" type="button">探测</button>
           </div>
           <div id="mcpCatalogList" class="capability-list">等待 MCP 配置</div>
         </section>
@@ -158,6 +161,8 @@
           <div class="section-title">
             <span>计划</span>
             <div class="button-row">
+              <button type="button" id="prReadinessBtn">PR 检查</button>
+              <button type="button" id="remotePublishPlanBtn">发布审批</button>
               <button type="button" id="handoffBtn">交付草稿</button>
               <button type="button" id="rollbackBtn">回滚</button>
               <button type="button" id="approveBtn">批准写入</button>
@@ -233,9 +238,13 @@
           </div>
           <form id="browserCheckForm" class="process-form">
             <input id="browserCheckUrlInput" type="url" placeholder="http://127.0.0.1:4173/" />
+            <input id="browserSmokeCheck" class="sr-only" type="checkbox" />
             <button type="submit" id="browserCheckBtn">检查</button>
             <button type="button" id="browserBaselineBtn">基线</button>
             <button type="button" id="browserScreenshotBtn">截图</button>
+            <button type="button" id="browserDomBtn">DOM</button>
+            <button type="button" id="browserInteractBtn">交互</button>
+            <button type="button" id="browserVisualBtn">视觉</button>
           </form>
           <div id="browserCheckResult" class="queue-list">
             <div class="empty-state">本地页面检查结果会显示在这里。</div>
