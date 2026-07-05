@@ -1504,6 +1504,10 @@ function evaluateProcessPolicy(command) {
   if (basePolicy.reason !== "未匹配允许的检查/构建命令模式。") {
     return { ...basePolicy, reason: basePolicy.allowed ? "该命令适合短任务执行，不需要后台进程。" : basePolicy.reason };
   }
+  const smokeCommand = [process.execPath, path.join(APP_ROOT, "server.js"), "--mcp-smoke-server"].join(" ");
+  if (text.toLowerCase() === smokeCommand.toLowerCase()) {
+    return { allowed: true, risk: "low", reason: "匹配本地 MCP smoke server 受控进程策略。", command: text };
+  }
   const allowed = PROCESS_COMMAND_PATTERNS.some((pattern) => pattern.test(text));
   if (!allowed) {
     return { allowed: false, risk: "blocked", reason: "未匹配允许的受管服务命令模式。", command: text };
@@ -3323,17 +3327,27 @@ async function readRemotePrStatus(git = null) {
   };
 }
 
-async function buildPullRequestReadiness(prompt = "") {
-  const git = await getGitSummary();
+async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
   const evidence = await getCurrentDiff();
+  const git = deep ? await getGitSummary() : evidence.git;
   const ci = await findCiConfigs();
-  const remote = await readRemotePrStatus(git);
   const tasks = await listTaskLogs(5);
   const checks = tasks.flatMap((task) => task.checks || []).slice(0, 12);
   const reviews = await listReviewArtifacts(5);
   const provider = git.remotes?.find((item) => item.direction === "push")?.provider
     || git.remotes?.[0]?.provider
     || "";
+  const remote = deep
+    ? await readRemotePrStatus(git)
+    : {
+      provider,
+      available: false,
+      authenticated: false,
+      reason: "默认 PR readiness 跳过远端 CLI 探测；使用 /api/pr-readiness?deep=1 执行远端 PR/CI 读取。",
+      pr: null,
+      checks: [],
+      policy: { access: "remote-read-only", pushes: false, createsRemotePr: false, skipped: true }
+    };
   const title = String(prompt || tasks[0]?.prompt || `Forge changes on ${git.branch || "workspace"}`).trim();
   const changedFiles = git.changedFiles || [];
   const blockers = [];
@@ -3407,6 +3421,8 @@ async function buildPullRequestReadiness(prompt = "") {
       pushes: false,
       createsRemotePr: false,
       readsRemoteCi: Boolean(remote.available)
+      ,
+      deep
     }
   };
 }
@@ -4722,7 +4738,7 @@ function parseMcpLineFrame(buffer) {
   return { json, rest: buffer.slice(lineEnd + 1) };
 }
 
-async function probeMcpStdioServer(server, { timeoutMs = 10000 } = {}) {
+async function probeMcpStdioServer(server, { timeoutMs = 30000 } = {}) {
   if (!server.command || server.disabled) {
     return summarizeMcpProbe({ status: server.disabled ? "disabled" : "not_configured", error: server.disabled ? "server disabled" : "missing command" });
   }
@@ -4826,7 +4842,7 @@ async function probeMcpStdioServer(server, { timeoutMs = 10000 } = {}) {
   });
 }
 
-async function callMcpStdioMethod(server, method, params = {}, { timeoutMs = 10000 } = {}) {
+async function callMcpStdioMethod(server, method, params = {}, { timeoutMs = 30000 } = {}) {
   if (!server.command || server.disabled) {
     throw new Error(server.disabled ? "MCP server disabled." : "MCP server missing command.");
   }
@@ -5907,10 +5923,21 @@ async function handleApi(req, res) {
 
     if (req.method === "POST" && url.pathname === "/api/pr-readiness") {
       const { prompt = "" } = await readJson(req);
-      return send(res, 200, await buildPullRequestReadiness(prompt));
+      return send(res, 200, await buildPullRequestReadiness(prompt, { deep: url.searchParams.get("deep") === "1" }));
     }
 
     if (req.method === "GET" && url.pathname === "/api/remote-pr-status") {
+      if (url.searchParams.get("deep") !== "1") {
+        return send(res, 200, {
+          provider: "",
+          available: false,
+          authenticated: false,
+          reason: "默认跳过远端 CLI 探测；使用 /api/remote-pr-status?deep=1 执行远端 PR/CI 读取。",
+          pr: null,
+          checks: [],
+          policy: { access: "remote-read-only", pushes: false, createsRemotePr: false, skipped: true }
+        });
+      }
       return send(res, 200, await readRemotePrStatus());
     }
 
@@ -6591,8 +6618,8 @@ async function runApiSmokeTest() {
     await fs.writeFile(path.join(MCP_DIR, "servers.json"), JSON.stringify({
       mcpServers: {
         "api-smoke-mcp": {
-          command: "node",
-          args: ["server.js", "--mcp-smoke-server"],
+          command: process.execPath,
+          args: [path.join(APP_ROOT, "server.js"), "--mcp-smoke-server"],
           env: { API_SMOKE_MCP: "1" }
         }
       }

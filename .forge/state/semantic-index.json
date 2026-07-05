@@ -1,6 +1,6 @@
 {
   "workspace": "D:\\cc-picture\\aaa\\coder",
-  "generatedAt": "2026-07-05T22:07:33.775Z",
+  "generatedAt": "2026-07-05T20:09:46.249Z",
   "fileCount": 6,
   "indexedFiles": 4,
   "summary": {
@@ -1532,147 +1532,147 @@
         {
           "kind": "function",
           "name": "readContextSnapshot",
-          "line": 1312
+          "line": 1280
         },
         {
           "kind": "function",
           "name": "parseUnifiedDiff",
-          "line": 1318
+          "line": 1286
         },
         {
           "kind": "function",
           "name": "applyUnifiedDiffToContent",
-          "line": 1361
+          "line": 1329
         },
         {
           "kind": "function",
           "name": "previewUnifiedDiff",
-          "line": 1394
+          "line": 1362
         },
         {
           "kind": "function",
           "name": "renderSingleFileDiff",
-          "line": 1409
+          "line": 1377
         },
         {
           "kind": "function",
           "name": "createCheckpoint",
-          "line": 1420
+          "line": 1388
         },
         {
           "kind": "function",
           "name": "listCheckpoints",
-          "line": 1440
+          "line": 1408
         },
         {
           "kind": "function",
           "name": "rollbackCheckpoint",
-          "line": 1455
+          "line": 1423
         },
         {
           "kind": "function",
           "name": "evaluateCommandPolicy",
-          "line": 1474
+          "line": 1442
         },
         {
           "kind": "function",
           "name": "isSafeCommand",
-          "line": 1496
+          "line": 1464
         },
         {
           "kind": "function",
           "name": "evaluateProcessPolicy",
-          "line": 1500
+          "line": 1468
         },
         {
           "kind": "function",
           "name": "readPackageScripts",
-          "line": 1514
+          "line": 1482
         },
         {
           "kind": "function",
           "name": "extractSafeScriptCommands",
-          "line": 1520
+          "line": 1488
         },
         {
           "kind": "function",
           "name": "packageScriptNameFromCommand",
-          "line": 1529
+          "line": 1497
         },
         {
           "kind": "function",
           "name": "discoverCheckCommands",
-          "line": 1537
+          "line": 1505
         },
         {
           "kind": "function",
           "name": "executeCommand",
-          "line": 1580
+          "line": 1548
         },
         {
           "kind": "function",
           "name": "executeUserCommand",
-          "line": 1604
+          "line": 1572
         },
         {
           "kind": "function",
           "name": "summarizeManagedProcess",
-          "line": 1624
+          "line": 1592
         },
         {
           "kind": "function",
           "name": "inferProcessProbe",
-          "line": 1640
+          "line": 1608
         },
         {
           "kind": "function",
           "name": "probeManagedProcess",
-          "line": 1658
+          "line": 1626
         },
         {
           "kind": "function",
           "name": "waitForProcessExit",
-          "line": 1688
+          "line": 1656
         },
         {
           "kind": "function",
           "name": "normalizeLocalBrowserTarget",
-          "line": 1699
+          "line": 1667
         },
         {
           "kind": "function",
           "name": "extractHtmlEvidence",
-          "line": 1715
+          "line": 1683
         },
         {
           "kind": "function",
           "name": "checkBrowserTarget",
-          "line": 1742
+          "line": 1710
         },
         {
           "kind": "function",
           "name": "browserBaselineId",
-          "line": 1781
+          "line": 1749
         },
         {
           "kind": "function",
           "name": "hashBuffer",
-          "line": 1785
+          "line": 1753
         },
         {
           "kind": "function",
           "name": "buildBrowserFingerprint",
-          "line": 1789
+          "line": 1757
         },
         {
           "kind": "function",
           "name": "compareBrowserFingerprints",
-          "line": 1799
+          "line": 1767
         },
         {
           "kind": "function",
           "name": "compareBrowserBaseline",
-          "line": 1821
+          "line": 1789
         }
       ],
       "calls": [
@@ -2162,12 +2162,12 @@
         {
           "method": "FETCH",
           "path": "http://127.0.0.1:${port}/json/list",
-          "line": 2116
+          "line": 1995
         },
         {
           "method": "FETCH",
           "path": "${baseUrl}${route}",
-          "line": 5974
+          "line": 5741
         }
       ],
       "entrypoints": [
@@ -3716,175 +3716,175 @@
     {
       "kind": "function",
       "name": "readContextSnapshot",
-      "line": 1312,
+      "line": 1280,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "parseUnifiedDiff",
-      "line": 1318,
+      "line": 1286,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "applyUnifiedDiffToContent",
-      "line": 1361,
+      "line": 1329,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "previewUnifiedDiff",
-      "line": 1394,
+      "line": 1362,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "renderSingleFileDiff",
-      "line": 1409,
+      "line": 1377,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "createCheckpoint",
-      "line": 1420,
+      "line": 1388,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "listCheckpoints",
-      "line": 1440,
+      "line": 1408,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "rollbackCheckpoint",
-      "line": 1455,
+      "line": 1423,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "evaluateCommandPolicy",
-      "line": 1474,
+      "line": 1442,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "isSafeCommand",
-      "line": 1496,
+      "line": 1464,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "evaluateProcessPolicy",
-      "line": 1500,
+      "line": 1468,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "readPackageScripts",
-      "line": 1514,
+      "line": 1482,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "extractSafeScriptCommands",
-      "line": 1520,
+      "line": 1488,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "packageScriptNameFromCommand",
-      "line": 1529,
+      "line": 1497,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "discoverCheckCommands",
-      "line": 1537,
+      "line": 1505,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "executeCommand",
-      "line": 1580,
+      "line": 1548,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "executeUserCommand",
-      "line": 1604,
+      "line": 1572,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "summarizeManagedProcess",
-      "line": 1624,
+      "line": 1592,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "inferProcessProbe",
-      "line": 1640,
+      "line": 1608,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "probeManagedProcess",
-      "line": 1658,
+      "line": 1626,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "waitForProcessExit",
-      "line": 1688,
+      "line": 1656,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "normalizeLocalBrowserTarget",
-      "line": 1699,
+      "line": 1667,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "extractHtmlEvidence",
-      "line": 1715,
+      "line": 1683,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "checkBrowserTarget",
-      "line": 1742,
+      "line": 1710,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "browserBaselineId",
-      "line": 1781,
+      "line": 1749,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "hashBuffer",
-      "line": 1785,
+      "line": 1753,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "buildBrowserFingerprint",
-      "line": 1789,
+      "line": 1757,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "compareBrowserFingerprints",
-      "line": 1799,
+      "line": 1767,
       "path": "server.js"
     },
     {
       "kind": "function",
       "name": "compareBrowserBaseline",
-      "line": 1821,
+      "line": 1789,
       "path": "server.js"
     }
   ],
@@ -3953,12 +3953,12 @@
     {
       "method": "FETCH",
       "path": "server.js",
-      "line": 2116
+      "line": 1995
     },
     {
       "method": "FETCH",
       "path": "server.js",
-      "line": 5974
+      "line": 5741
     }
   ],
   "selectors": [
