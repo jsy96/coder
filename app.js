@@ -1593,6 +1593,9 @@ browserInteractBtn?.addEventListener("click", async () => {
         url: targetUrl,
         actions: [
           { type: "wait", selector: "body" },
+          { type: "navigate", value: `${targetUrl}${targetUrl.includes("?") ? "&" : "?"}browser-interact-nav=1` },
+          { type: "waitUrl", value: "browser-interact-nav=1" },
+          { type: "waitNetwork" },
           { type: "hover", selector: "#refreshFilesBtn" },
           { type: "dblclick", selector: "#refreshFilesBtn" },
           { type: "clear", selector: "#browserCheckUrlInput" },

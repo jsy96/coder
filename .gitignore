@@ -31,7 +31,7 @@ npm-debug.log*
 *.env.local
 *.local
 .forge/
-.forge*
+*.forge*
 
 # 云开发环境配置（本地，不入库；模板见 env.example.js）
 env.js

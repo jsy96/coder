@@ -88,7 +88,7 @@ node server.js
 - **页面结构基线**：新增 `/api/browser-baseline` 和“基线”按钮，保存本地页面标题、heading 和 form/button/input/image 计数指纹，并在后续检查中输出结构 diff。
 - **真实页面截图**：新增 `/api/browser-screenshot` 和“截图”按钮，调用本机 Edge/Chrome headless 为本地 URL 生成 PNG 证据，产物保存在 `.forge/browser-screenshots`。
 - **DOM 快照**：新增 `/api/browser-dom` 和“DOM”按钮，使用真实浏览器渲染本地页面后导出 DOM，支持简单 `#id`、`.class`、tag 和 `[attr=value]` 选择器计数。
-- **DOM 交互**：新增 `/api/browser-interact` 和“交互”按钮，通过 Chrome DevTools Protocol 在隔离 profile 中执行 `wait`、`click`、`dblClick`、`hover`、`clear`、`type`、`press`、`select`、`check`、`uncheck`、`waitText`、`waitValue`，并返回交互后的 DOM 与步骤审计。
+- **DOM 交互**：新增 `/api/browser-interact` 和“交互”按钮，通过 Chrome DevTools Protocol 在隔离 profile 中执行 `wait`、`click`、`dblClick`、`hover`、`clear`、`type`、`press`、`select`、`check`、`uncheck`、`waitText`、`waitValue`、`navigate`、`waitUrl`、`waitNetwork`，并返回交互后的 DOM 与步骤审计。
 - **像素级视觉断言**：新增 `/api/browser-visual` 和“视觉”按钮，保存 PNG 视觉基线并执行尺寸、像素 diff、阈值、mismatch sample 和可视化 diff PNG 对比。
 - **模型运行层**：支持 `FORGE_MODELS` 逗号分隔候选模型，模型请求失败时按顺序 fallback，并在健康接口和会话日志记录运行时证据。
 

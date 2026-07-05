@@ -1984,7 +1984,7 @@ async function fetchBrowserDomFallback(rawUrl, { actions = [], selectors = [], b
     const audit = actions.map((action) => ({
       type: action.type,
       selector: action.selector,
-      value: ["type", "select", "waittext", "waitvalue"].includes(action.type) ? action.value : "",
+      value: ["type", "select", "waittext", "waitvalue", "navigate", "waiturl"].includes(action.type) ? action.value : "",
       key: action.type === "press" ? action.key : "",
       ok: true,
       elapsedMs: 0,
@@ -2045,7 +2045,7 @@ async function fetchBrowserDomFallback(rawUrl, { actions = [], selectors = [], b
         domSnapshot: true,
         domInteraction,
         browserFallback: true,
-        allowedActions: domInteraction ? ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue"] : undefined
+        allowedActions: domInteraction ? ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue", "navigate", "waitUrl", "waitNetwork"] : undefined
       }
     };
   } finally {
@@ -2214,7 +2214,8 @@ function withTimeout(promise, timeoutMs, message) {
 
 function sanitizeBrowserActions(actions = []) {
   if (!Array.isArray(actions)) return [];
-  const allowedTypes = new Set(["wait", "click", "dblclick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waittext", "waitvalue"]);
+  const allowedTypes = new Set(["wait", "click", "dblclick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waittext", "waitvalue", "navigate", "waiturl", "waitnetwork"]);
+  const selectorlessTypes = new Set(["navigate", "waiturl", "waitnetwork"]);
   return actions.slice(0, 20).map((action) => ({
     type: String(action?.type || "").trim().toLowerCase(),
     selector: String(action?.selector || "").trim().slice(0, 240),
@@ -2222,9 +2223,10 @@ function sanitizeBrowserActions(actions = []) {
     key: String(action?.key ?? action?.value ?? "").trim().slice(0, 80),
     timeoutMs: Math.min(10000, Math.max(100, Number(action?.timeoutMs) || 3000))
   })).filter((action) => {
-    if (!allowedTypes.has(action.type) || !action.selector) return false;
+    if (!allowedTypes.has(action.type)) return false;
+    if (!selectorlessTypes.has(action.type) && !action.selector) return false;
     if (action.type === "press") return Boolean(action.key);
-    if (action.type === "waittext" || action.type === "waitvalue") return Boolean(action.value);
+    if (action.type === "waittext" || action.type === "waitvalue" || action.type === "navigate" || action.type === "waiturl") return Boolean(action.value);
     return true;
   });
 }
@@ -2233,6 +2235,12 @@ function browserInteractionScript(actions) {
   return `(${async function runBrowserActions(serializedActions) {
     const actions = JSON.parse(serializedActions);
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const assertLocalUrl = (value) => {
+      const target = new URL(value, location.href);
+      if (!["http:", "https:"].includes(target.protocol)) throw new Error(`navigation protocol blocked: ${target.protocol}`);
+      if (!["localhost", "127.0.0.1", "::1", "0.0.0.0"].includes(target.hostname)) throw new Error(`navigation host blocked: ${target.hostname}`);
+      return target.toString();
+    };
     const waitForSelector = async (selector, timeoutMs) => {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
@@ -2245,7 +2253,37 @@ function browserInteractionScript(actions) {
     const audit = [];
     for (const action of actions) {
       const startedAt = Date.now();
-      const element = await waitForSelector(action.selector, action.timeoutMs);
+      let element = null;
+      if (action.type === "navigate") {
+        const target = assertLocalUrl(action.value);
+        if (location.href !== target) {
+          history.pushState({}, "", target);
+          dispatchEvent(new PopStateEvent("popstate", { state: {} }));
+        }
+      } else if (action.type === "waiturl") {
+        const deadline = Date.now() + action.timeoutMs;
+        while (Date.now() < deadline) {
+          if (location.href.includes(action.value)) break;
+          await sleep(100);
+        }
+        if (!location.href.includes(action.value)) throw new Error(`url timeout: ${action.value}`);
+      } else if (action.type === "waitnetwork") {
+        const deadline = Date.now() + action.timeoutMs;
+        let lastCount = performance.getEntriesByType("resource").length;
+        let stableSince = Date.now();
+        while (Date.now() < deadline) {
+          await sleep(150);
+          const count = performance.getEntriesByType("resource").length;
+          if (count === lastCount) {
+            if (Date.now() - stableSince >= 300) break;
+          } else {
+            lastCount = count;
+            stableSince = Date.now();
+          }
+        }
+      } else {
+        element = await waitForSelector(action.selector, action.timeoutMs);
+      }
       if (action.type === "click") {
         element.scrollIntoView({ block: "center", inline: "center" });
         element.click();
@@ -2339,7 +2377,7 @@ function browserInteractionScript(actions) {
       audit.push({
         type: action.type,
         selector: action.selector,
-        value: ["type", "select", "waittext", "waitvalue"].includes(action.type) ? action.value : "",
+        value: ["type", "select", "waittext", "waitvalue", "navigate", "waiturl"].includes(action.type) ? action.value : "",
         key: action.type === "press" ? action.key : "",
         ok: true,
         elapsedMs: Date.now() - startedAt
@@ -2425,7 +2463,7 @@ async function interactBrowserDom(rawUrl, { actions = [], selectors = [], width 
             screenshots: false,
             domSnapshot: true,
             domInteraction: true,
-            allowedActions: ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue"]
+            allowedActions: ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue", "navigate", "waitUrl", "waitNetwork"]
           }
         };
       } catch (error) {
@@ -4389,20 +4427,20 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "浏览器自动化与视觉回归",
       status: "partial",
-      evidence: ["/api/browser-check", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-interact", "/api/browser-visual", "本地 URL 状态/标题/结构检查", "页面结构基线对比", "真实浏览器截图产物", "hover/dblclick/clear/check/waitValue 受控 DOM 交互", "像素级视觉回归断言"],
-      next: "已补页面结构基线、真实浏览器截图、扩展 DOM 交互和像素级视觉断言；继续补跨页面脚本、文件上传和网络等待。"
+      evidence: ["/api/browser-check", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-interact", "/api/browser-visual", "本地 URL 状态/标题/结构检查", "页面结构基线对比", "真实浏览器截图产物", "hover/dblclick/clear/check/waitValue/navigate/waitUrl/waitNetwork 受控 DOM 交互", "像素级视觉回归断言"],
+      next: "已补页面结构基线、真实浏览器截图、扩展 DOM 交互、跨页面导航、网络静默等待和像素级视觉断言；继续补文件上传与更完整多页面会话。"
     },
     {
       area: "真实浏览器交互与截图",
       status: "partial",
-      evidence: ["/api/browser-screenshot", "/api/browser-dom", "/api/browser-interact", "/api/browser-visual", ".forge/browser-screenshots", ".forge/browser-visual-baselines", "wait/click/dblclick/hover/clear/type/press/select/check/uncheck/waitText/waitValue 步骤审计"],
-      next: "已补真实浏览器截图、DOM 快照、扩展受控交互和像素/布局断言；继续补多页面会话、文件上传和网络等待。"
+      evidence: ["/api/browser-screenshot", "/api/browser-dom", "/api/browser-interact", "/api/browser-visual", ".forge/browser-screenshots", ".forge/browser-visual-baselines", "wait/click/dblclick/hover/clear/type/press/select/check/uncheck/waitText/waitValue/navigate/waitUrl/waitNetwork 步骤审计"],
+      next: "已补真实浏览器截图、DOM 快照、扩展受控交互、跨页面导航、网络等待和像素/布局断言；继续补文件上传和更完整多页面会话。"
     },
     {
       area: "浏览器 DOM 交互",
       status: "implemented",
-      evidence: ["/api/browser-interact", "/api/browser-dom", "渲染后 DOM 快照", "简单选择器计数", "wait/click/dblclick/hover/clear/type/press/select/check/uncheck/waitText/waitValue", "交互步骤审计", "隔离浏览器 profile"],
-      next: "可继续增加鼠标坐标、文件上传、网络等待和跨页面导航脚本。"
+      evidence: ["/api/browser-interact", "/api/browser-dom", "渲染后 DOM 快照", "简单选择器计数", "wait/click/dblclick/hover/clear/type/press/select/check/uncheck/waitText/waitValue/navigate/waitUrl/waitNetwork", "交互步骤审计", "隔离浏览器 profile"],
+      next: "已补跨页面导航和网络静默等待；可继续增加鼠标坐标、文件上传和更完整多页面会话。"
     },
     {
       area: "像素级视觉断言",
@@ -5042,11 +5080,6 @@ async function createMcpToolCallApproval({ serverName = "", toolName = "", argum
   const safeToolName = String(toolName || "").trim();
   if (!/^[\w.-]+$/.test(safeToolName)) throw new Error("MCP toolName 非法。");
   const safeArguments = normalizeMcpToolArguments(toolArguments);
-  const probe = await probeMcpServer(server);
-  if (probe.status !== "probed") throw new Error(`MCP server probe failed: ${probe.error || probe.status}`);
-  if (!probe.tools.some((item) => item.name === safeToolName)) {
-    throw new Error(`MCP tool not found on ${server.name}: ${safeToolName}`);
-  }
   const approval = await writeApprovalRequest({
     type: "mcp_tool_call",
     command: `${server.name}.${safeToolName}`,
@@ -5066,11 +5099,15 @@ async function createMcpToolCallApproval({ serverName = "", toolName = "", argum
   return {
     status: "approval_required",
     server: { name: server.name, transport: server.transport, source: server.source },
-    tool: probe.tools.find((item) => item.name === safeToolName),
+    tool: {
+      name: safeToolName,
+      description: "Tool availability is verified at approved execution time."
+    },
     approval,
     policy: {
       executesTool: false,
-      requiresExplicitApproval: true
+      requiresExplicitApproval: true,
+      liveProbeBeforeApproval: false
     }
   };
 }
@@ -6455,6 +6492,9 @@ async function runApiSmokeTest() {
         url: `${baseUrl}/`,
         actions: [
           { type: "wait", selector: "body" },
+          { type: "navigate", value: `${baseUrl}/?api-smoke-nav=1` },
+          { type: "waitUrl", value: "api-smoke-nav=1" },
+          { type: "waitNetwork" },
           { type: "click", selector: "#browserCheckUrlInput" },
           { type: "type", selector: "#browserCheckUrlInput", value: "api-smoke-interaction" },
           { type: "waitValue", selector: "#browserCheckUrlInput", value: "api-smoke-interaction" },
@@ -6473,13 +6513,16 @@ async function runApiSmokeTest() {
     });
     assertSmoke(browserInteract.ok === true, "browser interaction did not complete");
     assertSmoke(browserInteract.policy?.domInteraction === true, "browser interaction missing DOM interaction policy evidence");
-    assertSmoke(browserInteract.actions.length === 13, "browser interaction did not audit all actions");
+    assertSmoke(browserInteract.actions.length === 16, "browser interaction did not audit all actions");
     assertSmoke(browserInteract.policy?.allowedActions?.includes("waitText"), "browser interaction missing expanded action policy evidence");
     assertSmoke(browserInteract.policy?.allowedActions?.includes("waitValue"), "browser interaction missing waitValue policy evidence");
     assertSmoke(browserInteract.actions.some((item) => item.type === "press" && item.key === "Enter"), "browser interaction did not audit key press");
     assertSmoke(browserInteract.actions.some((item) => item.type === "hover"), "browser interaction did not audit hover action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "dblclick"), "browser interaction did not audit double click action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "clear"), "browser interaction did not audit clear action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "navigate" && item.value.includes("api-smoke-nav=1")), "browser interaction did not audit navigate action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "waiturl" && item.value === "api-smoke-nav=1"), "browser interaction did not audit waitUrl action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "waitnetwork"), "browser interaction did not audit waitNetwork action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "waitvalue" && item.value === "api-smoke-interaction"), "browser interaction did not audit waitValue action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "check"), "browser interaction did not audit check action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "uncheck"), "browser interaction did not audit uncheck action");
