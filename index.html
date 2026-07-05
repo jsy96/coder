@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Forge Code｜真实编码代理工作台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar" aria-label="工作区导航">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">F</div>
+          <div>
+            <p>Forge Code</p>
+            <span>DeepSeek 驱动的本地编码代理</span>
+          </div>
+        </div>
+
+        <button class="new-task" id="newTaskBtn" type="button">
+          <span aria-hidden="true">+</span>
+          新建会话
+        </button>
+
+        <nav class="thread-list" aria-label="最近任务">
+          <a class="thread active" href="#">
+            <span class="status-dot live"></span>
+            <span>
+              <strong>当前工作区</strong>
+              <small id="workspaceStatus">正在连接后端...</small>
+            </span>
+          </a>
+          <a class="thread" href="#">
+            <span class="status-dot idle"></span>
+            <span>
+              <strong>验证闭环</strong>
+              <small>写入后自动运行检查</small>
+            </span>
+          </a>
+          <a class="thread" href="#">
+            <span class="status-dot idle"></span>
+            <span>
+              <strong>任务证据</strong>
+              <small>记录 checkpoint / Git / 检查输出</small>
+            </span>
+          </a>
+        </nav>
+
+        <section class="repo-card" aria-label="仓库">
+          <div class="repo-head">
+            <span class="folder" aria-hidden="true"></span>
+            <div>
+              <strong id="repoName">workspace</strong>
+              <small id="branchName">DeepSeek：检测中</small>
+            </div>
+          </div>
+          <form class="workspace-form" id="workspaceForm">
+            <label class="sr-only" for="workspaceInput">工作目录</label>
+            <input id="workspaceInput" type="text" spellcheck="false" placeholder="输入本地工作目录路径" />
+            <button type="submit">切换</button>
+          </form>
+          <button class="worktree-btn" id="worktreeBtn" type="button">创建隔离任务分支</button>
+          <div class="meter" aria-label="上下文使用量">
+            <span id="contextMeter" style="width: 0%"></span>
+          </div>
+          <p id="contextText">等待加载上下文</p>
+          <div class="repo-meta" id="gitStatus">Git：检测中</div>
+        </section>
+
+        <section class="repo-card task-card" aria-label="最近任务">
+          <div class="section-title compact">
+            <span>任务日志</span>
+          </div>
+          <div id="taskList" class="task-list">等待任务记录</div>
+        </section>
+
+        <section class="repo-card files-card" aria-label="工作区文件">
+          <div class="section-title compact">
+            <span>文件</span>
+            <button id="refreshFilesBtn" type="button">刷新</button>
+          </div>
+          <div id="fileList" class="file-list">正在读取文件...</div>
+        </section>
+      </aside>
+
+      <main class="main">
+        <section class="terminal-panel" aria-label="代理会话">
+          <div class="terminal-head">
+            <div class="traffic" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <strong>会话</strong>
+            <div class="run-state compact" id="runState" aria-label="当前代理状态">
+              <span class="pulse"></span>
+              待连接
+            </div>
+            <button id="replayBtn" type="button">刷新</button>
+          </div>
+
+          <div id="log" class="log" aria-live="polite">
+            <article class="message agent">
+              <span>Forge</span>
+              <p>我会读取当前工作区文件，把需求发送给 deepseek-v4-pro，并返回计划、diff、审查发现和检查命令。批准写入后会自动运行检查，失败时生成修复 diff。</p>
+            </article>
+          </div>
+
+          <form id="promptForm" class="prompt-box">
+            <label class="sr-only" for="promptInput">任务提示词</label>
+            <textarea id="promptInput" rows="2" placeholder="例如：把这个应用改成支持查看文件内容，并补上错误提示..."></textarea>
+            <div class="prompt-actions">
+              <button class="ghost" type="button" id="attachBtn">重新加载上下文</button>
+              <button class="ghost" type="button" id="queueBtn">加入队列</button>
+              <button type="submit" id="runAgentBtn">运行代理</button>
+            </div>
+          </form>
+        </section>
+      </main>
+
+      <aside class="inspector" aria-label="运行检查器">
+        <section class="plan-card">
+          <div class="section-title">
+            <span>计划</span>
+            <div class="button-row">
+              <button type="button" id="handoffBtn">交付草稿</button>
+              <button type="button" id="rollbackBtn">回滚</button>
+              <button type="button" id="approveBtn">批准写入</button>
+            </div>
+          </div>
+          <ol class="steps" id="planSteps">
+            <li class="active">等待你的任务描述</li>
+            <li>读取工作区上下文</li>
+            <li>生成修改方案</li>
+            <li>审批后应用补丁</li>
+          </ol>
+        </section>
+
+        <section class="diff-card">
+          <div class="section-title">
+            <span>Diff 预览</span>
+            <strong id="diffSummary">暂无修改</strong>
+          </div>
+          <div id="diffList" class="diff-list">
+            <div class="empty-state">运行代理后，这里会显示 DeepSeek 生成的 unified diff。批准写入前会自动创建 checkpoint。</div>
+          </div>
+        </section>
+
+        <section class="preview-card">
+          <div class="section-title">
+            <span>检查与命令</span>
+            <div class="button-row">
+              <button type="button" id="reviewBtn">复核改动</button>
+              <button type="button" id="runCommandsBtn">运行建议命令</button>
+            </div>
+          </div>
+          <div id="checksList">
+            <div class="check-row queued">
+              <span></span>
+              等待生成建议命令
+            </div>
+          </div>
+          <div id="reviewList" class="review-list">
+            <div class="empty-state">审查发现和自动验证结果会显示在这里。</div>
+          </div>
+          <div id="queueList" class="queue-list">
+            <div class="empty-state">任务队列会显示在这里。</div>
+          </div>
+        </section>
+      </aside>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

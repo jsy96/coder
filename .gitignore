@@ -1,0 +1,45 @@
+# 依赖
+node_modules/
+miniprogram_npm/
+package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+
+# 构建产物
+dist/
+build/
+
+# 日志
+*.log
+npm-debug.log*
+
+# 环境变量与密钥
+.env
+.env.local
+*.env.local
+*.local
+
+# 云开发环境配置（本地，不入库；模板见 env.example.js）
+env.js
+
+# 微信开发者工具缓存
+.tea/
+
+# 开发者脚本产物与缓存（scripts/）
+scripts/.env
+scripts/.token_cache
+scripts/*.xlsx
+scripts/notice.txt
+scripts/ai_place_candidates*.json
