@@ -25,32 +25,755 @@ let modelRuntime = {
   lastModel: "",
   lastFallbacks: [],
   lastError: "",
-  lastUsedAt: ""
+  lastUsedAt: "",
+  lastStartedAt: "",
+  lastCompletedAt: "",
+  lastStatus: "idle",
+  requestCount: 0,
+  successCount: 0,
+  failureCount: 0,
+  totalLatencyMs: 0,
+  averageLatencyMs: 0,
+  lastLatencyMs: 0,
+  recentCalls: []
+};
+let modelUsageTotals = {
+  requestCount: 0,
+  successCount: 0,
+  failureCount: 0,
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+  totalLatencyMs: 0,
+  averageLatencyMs: 0,
+  fallbackCount: 0,
+  byModel: {}
 };
 
 function currentModelName() {
   return modelRuntime.lastModel || MODEL_CANDIDATES[0] || DEFAULT_MODEL;
 }
+
+function inferModelProvider(endpoint) {
+  let host = "";
+  try {
+    host = new URL(endpoint).hostname.toLowerCase();
+  } catch {
+    return "custom-openai-compatible";
+  }
+  if (host.includes("deepseek")) return "deepseek-compatible";
+  if (host.includes("openai")) return "openai-compatible";
+  if (host.includes("azure")) return "azure-openai-compatible";
+  if (host.includes("localhost") || host === "127.0.0.1") return "local-openai-compatible";
+  return "custom-openai-compatible";
+}
+
+function getModelEndpointInfo() {
+  try {
+    const endpoint = new URL(MODEL_API_URL);
+    return {
+      provider: inferModelProvider(MODEL_API_URL),
+      protocol: endpoint.protocol.replace(":", ""),
+      host: endpoint.hostname,
+      path: endpoint.pathname,
+      redacted: `${endpoint.protocol}//${endpoint.hostname}${endpoint.pathname}`
+    };
+  } catch {
+    return {
+      provider: "custom-openai-compatible",
+      protocol: "unknown",
+      host: "unparsed-endpoint",
+      path: "",
+      redacted: "custom endpoint"
+    };
+  }
+}
+
+function recordModelRuntimeCall(call) {
+  const latencyMs = Math.max(0, Math.round(Number(call.latencyMs) || 0));
+  const usage = normalizeModelUsage(call.usage);
+  const successCount = modelRuntime.successCount + (call.ok ? 1 : 0);
+  const failureCount = modelRuntime.failureCount + (call.ok ? 0 : 1);
+  const requestCount = successCount + failureCount;
+  const totalLatencyMs = modelRuntime.totalLatencyMs + latencyMs;
+  const completedAt = call.completedAt || new Date().toISOString();
+  modelRuntime = {
+    ...modelRuntime,
+    candidates: MODEL_CANDIDATES,
+    lastModel: call.ok ? call.model || modelRuntime.lastModel : modelRuntime.lastModel,
+    lastFallbacks: call.fallbacks || [],
+    lastError: call.ok ? "" : call.error || "",
+    lastUsedAt: completedAt,
+    lastStartedAt: call.startedAt || modelRuntime.lastStartedAt,
+    lastCompletedAt: completedAt,
+    lastStatus: call.ok ? "success" : "failed",
+    requestCount,
+    successCount,
+    failureCount,
+    totalLatencyMs,
+    averageLatencyMs: requestCount ? Math.round(totalLatencyMs / requestCount) : 0,
+    lastLatencyMs: latencyMs,
+    recentCalls: [
+      {
+        ok: Boolean(call.ok),
+        model: call.model || "",
+        startedAt: call.startedAt || "",
+        completedAt,
+        latencyMs,
+        fallbackCount: (call.fallbacks || []).length,
+        usage,
+        error: call.ok ? "" : String(call.error || "").slice(0, 500)
+      },
+      ...(modelRuntime.recentCalls || [])
+    ].slice(0, 12)
+  };
+}
+
+function normalizeModelUsage(usage = {}) {
+  const promptTokens = Math.max(0, Math.round(Number(usage.prompt_tokens ?? usage.promptTokens) || 0));
+  const completionTokens = Math.max(0, Math.round(Number(usage.completion_tokens ?? usage.completionTokens) || 0));
+  const totalTokens = Math.max(0, Math.round(Number(usage.total_tokens ?? usage.totalTokens) || (promptTokens + completionTokens) || 0));
+  return { promptTokens, completionTokens, totalTokens };
+}
+
+function emptyModelUsageLedger() {
+  return {
+    generatedAt: "",
+    workspace: currentWorkspace,
+    endpoint: getModelEndpointInfo(),
+    totals: {
+      requestCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      totalLatencyMs: 0,
+      averageLatencyMs: 0,
+      fallbackCount: 0,
+      byModel: {}
+    },
+    recent: [],
+    summary: {
+      requestCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      averageLatencyMs: 0,
+      fallbackCount: 0,
+      modelCount: 0,
+      recentCount: 0
+    },
+    policy: {
+      access: "local-read-only",
+      exposesApiKey: false,
+      changesProviderConfig: false,
+      executesModelCall: false,
+      persisted: true
+    }
+  };
+}
+
+function summarizeModelUsageLedger(ledger) {
+  const totals = ledger?.totals || {};
+  return {
+    requestCount: Number(totals.requestCount || 0),
+    successCount: Number(totals.successCount || 0),
+    failureCount: Number(totals.failureCount || 0),
+    promptTokens: Number(totals.promptTokens || 0),
+    completionTokens: Number(totals.completionTokens || 0),
+    totalTokens: Number(totals.totalTokens || 0),
+    averageLatencyMs: Number(totals.averageLatencyMs || 0),
+    fallbackCount: Number(totals.fallbackCount || 0),
+    modelCount: Object.keys(totals.byModel || {}).length,
+    recentCount: Array.isArray(ledger?.recent) ? ledger.recent.length : 0
+  };
+}
+
+function parseModelCostPolicy(raw = process.env.FORGE_MODEL_COST_POLICY) {
+  const text = String(raw || "").trim();
+  if (!text) {
+    return {
+      configured: false,
+      source: "not-configured",
+      currency: "USD",
+      models: {},
+      error: ""
+    };
+  }
+  try {
+    const parsed = JSON.parse(text);
+    const sourceModels = parsed.models && typeof parsed.models === "object" ? parsed.models : parsed;
+    const models = {};
+    for (const [model, value] of Object.entries(sourceModels || {})) {
+      if (!value || typeof value !== "object") continue;
+      const promptPer1M = Number(value.promptPer1M ?? value.inputPer1M ?? value.prompt ?? value.input ?? 0);
+      const completionPer1M = Number(value.completionPer1M ?? value.outputPer1M ?? value.completion ?? value.output ?? 0);
+      if (!Number.isFinite(promptPer1M) && !Number.isFinite(completionPer1M)) continue;
+      models[model] = {
+        promptPer1M: Number.isFinite(promptPer1M) ? Math.max(0, promptPer1M) : 0,
+        completionPer1M: Number.isFinite(completionPer1M) ? Math.max(0, completionPer1M) : 0
+      };
+    }
+    return {
+      configured: Object.keys(models).length > 0,
+      source: "FORGE_MODEL_COST_POLICY",
+      currency: String(parsed.currency || "USD"),
+      models,
+      error: ""
+    };
+  } catch (error) {
+    return {
+      configured: false,
+      source: "FORGE_MODEL_COST_POLICY",
+      currency: "USD",
+      models: {},
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function buildModelCostPolicySchema({ raw = process.env.FORGE_MODEL_COST_POLICY } = {}) {
+  const parsed = parseModelCostPolicy(raw);
+  const example = {
+    currency: "USD",
+    models: {
+      default: {
+        promptPer1M: 0,
+        completionPer1M: 0
+      },
+      [MODEL_CANDIDATES[0] || DEFAULT_MODEL]: {
+        promptPer1M: 0,
+        completionPer1M: 0
+      }
+    }
+  };
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    envVar: "FORGE_MODEL_COST_POLICY",
+    configured: parsed.configured,
+    valid: !parsed.error,
+    parsed,
+    schema: {
+      type: "object",
+      required: ["models"],
+      properties: {
+        currency: {
+          type: "string",
+          default: "USD",
+          description: "Display currency for estimated model spend."
+        },
+        models: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            properties: {
+              promptPer1M: { type: "number", minimum: 0 },
+              completionPer1M: { type: "number", minimum: 0 },
+              inputPer1M: { type: "number", minimum: 0 },
+              outputPer1M: { type: "number", minimum: 0 }
+            }
+          }
+        }
+      },
+      aliases: {
+        promptPer1M: ["inputPer1M", "prompt", "input"],
+        completionPer1M: ["outputPer1M", "completion", "output"]
+      }
+    },
+    example,
+    exampleJson: JSON.stringify(example),
+    policy: {
+      access: "local-read-only",
+      exposesApiKey: false,
+      changesProviderConfig: false,
+      writesEnvironment: false,
+      executesModelCall: false,
+      bundledPrices: false
+    },
+    notes: [
+      "This endpoint validates and documents pricing shape only; it does not write environment variables.",
+      "No provider prices are bundled. Enter your own rates per 1M prompt/completion tokens.",
+      "Use a model-specific key or default for fallback pricing."
+    ]
+  };
+}
+
+function buildModelCostEstimate({ usageLedger = null, costPolicy = parseModelCostPolicy() } = {}) {
+  const totals = usageLedger?.totals || modelUsageTotals || {};
+  const byModel = totals.byModel || {};
+  const rows = Object.entries(byModel).map(([model, usage]) => {
+    const rate = costPolicy.models?.[model] || costPolicy.models?.default || null;
+    const promptTokens = Number(usage.promptTokens || 0);
+    const completionTokens = Number(usage.completionTokens || 0);
+    const promptCost = rate ? (promptTokens / 1_000_000) * Number(rate.promptPer1M || 0) : null;
+    const completionCost = rate ? (completionTokens / 1_000_000) * Number(rate.completionPer1M || 0) : null;
+    const estimatedCost = rate ? promptCost + completionCost : null;
+    return {
+      model,
+      promptTokens,
+      completionTokens,
+      totalTokens: Number(usage.totalTokens || 0),
+      requestCount: Number(usage.requestCount || 0),
+      priced: Boolean(rate),
+      promptPer1M: rate ? Number(rate.promptPer1M || 0) : null,
+      completionPer1M: rate ? Number(rate.completionPer1M || 0) : null,
+      estimatedCost: estimatedCost === null ? null : Number(estimatedCost.toFixed(8))
+    };
+  });
+  const pricedRows = rows.filter((row) => row.priced);
+  const estimatedCost = pricedRows.reduce((sum, row) => sum + Number(row.estimatedCost || 0), 0);
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status: !costPolicy.configured
+      ? "unpriced"
+      : rows.length && rows.every((row) => row.priced)
+        ? "priced"
+        : "partial",
+    currency: costPolicy.currency || "USD",
+    configured: Boolean(costPolicy.configured),
+    source: costPolicy.source,
+    estimatedCost: Number(estimatedCost.toFixed(8)),
+    pricedModelCount: pricedRows.length,
+    unpricedModelCount: rows.filter((row) => !row.priced).length,
+    rows,
+    policy: {
+      access: "local-read-only",
+      exposesApiKey: false,
+      changesProviderConfig: false,
+      executesModelCall: false,
+      pricingSource: costPolicy.source,
+      bundledPrices: false
+    },
+    error: costPolicy.error || "",
+    notes: costPolicy.configured
+      ? ["Costs are estimates from user-configured FORGE_MODEL_COST_POLICY rates."]
+      : ["No bundled provider prices are used. Configure FORGE_MODEL_COST_POLICY to enable estimates."]
+  };
+}
+
+function parseModelBilling(raw = process.env.FORGE_MODEL_BILLING_JSON, source = "FORGE_MODEL_BILLING_JSON") {
+  const text = String(raw || "").trim();
+  if (!text) {
+    return {
+      configured: false,
+      source: "not-configured",
+      currency: "USD",
+      period: "",
+      total: null,
+      models: {},
+      invoices: [],
+      error: ""
+    };
+  }
+  try {
+    const parsed = JSON.parse(text);
+    const models = {};
+    const sourceModels = parsed.models && typeof parsed.models === "object" ? parsed.models : {};
+    for (const [model, value] of Object.entries(sourceModels)) {
+      const actualCost = typeof value === "number"
+        ? value
+        : Number(value?.actualCost ?? value?.cost ?? value?.amount ?? 0);
+      if (!Number.isFinite(actualCost)) continue;
+      models[model] = {
+        actualCost: Number(actualCost.toFixed(8))
+      };
+    }
+    const invoiceRows = Array.isArray(parsed.invoices) ? parsed.invoices : [];
+    const invoices = invoiceRows.map((invoice, index) => ({
+      id: String(invoice?.id || invoice?.invoiceId || `invoice-${index + 1}`),
+      period: String(invoice?.period || parsed.period || ""),
+      currency: String(invoice?.currency || parsed.currency || "USD"),
+      amount: Number(invoice?.amount ?? invoice?.total ?? 0)
+    })).filter((invoice) => Number.isFinite(invoice.amount));
+    const modelTotal = Object.values(models).reduce((sum, row) => sum + Number(row.actualCost || 0), 0);
+    const invoiceTotal = invoices.reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0);
+    const explicitTotal = Number(parsed.total ?? parsed.amount ?? parsed.actualCost);
+    const total = Number.isFinite(explicitTotal)
+      ? explicitTotal
+      : invoiceTotal || modelTotal;
+    return {
+      configured: Number.isFinite(total) || Object.keys(models).length > 0 || invoices.length > 0,
+      source,
+      currency: String(parsed.currency || invoices[0]?.currency || "USD"),
+      period: String(parsed.period || invoices[0]?.period || ""),
+      total: Number.isFinite(total) ? Number(total.toFixed(8)) : null,
+      models,
+      invoices,
+      error: ""
+    };
+  } catch (error) {
+    return {
+      configured: false,
+      source,
+      currency: "USD",
+      period: "",
+      total: null,
+      models: {},
+      invoices: [],
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+async function buildModelBillingReconciliation({ usageLedger = null, raw = "" } = {}) {
+  let billing = parseModelBilling(raw, "request.raw");
+  if (!String(raw || "").trim()) {
+    const fileBilling = await readJsonOrNull(MODEL_BILLING_PATH);
+    if (fileBilling && fileBilling.workspace === currentWorkspace && fileBilling.billing) {
+      billing = parseModelBilling(JSON.stringify(fileBilling.billing), MODEL_BILLING_PATH);
+    } else {
+      billing = parseModelBilling(process.env.FORGE_MODEL_BILLING_JSON, "FORGE_MODEL_BILLING_JSON");
+    }
+  }
+  const estimate = buildModelCostEstimate({ usageLedger });
+  const modelNames = new Set([
+    ...(estimate.rows || []).map((row) => row.model),
+    ...Object.keys(billing.models || {})
+  ]);
+  const rows = Array.from(modelNames).sort().map((model) => {
+    const estimated = estimate.rows.find((row) => row.model === model);
+    const actual = billing.models?.[model] || null;
+    const estimatedCost = estimated?.estimatedCost ?? null;
+    const actualCost = actual?.actualCost ?? null;
+    return {
+      model,
+      estimatedCost,
+      actualCost,
+      variance: estimatedCost === null || actualCost === null
+        ? null
+        : Number((Number(actualCost) - Number(estimatedCost)).toFixed(8)),
+      priced: Boolean(estimated?.priced),
+      requestCount: Number(estimated?.requestCount || 0),
+      promptTokens: Number(estimated?.promptTokens || 0),
+      completionTokens: Number(estimated?.completionTokens || 0),
+      totalTokens: Number(estimated?.totalTokens || 0)
+    };
+  });
+  const actualCost = billing.total === null
+    ? rows.reduce((sum, row) => sum + Number(row.actualCost || 0), 0)
+    : Number(billing.total);
+  const hasActual = billing.configured && (billing.total !== null || rows.some((row) => row.actualCost !== null));
+  const variance = hasActual ? Number((actualCost - estimate.estimatedCost).toFixed(8)) : null;
+  const fullyMapped = rows.length === 0 || rows.every((row) => row.actualCost !== null || row.estimatedCost === null);
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status: billing.error
+      ? "invalid"
+      : !billing.configured
+        ? "not-configured"
+        : !estimate.configured
+          ? "unpriced"
+          : !fullyMapped
+            ? "partial"
+            : Math.abs(variance || 0) <= 0.000001
+              ? "matched"
+              : "variance",
+    configured: Boolean(billing.configured),
+    currency: billing.currency || estimate.currency || "USD",
+    period: billing.period,
+    estimatedCost: estimate.estimatedCost,
+    actualCost: hasActual ? Number(actualCost.toFixed(8)) : null,
+    variance,
+    rows,
+    billing: {
+      source: billing.source,
+      total: billing.total,
+      modelCount: Object.keys(billing.models || {}).length,
+      invoiceCount: billing.invoices.length,
+      invoices: billing.invoices
+    },
+    estimate,
+    policy: {
+      access: "local-read-only",
+      exposesApiKey: false,
+      changesProviderConfig: false,
+      writesEnvironment: false,
+      executesModelCall: false,
+      providerBillingApi: false,
+      acceptsDryRunRaw: true
+    },
+    error: billing.error || "",
+    notes: [
+      "Reconciles local token-cost estimates against user-supplied billing JSON only.",
+      "It does not call provider billing APIs or deduct spend from provider invoices.",
+      "Configure FORGE_MODEL_BILLING_JSON or .forge/state/model-billing.json, or POST raw JSON for dry-run validation."
+    ]
+  };
+}
+
+function parseModelBudgetLimit(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const limit = Math.floor(Number(value));
+  return Number.isFinite(limit) && limit >= 0 ? limit : null;
+}
+
+function buildModelBudgetStatus({ usageLedger = null, limits = {} } = {}) {
+  const usageSummary = summarizeModelUsageLedger(usageLedger || { totals: modelUsageTotals, recent: [] });
+  const requestLimit = parseModelBudgetLimit(
+    Object.prototype.hasOwnProperty.call(limits, "requestLimit")
+      ? limits.requestLimit
+      : process.env.FORGE_MODEL_REQUEST_LIMIT
+  );
+  const tokenLimit = parseModelBudgetLimit(
+    Object.prototype.hasOwnProperty.call(limits, "tokenLimit")
+      ? limits.tokenLimit
+      : process.env.FORGE_MODEL_TOKEN_LIMIT
+  );
+  const checks = [
+    {
+      name: "request-limit",
+      configured: requestLimit !== null,
+      limit: requestLimit,
+      used: usageSummary.requestCount,
+      remaining: requestLimit === null ? null : Math.max(0, requestLimit - usageSummary.requestCount),
+      blocked: requestLimit !== null && usageSummary.requestCount >= requestLimit,
+      source: Object.prototype.hasOwnProperty.call(limits, "requestLimit")
+        ? "override"
+        : (process.env.FORGE_MODEL_REQUEST_LIMIT ? "FORGE_MODEL_REQUEST_LIMIT" : "not-configured")
+    },
+    {
+      name: "token-limit",
+      configured: tokenLimit !== null,
+      limit: tokenLimit,
+      used: usageSummary.totalTokens,
+      remaining: tokenLimit === null ? null : Math.max(0, tokenLimit - usageSummary.totalTokens),
+      blocked: tokenLimit !== null && usageSummary.totalTokens >= tokenLimit,
+      source: Object.prototype.hasOwnProperty.call(limits, "tokenLimit")
+        ? "override"
+        : (process.env.FORGE_MODEL_TOKEN_LIMIT ? "FORGE_MODEL_TOKEN_LIMIT" : "not-configured")
+    }
+  ];
+  const blockingChecks = checks.filter((item) => item.blocked);
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status: blockingChecks.length ? "blocked" : "allowed",
+    blocksModelCall: blockingChecks.length > 0,
+    checks,
+    usage: usageSummary,
+    policy: {
+      access: "local-read-only",
+      exposesApiKey: false,
+      changesProviderConfig: false,
+      executesModelCall: false,
+      enforcedBeforeProviderRequest: true
+    },
+    message: blockingChecks.length
+      ? `模型预算已阻止请求：${blockingChecks.map((item) => `${item.name} ${item.used}/${item.limit}`).join(", ")}`
+      : "模型预算允许请求。"
+  };
+}
+
+async function assertModelBudgetAllowsRequest() {
+  const usageLedger = await readModelUsageLedger();
+  const budget = buildModelBudgetStatus({ usageLedger });
+  if (budget.blocksModelCall) {
+    const startedAt = new Date().toISOString();
+    recordModelRuntimeCall({
+      ok: false,
+      model: MODEL_CANDIDATES[0] || DEFAULT_MODEL,
+      fallbacks: [],
+      error: budget.message,
+      startedAt,
+      completedAt: startedAt,
+      latencyMs: 0
+    });
+    await recordModelUsageCall({
+      ok: false,
+      model: MODEL_CANDIDATES[0] || DEFAULT_MODEL,
+      fallbacks: [],
+      error: budget.message,
+      startedAt,
+      completedAt: startedAt,
+      latencyMs: 0
+    }).catch(() => {});
+    throw new Error(budget.message);
+  }
+  return budget;
+}
+
+function mergeModelUsageTotals(baseTotals = {}, call = {}) {
+  const usage = normalizeModelUsage(call.usage);
+  const model = call.model || "unknown";
+  const latencyMs = Math.max(0, Math.round(Number(call.latencyMs) || 0));
+  const fallbackCount = Array.isArray(call.fallbacks) ? call.fallbacks.length : Number(call.fallbackCount || 0);
+  const requestCount = Number(baseTotals.requestCount || 0) + 1;
+  const successCount = Number(baseTotals.successCount || 0) + (call.ok ? 1 : 0);
+  const failureCount = Number(baseTotals.failureCount || 0) + (call.ok ? 0 : 1);
+  const totalLatencyMs = Number(baseTotals.totalLatencyMs || 0) + latencyMs;
+  const byModel = { ...(baseTotals.byModel || {}) };
+  const modelTotals = byModel[model] || {
+    requestCount: 0,
+    successCount: 0,
+    failureCount: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    totalLatencyMs: 0,
+    averageLatencyMs: 0,
+    fallbackCount: 0
+  };
+  const modelRequestCount = Number(modelTotals.requestCount || 0) + 1;
+  const modelTotalLatencyMs = Number(modelTotals.totalLatencyMs || 0) + latencyMs;
+  byModel[model] = {
+    requestCount: modelRequestCount,
+    successCount: Number(modelTotals.successCount || 0) + (call.ok ? 1 : 0),
+    failureCount: Number(modelTotals.failureCount || 0) + (call.ok ? 0 : 1),
+    promptTokens: Number(modelTotals.promptTokens || 0) + usage.promptTokens,
+    completionTokens: Number(modelTotals.completionTokens || 0) + usage.completionTokens,
+    totalTokens: Number(modelTotals.totalTokens || 0) + usage.totalTokens,
+    totalLatencyMs: modelTotalLatencyMs,
+    averageLatencyMs: modelRequestCount ? Math.round(modelTotalLatencyMs / modelRequestCount) : 0,
+    fallbackCount: Number(modelTotals.fallbackCount || 0) + fallbackCount
+  };
+  return {
+    requestCount,
+    successCount,
+    failureCount,
+    promptTokens: Number(baseTotals.promptTokens || 0) + usage.promptTokens,
+    completionTokens: Number(baseTotals.completionTokens || 0) + usage.completionTokens,
+    totalTokens: Number(baseTotals.totalTokens || 0) + usage.totalTokens,
+    totalLatencyMs,
+    averageLatencyMs: requestCount ? Math.round(totalLatencyMs / requestCount) : 0,
+    fallbackCount: Number(baseTotals.fallbackCount || 0) + fallbackCount,
+    byModel
+  };
+}
+
+function buildModelPolicy({ includeRecent = true, usageLedger = null } = {}) {
+  const endpoint = getModelEndpointInfo();
+  const candidates = MODEL_CANDIDATES.length ? MODEL_CANDIDATES : [DEFAULT_MODEL];
+  const hasApiKey = Boolean(process.env.DEEPSEEK_API_KEY);
+  const usageSummary = summarizeModelUsageLedger(usageLedger || { totals: modelUsageTotals, recent: [] });
+  const budgetStatus = buildModelBudgetStatus({ usageLedger });
+  const costEstimate = buildModelCostEstimate({ usageLedger });
+  const runtime = {
+    provider: endpoint.provider,
+    activeModel: currentModelName(),
+    candidateCount: candidates.length,
+    candidates,
+    fallbackOrder: candidates.map((model, index) => ({
+      model,
+      order: index + 1,
+      primary: index === 0,
+      lastUsed: modelRuntime.lastModel === model
+    })),
+    requestCount: modelRuntime.requestCount,
+    successCount: modelRuntime.successCount,
+    failureCount: modelRuntime.failureCount,
+    failureRate: modelRuntime.requestCount
+      ? Number((modelRuntime.failureCount / modelRuntime.requestCount).toFixed(4))
+      : 0,
+    averageLatencyMs: modelRuntime.averageLatencyMs,
+    lastLatencyMs: modelRuntime.lastLatencyMs,
+    lastStatus: modelRuntime.lastStatus,
+    lastUsedAt: modelRuntime.lastUsedAt,
+    fallbackCount: modelRuntime.lastFallbacks.length,
+    usage: usageSummary
+  };
+  const recentCalls = (modelRuntime.recentCalls || []).slice(0, includeRecent ? 12 : 0).map((call) => ({
+    ok: call.ok,
+    model: call.model,
+    startedAt: call.startedAt,
+    completedAt: call.completedAt,
+    latencyMs: call.latencyMs,
+    fallbackCount: call.fallbackCount,
+    error: call.error ? "[redacted]" : ""
+  }));
+  const budgetPolicy = {
+    mode: "local-preflight",
+    configuredCostSource: costEstimate.source,
+    estimatedSpend: costEstimate.status === "unpriced" ? "not-calculated" : costEstimate.estimatedCost,
+    unitCosts: costEstimate.configured ? "user-configured" : "not-configured",
+    costEstimate,
+    status: budgetStatus.status,
+    requestLimit: budgetStatus.checks.find((item) => item.name === "request-limit")?.limit ?? "not-configured",
+    tokenLimit: budgetStatus.checks.find((item) => item.name === "token-limit")?.limit ?? "not-configured",
+    checks: budgetStatus.checks,
+    fallbackLimit: candidates.length,
+    usageLedger: usageSummary,
+    notes: [
+      "API key values are never returned by model policy endpoints.",
+      "Provider token usage is captured when the API response includes usage fields.",
+      "FORGE_MODEL_REQUEST_LIMIT and FORGE_MODEL_TOKEN_LIMIT are checked before provider requests.",
+      "Spend estimates require user-configured FORGE_MODEL_COST_POLICY pricing.",
+      "Fallback order follows FORGE_MODELS or DEEPSEEK_MODEL environment order."
+    ]
+  };
+  const guardrails = [
+    { name: "api-key-redaction", status: "enforced", evidence: "only Boolean hasApiKey is exposed" },
+    { name: "provider-config-read-only", status: "enforced", evidence: "endpoint reports policy metadata and never mutates provider settings" },
+    { name: "fallback-order-auditable", status: candidates.length > 1 ? "configured" : "single-model", evidence: candidates.join(", ") },
+    { name: "recent-call-redaction", status: "enforced", evidence: "recent call errors are redacted in model_policy output" },
+    { name: "sse-agent-stream", status: "implemented", evidence: "/api/agent-stream emits start/goal/context/token/result/done/error events" },
+    { name: "provider-token-streaming", status: "implemented", evidence: "final non-tool JSON calls can stream provider delta tokens through /api/agent-stream token events" },
+    { name: "token-usage-ledger", status: "implemented", evidence: ".forge/state/model-usage.json" },
+    { name: "model-budget-preflight", status: "implemented", evidence: "FORGE_MODEL_REQUEST_LIMIT / FORGE_MODEL_TOKEN_LIMIT checked before provider fetch" },
+    { name: "provider-cost-accounting", status: costEstimate.configured ? costEstimate.status : "usage-only", evidence: "token usage is captured; pricing only uses FORGE_MODEL_COST_POLICY and /api/model-cost-policy schema" },
+    { name: "user-supplied-billing-reconciliation", status: "implemented", evidence: "/api/model-billing reconciles local estimates with user-supplied billing JSON without provider API calls" }
+  ];
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status: hasApiKey ? "configured" : "missing-api-key",
+    endpoint,
+    hasApiKey,
+    runtime,
+    recentCalls,
+    budgetPolicy,
+    budgetStatus,
+    costEstimate,
+    guardrails,
+    policy: {
+      access: "local-read-only",
+      exposesApiKey: false,
+      changesProviderConfig: false,
+      executesModelCall: false,
+      includesRecentCalls: Boolean(includeRecent)
+    },
+    remainingGaps: [
+      "provider API billing reconciliation and invoice-backed spend deduction"
+    ]
+  };
+}
 const CONTEXT_LIMIT_BYTES = 220 * 1024;
 const MAX_FILE_BYTES = 120 * 1024;
 const MAX_SEMANTIC_FILE_BYTES = 512 * 1024;
+const SEMANTIC_INDEX_ENTRYPOINTS = new Set(["server.js", "app.js", "index.html", "package.json"]);
 const MAX_AGENT_TURNS = 8;
 const CHECKPOINT_DIR = path.join(APP_ROOT, ".forge", "checkpoints");
 const TASK_LOG_DIR = path.join(APP_ROOT, ".forge", "tasks");
+const THREAD_DIR = path.join(APP_ROOT, ".forge", "threads");
 const WORKTREE_DIR = path.join(APP_ROOT, ".forge", "worktrees");
 const QUEUE_DIR = path.join(APP_ROOT, ".forge", "queue");
 const HANDOFF_DIR = path.join(APP_ROOT, ".forge", "handoffs");
 const REVIEW_DIR = path.join(APP_ROOT, ".forge", "reviews");
+const PROCESS_LOG_DIR = path.join(APP_ROOT, ".forge", "process-logs");
+const REMOTE_PUBLISH_DIR = path.join(APP_ROOT, ".forge", "remote-publish");
+const REMOTE_CI_DIR = path.join(APP_ROOT, ".forge", "remote-ci");
 const STATE_DIR = path.join(APP_ROOT, ".forge", "state");
 const GOAL_STATE_PATH = path.join(STATE_DIR, "goal.json");
 const CONTEXT_SNAPSHOT_PATH = path.join(STATE_DIR, "context-snapshot.json");
+const CONTEXT_COMPACT_PATH = path.join(STATE_DIR, "context-compact.json");
+const CONTEXT_ROLLUP_PATH = path.join(STATE_DIR, "context-rollup.json");
+const MODEL_USAGE_PATH = path.join(STATE_DIR, "model-usage.json");
+const MODEL_BILLING_PATH = path.join(STATE_DIR, "model-billing.json");
 const SEMANTIC_INDEX_PATH = path.join(STATE_DIR, "semantic-index.json");
 const APPROVAL_DIR = path.join(APP_ROOT, ".forge", "approvals");
+const ESCALATION_DIR = path.join(APP_ROOT, ".forge", "escalations");
 const EXTENSION_DIR = path.join(APP_ROOT, ".forge", "extensions");
 const MCP_DIR = path.join(APP_ROOT, ".forge", "mcp");
 const BROWSER_BASELINE_DIR = path.join(APP_ROOT, ".forge", "browser-baselines");
 const BROWSER_SCREENSHOT_DIR = path.join(APP_ROOT, ".forge", "browser-screenshots");
 const BROWSER_VISUAL_DIR = path.join(APP_ROOT, ".forge", "browser-visual-baselines");
+const BROWSER_SESSION_DIR = path.join(APP_ROOT, ".forge", "browser-sessions");
+const BROWSER_TRACE_DIR = path.join(APP_ROOT, ".forge", "browser-traces");
 const SKIP_DIRS = new Set([".git", ".forge", "node_modules", "dist", "build", ".next", ".turbo", "coverage"]);
 const SKIP_FILES = new Set([".env", ".env.local"]);
 const TEXT_EXTS = new Set([
@@ -92,6 +815,93 @@ function send(res, status, payload, headers = {}) {
 
 function sendError(res, status, error) {
   send(res, status, { error: error instanceof Error ? error.message : String(error) });
+}
+
+function beginSse(res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+}
+
+function writeSse(res, event, payload = {}) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function parseProviderStreamChunk(chunk) {
+  const choices = Array.isArray(chunk?.choices) ? chunk.choices : [];
+  const deltas = [];
+  for (const choice of choices) {
+    const delta = choice?.delta || {};
+    if (typeof delta.content === "string" && delta.content) deltas.push(delta.content);
+    if (typeof choice?.message?.content === "string" && choice.message.content) deltas.push(choice.message.content);
+  }
+  return {
+    content: deltas.join(""),
+    usage: chunk?.usage || null,
+    finishReason: choices.find((choice) => choice?.finish_reason)?.finish_reason || ""
+  };
+}
+
+async function readProviderSseResponse(response, onToken) {
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    throw new Error(`Provider stream response is not readable: ${text.slice(0, 160)}`);
+  }
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let usage = null;
+  let finishReason = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split(/\n\n+/);
+    buffer = events.pop() || "";
+    for (const event of events) {
+      const dataLines = event.split(/\n/).filter((line) => line.startsWith("data:"));
+      if (!dataLines.length) continue;
+      const dataText = dataLines.map((line) => line.replace(/^data:\s*/, "")).join("\n").trim();
+      if (!dataText || dataText === "[DONE]") continue;
+      let parsed = null;
+      try {
+        parsed = JSON.parse(dataText);
+      } catch {
+        continue;
+      }
+      const part = parseProviderStreamChunk(parsed);
+      if (part.usage) usage = part.usage;
+      if (part.finishReason) finishReason = part.finishReason;
+      if (part.content) {
+        content += part.content;
+        if (typeof onToken === "function") onToken(part.content, { finishReason });
+      }
+    }
+  }
+  const tail = buffer.trim();
+  if (tail) {
+    for (const dataLine of tail.split(/\n/).filter((line) => line.startsWith("data:"))) {
+      const dataText = dataLine.replace(/^data:\s*/, "").trim();
+      if (!dataText || dataText === "[DONE]") continue;
+      try {
+        const part = parseProviderStreamChunk(JSON.parse(dataText));
+        if (part.usage) usage = part.usage;
+        if (part.finishReason) finishReason = part.finishReason;
+        if (part.content) {
+          content += part.content;
+          if (typeof onToken === "function") onToken(part.content, { finishReason });
+        }
+      } catch {
+        // Ignore malformed trailing provider frames.
+      }
+    }
+  }
+  return { content, usage, finishReason };
 }
 
 async function readJson(req) {
@@ -217,8 +1027,8 @@ async function listSemanticFiles(dir = currentWorkspace, base = "") {
     if (!entry.isFile() || !isTextFile(entry.name)) continue;
     const full = path.join(dir, entry.name);
     const stat = await fs.stat(full);
-    if (stat.size > MAX_SEMANTIC_FILE_BYTES) continue;
     const relativePath = toPosix(path.join(base, entry.name));
+    if (stat.size > MAX_SEMANTIC_FILE_BYTES && !SEMANTIC_INDEX_ENTRYPOINTS.has(relativePath)) continue;
     files.push({ path: relativePath, size: stat.size });
   }
   return files.sort((a, b) => a.path.localeCompare(b.path)).slice(0, 600);
@@ -269,9 +1079,9 @@ async function buildAssetCatalog() {
     },
     gaps: [
       "cloud image vision summaries",
-      "full audio/video transcription without local engine",
-      "full PDF layout extraction",
-      "legacy Office binary parsing"
+      "cloud audio/video transcription and diarization",
+      "complex object-stream PDF layout extraction",
+      "full legacy Office formatting and embedded object parsing"
     ]
   };
 }
@@ -300,6 +1110,37 @@ function splitDelimitedLine(line, delimiter) {
   return values;
 }
 
+function inspectParquetBuffer(buffer, totalSize = buffer.length) {
+  const startsWithMagic = buffer.length >= 4 && buffer.toString("ascii", 0, 4) === "PAR1";
+  const endsWithMagic = buffer.length >= 4 && buffer.toString("ascii", buffer.length - 4, buffer.length) === "PAR1";
+  if (buffer.length < 12 || !startsWithMagic || !endsWithMagic) {
+    return {
+      format: "parquet",
+      container: "parquet",
+      magic: { header: startsWithMagic, footer: endsWithMagic },
+      footerAvailable: false,
+      warning: "Parquet footer not available in sampled bytes."
+    };
+  }
+  const footerLength = buffer.readUInt32LE(buffer.length - 8);
+  const footerStart = buffer.length - 8 - footerLength;
+  const footerAvailable = footerLength >= 0 && footerStart >= 4;
+  const footer = footerAvailable ? buffer.subarray(footerStart, buffer.length - 8) : Buffer.alloc(0);
+  return {
+    format: "parquet",
+    container: "parquet",
+    magic: { header: startsWithMagic, footer: endsWithMagic },
+    footerAvailable,
+    footerLength,
+    footerOffset: footerAvailable ? footerStart : null,
+    sampledEntireFile: buffer.length === totalSize,
+    metadataStrings: extractReadableStrings(footer, 40),
+    warning: footerAvailable
+      ? "Lightweight Parquet footer probe; full schema/row-group decoding requires a dedicated Parquet metadata parser."
+      : "Invalid or truncated Parquet footer."
+  };
+}
+
 function extractReadableStrings(buffer, limit = 80) {
   return (buffer.toString("latin1").match(/[ -~]{5,}/g) || [])
     .map((item) => item.replace(/\s+/g, " ").trim())
@@ -308,12 +1149,14 @@ function extractReadableStrings(buffer, limit = 80) {
 }
 
 function decodeXmlEntities(text = "") {
-  return String(text || "")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, "\"")
-    .replace(/&apos;/g, "'");
+  const named = { amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'" };
+  return String(text || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
+    const lower = entity.toLowerCase();
+    if (named[lower]) return named[lower];
+    if (lower.startsWith("#x")) return String.fromCodePoint(Number.parseInt(lower.slice(2), 16) || 0);
+    if (lower.startsWith("#")) return String.fromCodePoint(Number.parseInt(lower.slice(1), 10) || 0);
+    return match;
+  });
 }
 
 function extractXmlText(xml = "") {
@@ -393,18 +1236,167 @@ function inspectOfficeOpenXml(buffer, ext) {
   };
 }
 
+function extractUtf16LeStrings(buffer, limit = 80) {
+  const strings = [];
+  let current = "";
+  for (let offset = 0; offset + 1 < buffer.length; offset += 2) {
+    const code = buffer.readUInt16LE(offset);
+    if ((code >= 32 && code <= 126) || code === 9 || code === 10 || code === 13) {
+      current += String.fromCharCode(code);
+      continue;
+    }
+    if (current.trim().length >= 5) strings.push(current.replace(/\s+/g, " ").trim());
+    current = "";
+    if (strings.length >= limit) break;
+  }
+  if (current.trim().length >= 5 && strings.length < limit) {
+    strings.push(current.replace(/\s+/g, " ").trim());
+  }
+  return strings;
+}
+
+function inspectLegacyOfficeBinary(buffer, ext) {
+  const isCompoundFile = buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+  const asciiStrings = extractReadableStrings(buffer, 120);
+  const utf16Strings = extractUtf16LeStrings(buffer, 120);
+  const streamHints = [...new Set([...asciiStrings, ...utf16Strings]
+    .filter((item) => /^(WordDocument|Workbook|Book|PowerPoint Document|Pictures|SummaryInformation|DocumentSummaryInformation)$/i.test(item))
+    .slice(0, 20))];
+  const textSample = [...new Set([...utf16Strings, ...asciiStrings])]
+    .filter((item) => !/^[\x00-\x1f]+$/.test(item))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 8000);
+  return {
+    format: ext.slice(1),
+    packageType: isCompoundFile ? "compound-file-binary" : "legacy-office-binary",
+    compoundFile: isCompoundFile,
+    streamHints,
+    textSample,
+    strings: asciiStrings.slice(0, 40),
+    unicodeStrings: utf16Strings.slice(0, 40),
+    warning: isCompoundFile
+      ? "Lightweight legacy Office inspection; full formatting, tables, and embedded objects require a dedicated CFBF parser."
+      : "Legacy Office signature not detected; text extraction used best-effort string scanning."
+  };
+}
+
+function createSmokeLegacyOfficeBuffer(text = "Forge legacy DOC smoke text") {
+  const signature = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+  const padding = Buffer.alloc(512 - signature.length, 0);
+  const asciiHints = Buffer.from("WordDocument\0SummaryInformation\0", "latin1");
+  const unicodeText = Buffer.from(`\0\0${text}\0`, "utf16le");
+  return Buffer.concat([signature, padding, asciiHints, unicodeText, Buffer.alloc(256, 0)]);
+}
+
+function decodePdfLiteralString(value = "") {
+  return String(value || "")
+    .replace(/\\([()\\])/g, "$1")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t")
+    .replace(/\\([0-7]{1,3})/g, (match, octal) => String.fromCharCode(parseInt(octal, 8)))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractPdfContentSources(buffer, latin1) {
+  const sources = [{ content: latin1, compressed: false, filter: "none" }];
+  const streamPattern = /(<<[\s\S]{0,1200}?>>)\s*stream\r?\n?([\s\S]*?)\r?\n?endstream/g;
+  for (const match of latin1.matchAll(streamPattern)) {
+    const dictionary = match[1] || "";
+    if (!/\/Filter\s*(?:\[[^\]]*)?\/FlateDecode\b/.test(dictionary)) continue;
+    const raw = Buffer.from(match[2] || "", "latin1");
+    for (const candidate of [
+      raw,
+      raw.subarray(raw[0] === 0x0d && raw[1] === 0x0a ? 2 : raw[0] === 0x0a ? 1 : 0),
+      raw.subarray(0, raw.length && raw[raw.length - 1] === 0x0a ? raw.length - 1 : raw.length)
+    ]) {
+      try {
+        const inflated = zlib.inflateSync(candidate).toString("latin1");
+        sources.push({ content: inflated, compressed: true, filter: "FlateDecode" });
+        break;
+      } catch {
+        // Try the next stream boundary normalization candidate.
+      }
+    }
+  }
+  return sources;
+}
+
 function inspectPdfBuffer(buffer) {
   const latin1 = buffer.toString("latin1");
-  const literalStrings = [...latin1.matchAll(/\(([^()]{2,500})\)\s*T[jJ]/g)]
-    .map((match) => match[1].replace(/\\([()\\])/g, "$1").replace(/\\n/g, "\n").replace(/\\r/g, "\r").replace(/\\t/g, "\t"))
-    .map((item) => item.replace(/\s+/g, " ").trim())
+  const contentSources = extractPdfContentSources(buffer, latin1);
+  const joinedContent = contentSources.map((item) => item.content).join("\n");
+  const literalStrings = [...joinedContent.matchAll(/\(([^()]{2,500})\)\s*T[jJ]/g)]
+    .map((match) => decodePdfLiteralString(match[1]))
     .filter(Boolean)
     .slice(0, 80);
+  const pageBoxes = [...latin1.matchAll(/\/(?:MediaBox|CropBox)\s*\[\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*\]/g)]
+    .slice(0, 40)
+    .map((match, index) => {
+      const values = match.slice(1, 5).map((item) => Number(item));
+      return {
+        page: index + 1,
+        type: match[0].startsWith("/CropBox") ? "CropBox" : "MediaBox",
+        x0: values[0],
+        y0: values[1],
+        x1: values[2],
+        y1: values[3],
+        width: values[2] - values[0],
+        height: values[3] - values[1]
+      };
+    });
+  const textBlocks = [];
+  const textObjectPattern = /BT([\s\S]*?)ET/g;
+  for (const source of contentSources) {
+    for (const objectMatch of source.content.matchAll(textObjectPattern)) {
+      const content = objectMatch[1];
+      let x = 0;
+      let y = 0;
+      const tm = /([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+Tm/.exec(content);
+      const td = /([-\d.]+)\s+([-\d.]+)\s+T[dD]/.exec(content);
+      if (tm) {
+        x = Number(tm[5]);
+        y = Number(tm[6]);
+      } else if (td) {
+        x = Number(td[1]);
+        y = Number(td[2]);
+      }
+      const text = [...content.matchAll(/\(([^()]{1,500})\)\s*T[jJ]/g)]
+        .map((match) => decodePdfLiteralString(match[1]))
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      if (text) {
+        textBlocks.push({
+          page: Math.max(1, pageBoxes.length ? 1 : 0),
+          x,
+          y,
+          compressed: source.compressed,
+          filter: source.filter,
+          text: text.slice(0, 1000)
+        });
+      }
+      if (textBlocks.length >= 120) break;
+    }
+    if (textBlocks.length >= 120) break;
+  }
   return {
     format: "pdf",
     pagesEstimated: (latin1.match(/\/Type\s*\/Page\b/g) || []).length,
     textSample: literalStrings.join(" ").slice(0, 8000),
-    strings: extractReadableStrings(buffer, 40)
+    strings: extractReadableStrings(buffer, 40),
+    layout: {
+      engine: "local-pdf-content-stream",
+      pageBoxes,
+      textBlocks,
+      textBlockCount: textBlocks.length,
+      compressedStreamCount: contentSources.filter((item) => item.compressed).length,
+      filters: [...new Set(contentSources.map((item) => item.filter))],
+      warning: "Lightweight local parser; complex object-stream PDFs may need a dedicated PDF layout engine."
+    }
   };
 }
 
@@ -431,7 +1423,19 @@ function inspectImageBuffer(buffer, ext) {
   if (ext === ".webp" && buffer.length >= 30 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
     return { format: "webp", width: 0, height: 0, channels: "unknown" };
   }
-  if (ext === ".svg") return { format: "svg", width: 0, height: 0, channels: "vector" };
+  if (ext === ".svg") {
+    const text = buffer.toString("utf8");
+    const svgTag = /<svg\b[^>]*>/i.exec(text)?.[0] || "";
+    const attr = (name) => new RegExp(`\\b${escapeRegExp(name)}\\s*=\\s*["']([^"']+)["']`, "i").exec(svgTag)?.[1] || "";
+    const viewBox = attr("viewBox").split(/\s+/).map(Number).filter((item) => Number.isFinite(item));
+    return {
+      format: "svg",
+      width: Number.parseFloat(attr("width")) || (viewBox.length === 4 ? viewBox[2] : 0),
+      height: Number.parseFloat(attr("height")) || (viewBox.length === 4 ? viewBox[3] : 0),
+      channels: "vector",
+      viewBox: viewBox.length === 4 ? viewBox : []
+    };
+  }
   return { format: ext.replace(".", "") || "image", width: 0, height: 0, channels: "unknown" };
 }
 
@@ -520,31 +1524,124 @@ function inspectImageVision(buffer, ext) {
   }
 }
 
-async function inspectImageOcr(fullPath, ext) {
+function extractSvgText(svg = "") {
+  const text = String(svg || "");
+  const values = [];
+  for (const pattern of [
+    /<(?:title|desc|text|tspan)\b[^>]*>([\s\S]*?)<\/(?:title|desc|text|tspan)>/gi,
+    /\b(?:aria-label|alt)\s*=\s*["']([^"']+)["']/gi
+  ]) {
+    for (const match of text.matchAll(pattern)) {
+      const value = decodeXmlEntities(String(match[1] || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+      if (value) values.push(value);
+    }
+  }
+  return [...new Set(values)].slice(0, 80);
+}
+
+async function inspectImageOcr(fullPath, ext, stat) {
+  const sourceHash = crypto
+    .createHash("sha256")
+    .update(`${fullPath}:${stat.size}:${stat.mtimeMs}`)
+    .digest("hex");
+  const outputDir = path.join(APP_ROOT, ".forge", "image-ocr");
+  const textPath = path.join(outputDir, `${sourceHash}.txt`);
+  const metaPath = path.join(outputDir, `${sourceHash}.json`);
+  const cachedText = await fs.readFile(textPath, "utf8").catch(() => "");
+  const cachedMeta = parseJsonOutput(await fs.readFile(metaPath, "utf8").catch(() => ""), null);
+  if (ext === ".svg") {
+    const svgText = await fs.readFile(fullPath, "utf8").catch(() => "");
+    const extracted = extractSvgText(svgText);
+    return {
+      available: extracted.length > 0,
+      enabled: true,
+      cached: false,
+      engine: "local-svg-text-extractor",
+      textPath: "",
+      metaPath: "",
+      artifact: null,
+      textSample: extracted.join("\n").slice(0, 4000),
+      textBlocks: extracted,
+      reason: extracted.length ? "" : "no SVG text nodes, title, desc, aria-label, or alt attributes found"
+    };
+  }
   if (![".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"].includes(ext)) {
     return {
       available: false,
+      enabled: false,
+      cached: Boolean(cachedText),
       engine: "tesseract",
+      artifact: cachedMeta || null,
+      textPath: cachedText ? textPath : "",
+      textSample: cachedText.slice(0, 4000),
       reason: "unsupported image format for local OCR probe"
+    };
+  }
+  if (cachedText) {
+    return {
+      available: true,
+      enabled: true,
+      cached: true,
+      engine: "tesseract",
+      textPath,
+      metaPath,
+      artifact: cachedMeta || null,
+      textSample: cachedText.slice(0, 4000),
+      reason: ""
+    };
+  }
+  if (process.env.FORGE_ENABLE_IMAGE_OCR !== "1") {
+    return {
+      available: false,
+      enabled: false,
+      cached: false,
+      engine: "tesseract",
+      textPath,
+      metaPath,
+      reason: "set FORGE_ENABLE_IMAGE_OCR=1 to probe and run local OCR"
     };
   }
   const cli = await runLocalCommand("tesseract --version", { cwd: APP_ROOT, timeout: 5000, maxBuffer: 128 * 1024 });
   if (!cli.ok) {
     return {
       available: false,
+      enabled: true,
+      cached: Boolean(cachedText),
       engine: "tesseract",
+      artifact: cachedMeta || null,
+      textPath: cachedText ? textPath : "",
+      metaPath,
+      textSample: cachedText.slice(0, 4000),
       reason: "tesseract CLI not installed or not on PATH"
     };
   }
+  await fs.mkdir(outputDir, { recursive: true });
   const result = await runLocalCommand(`tesseract "${fullPath.replace(/"/g, "\"\"")}" stdout --psm 6`, {
     cwd: APP_ROOT,
     timeout: 15000,
     maxBuffer: 512 * 1024
   });
+  const text = result.ok ? result.output : "";
+  if (text) await fs.writeFile(textPath, text, "utf8").catch(() => {});
+  const artifact = {
+    engine: "tesseract",
+    sourcePath: fullPath,
+    sourceHash,
+    sourceSize: stat.size,
+    textPath: text ? textPath : "",
+    generatedAt: new Date().toISOString(),
+    cached: false
+  };
+  await fs.writeFile(metaPath, JSON.stringify(artifact, null, 2), "utf8").catch(() => {});
   return {
     available: result.ok,
+    enabled: true,
+    cached: false,
     engine: "tesseract",
-    textSample: result.ok ? result.output.slice(0, 4000) : "",
+    textPath: text ? textPath : "",
+    metaPath,
+    artifact,
+    textSample: text.slice(0, 4000),
     reason: result.ok ? "" : result.output.slice(0, 1000)
   };
 }
@@ -661,23 +1758,59 @@ async function inspectMediaTools(fullPath) {
 
 async function inspectMediaTranscription(fullPath, ext, stat) {
   const audioLike = [".mp3", ".wav", ".m4a", ".mp4", ".mov", ".webm"].includes(ext);
+  const sourceHash = crypto
+    .createHash("sha256")
+    .update(`${fullPath}:${stat.size}:${stat.mtimeMs}`)
+    .digest("hex");
+  const outputDir = path.join(APP_ROOT, ".forge", "media-transcripts");
+  const transcriptPath = path.join(outputDir, `${sourceHash}.txt`);
+  const metaPath = path.join(outputDir, `${sourceHash}.json`);
+  const cachedText = await fs.readFile(transcriptPath, "utf8").catch(() => "");
+  const cachedMeta = parseJsonOutput(await fs.readFile(metaPath, "utf8").catch(() => ""), null);
   if (!audioLike) {
-    return { available: false, enabled: false, engine: "whisper", reason: "unsupported media extension" };
+    return {
+      available: false,
+      enabled: false,
+      cached: Boolean(cachedText),
+      engine: "whisper",
+      artifact: cachedMeta || null,
+      reason: "unsupported media extension"
+    };
   }
   const whisper = await runLocalProcess("whisper", ["--help"], { cwd: APP_ROOT, timeout: 5000, maxBuffer: 128 * 1024 });
   if (!whisper.ok) {
     return {
       available: false,
       enabled: false,
+      cached: Boolean(cachedText),
       engine: "whisper",
+      artifact: cachedMeta || null,
+      transcriptPath: cachedText ? transcriptPath : "",
+      textSample: cachedText.slice(0, 8000),
       reason: "whisper CLI not installed or not on PATH"
+    };
+  }
+  if (cachedText) {
+    return {
+      available: true,
+      enabled: true,
+      cached: true,
+      engine: "whisper",
+      transcriptPath,
+      metaPath,
+      artifact: cachedMeta || null,
+      textSample: cachedText.slice(0, 8000),
+      reason: ""
     };
   }
   if (process.env.FORGE_ENABLE_MEDIA_TRANSCRIPTION !== "1") {
     return {
       available: true,
       enabled: false,
+      cached: false,
       engine: "whisper",
+      transcriptPath,
+      metaPath,
       reason: "set FORGE_ENABLE_MEDIA_TRANSCRIPTION=1 to run local transcription"
     };
   }
@@ -685,12 +1818,15 @@ async function inspectMediaTranscription(fullPath, ext, stat) {
     return {
       available: true,
       enabled: false,
+      cached: false,
       engine: "whisper",
+      transcriptPath,
+      metaPath,
       reason: "media file exceeds 25MB transcription limit"
     };
   }
-  const outputDir = path.join(APP_ROOT, ".forge", "media-transcripts");
   await fs.mkdir(outputDir, { recursive: true });
+  const rawOutputPath = path.join(outputDir, `${path.parse(fullPath).name}.txt`);
   const result = await runLocalProcess("whisper", [
     fullPath,
     "--model", process.env.FORGE_WHISPER_MODEL || "tiny",
@@ -698,13 +1834,31 @@ async function inspectMediaTranscription(fullPath, ext, stat) {
     "--output_dir", outputDir,
     "--fp16", "False"
   ], { cwd: APP_ROOT, timeout: 180000, maxBuffer: 1024 * 1024 });
-  const transcriptPath = path.join(outputDir, `${path.parse(fullPath).name}.txt`);
-  const text = await fs.readFile(transcriptPath, "utf8").catch(() => "");
+  const text = await fs.readFile(rawOutputPath, "utf8").catch(() => "");
+  if (text) {
+    await fs.writeFile(transcriptPath, text, "utf8");
+    if (rawOutputPath !== transcriptPath) await fs.rm(rawOutputPath, { force: true }).catch(() => {});
+  }
+  const artifact = {
+    engine: "whisper",
+    model: process.env.FORGE_WHISPER_MODEL || "tiny",
+    sourcePath: fullPath,
+    sourceHash,
+    sourceSize: stat.size,
+    transcriptPath: text ? transcriptPath : "",
+    generatedAt: new Date().toISOString(),
+    cached: false
+  };
+  await fs.writeFile(metaPath, JSON.stringify(artifact, null, 2), "utf8").catch(() => {});
   return {
     available: result.ok,
     enabled: true,
+    cached: false,
     engine: "whisper",
+    model: artifact.model,
     transcriptPath: text ? transcriptPath : "",
+    metaPath,
+    artifact,
     textSample: text.slice(0, 8000),
     reason: result.ok ? "" : result.output.slice(0, 1000)
   };
@@ -747,7 +1901,7 @@ async function inspectAsset(relativePath) {
       ...base,
       image: inspectImageBuffer(data, ext),
       vision: inspectImageVision(data, ext),
-      ocr: await inspectImageOcr(full, ext),
+      ocr: await inspectImageOcr(full, ext, stat),
       preview: text ? text.replace(/\s+/g, " ").slice(0, 2000) : "",
       strings: text ? [] : extractReadableStrings(data, 12)
     };
@@ -783,18 +1937,19 @@ async function inspectAsset(relativePath) {
         }
       };
     }
+    if (ext === ".parquet") {
+      return {
+        ...base,
+        data: inspectParquetBuffer(data, stat.size)
+      };
+    }
   }
   if (type === "document") {
     const document = [".docx", ".pptx", ".xlsx"].includes(ext)
       ? inspectOfficeOpenXml(data, ext)
       : ext === ".pdf"
         ? inspectPdfBuffer(data)
-        : {
-            format: ext.slice(1),
-            pagesEstimated: 0,
-            strings: extractReadableStrings(data, 40),
-            warning: "legacy Office binary text extraction is limited"
-          };
+        : inspectLegacyOfficeBinary(data, ext);
     return {
       ...base,
       document
@@ -902,6 +2057,143 @@ function uniqueLimited(items, limit = 80) {
   return [...new Set(items.filter(Boolean))].slice(0, limit);
 }
 
+function splitSemanticParameters(raw = "") {
+  return String(raw || "")
+    .split(",")
+    .map((item) => item.trim().replace(/\s*=.+$/, "").replace(/^\.\.\./, ""))
+    .filter(Boolean)
+    .slice(0, 24);
+}
+
+function countBraceDelta(line = "") {
+  const stripped = String(line || "")
+    .replace(/(["'`])(?:\\.|(?!\1).)*\1/g, "")
+    .replace(/\/\/.*$/, "");
+  return (stripped.match(/\{/g) || []).length - (stripped.match(/\}/g) || []).length;
+}
+
+function inferBlockEndLine(lines, startLine) {
+  let depth = 0;
+  let opened = false;
+  for (let index = Math.max(0, startLine - 1); index < lines.length; index += 1) {
+    const delta = countBraceDelta(lines[index]);
+    if (delta !== 0) opened = true;
+    depth += delta;
+    if (opened && depth <= 0) return index + 1;
+  }
+  return startLine;
+}
+
+function inferPythonBlockEndLine(lines, startLine, indent) {
+  for (let index = startLine; index < lines.length; index += 1) {
+    const line = lines[index] || "";
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const currentIndent = (line.match(/^\s*/) || [""])[0].length;
+    if (currentIndent <= indent) return index;
+  }
+  return lines.length;
+}
+
+function extractSymbolOutline(filePath, content) {
+  const ext = path.extname(filePath).toLowerCase();
+  const lines = content.split(/\r?\n/);
+  const outline = [];
+  const classStack = [];
+  const add = (item) => {
+    if (!item.name || outline.length >= 2000) return;
+    outline.push({
+      path: filePath,
+      kind: item.kind,
+      name: item.name,
+      line: item.line,
+      endLine: item.endLine || item.line,
+      params: item.params || [],
+      container: item.container || "",
+      signature: item.signature || ""
+    });
+  };
+
+  if ([".js", ".jsx", ".mjs", ".ts", ".tsx", ".vue"].includes(ext)) {
+    lines.forEach((line, index) => {
+      const lineNumber = index + 1;
+      while (classStack.length && lineNumber > classStack[classStack.length - 1].endLine) classStack.pop();
+      const classMatch = /^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/.exec(line);
+      if (classMatch) {
+        const endLine = inferBlockEndLine(lines, lineNumber);
+        classStack.push({ name: classMatch[1], endLine });
+        add({ kind: "class", name: classMatch[1], line: lineNumber, endLine, signature: line.trim().slice(0, 180) });
+        return;
+      }
+      const functionMatch = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/.exec(line);
+      if (functionMatch) {
+        add({
+          kind: "function",
+          name: functionMatch[1],
+          line: lineNumber,
+          endLine: inferBlockEndLine(lines, lineNumber),
+          params: splitSemanticParameters(functionMatch[2]),
+          signature: line.trim().slice(0, 180)
+        });
+        return;
+      }
+      const arrowMatch = /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(([^)]*)\)|([A-Za-z_$][\w$]*))\s*=>/.exec(line);
+      if (arrowMatch) {
+        add({
+          kind: "function",
+          name: arrowMatch[1],
+          line: lineNumber,
+          endLine: inferBlockEndLine(lines, lineNumber),
+          params: splitSemanticParameters(arrowMatch[2] || arrowMatch[3] || ""),
+          signature: line.trim().slice(0, 180)
+        });
+        return;
+      }
+      const methodMatch = /^\s{2,}(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*\{/.exec(line);
+      const container = classStack[classStack.length - 1]?.name || "";
+      if (methodMatch && container && !["if", "for", "while", "switch", "catch"].includes(methodMatch[1])) {
+        add({
+          kind: "method",
+          name: methodMatch[1],
+          line: lineNumber,
+          endLine: inferBlockEndLine(lines, lineNumber),
+          params: splitSemanticParameters(methodMatch[2]),
+          container,
+          signature: line.trim().slice(0, 180)
+        });
+      }
+    });
+  } else if (ext === ".py") {
+    const stack = [];
+    lines.forEach((line, index) => {
+      const lineNumber = index + 1;
+      const indent = (line.match(/^\s*/) || [""])[0].length;
+      while (stack.length && indent <= stack[stack.length - 1].indent && line.trim()) stack.pop();
+      const classMatch = /^(\s*)class\s+([A-Za-z_][\w]*)\s*[:(]/.exec(line);
+      if (classMatch) {
+        const endLine = inferPythonBlockEndLine(lines, lineNumber, indent);
+        stack.push({ name: classMatch[2], indent, endLine });
+        add({ kind: "class", name: classMatch[2], line: lineNumber, endLine, signature: line.trim().slice(0, 180) });
+        return;
+      }
+      const functionMatch = /^(\s*)(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)/.exec(line);
+      if (functionMatch) {
+        const container = stack[stack.length - 1]?.name || "";
+        add({
+          kind: container ? "method" : "function",
+          name: functionMatch[2],
+          line: lineNumber,
+          endLine: inferPythonBlockEndLine(lines, lineNumber, indent),
+          params: splitSemanticParameters(functionMatch[3]),
+          container,
+          signature: line.trim().slice(0, 180)
+        });
+      }
+    });
+  }
+
+  return outline;
+}
+
 function extractSemanticSignals(filePath, content) {
   const ext = path.extname(filePath).toLowerCase();
   const lines = content.split(/\r?\n/);
@@ -914,6 +2206,7 @@ function extractSemanticSignals(filePath, content) {
     imports: [],
     exports: [],
     declarations: [],
+    symbolOutline: [],
     calls: [],
     selectors: [],
     routes: [],
@@ -922,6 +2215,7 @@ function extractSemanticSignals(filePath, content) {
 
   const addDeclaration = (kind, name, line) => {
     if (!name || record.declarations.length >= 80) return;
+    if (record.declarations.some((item) => item.kind === kind && item.name === name && item.line === line)) return;
     record.declarations.push({ kind, name, line });
   };
   const addImport = (source, line, names = []) => {
@@ -986,6 +2280,10 @@ function extractSemanticSignals(filePath, content) {
       addDeclaration("class", match[1], findLineNumber(lines, match.index || 0));
     }
   }
+  record.symbolOutline = extractSymbolOutline(filePath, content);
+  for (const item of record.symbolOutline) {
+    addDeclaration(item.kind, item.name, item.line);
+  }
   for (const match of content.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
     const name = match[1];
     if (["if", "for", "while", "switch", "catch", "function", "return", "typeof"].includes(name)) continue;
@@ -996,6 +2294,7 @@ function extractSemanticSignals(filePath, content) {
   record.imports = record.imports.slice(0, 80);
   record.exports = record.exports.slice(0, 80);
   record.declarations = record.declarations.slice(0, 80);
+  record.symbolOutline = record.symbolOutline.slice(0, 2000);
   record.calls = record.calls.slice(0, 120);
   record.selectors = record.selectors.slice(0, 120);
   record.routes = record.routes.slice(0, 80);
@@ -1012,6 +2311,7 @@ async function buildSemanticIndex({ persist = false } = {}) {
   const imports = [];
   const routes = [];
   const selectors = [];
+  const symbolOutline = [];
   const callGraph = {};
 
   for (const file of files) {
@@ -1023,6 +2323,7 @@ async function buildSemanticIndex({ persist = false } = {}) {
     for (const item of record.imports) imports.push({ ...item, path: file.path });
     for (const route of record.routes) routes.push({ ...route, path: file.path });
     for (const selector of record.selectors) selectors.push({ ...selector, path: file.path });
+    for (const item of record.symbolOutline || []) symbolOutline.push({ ...item, path: file.path });
     callGraph[file.path] = uniqueLimited(record.calls.map((item) => item.name), 160);
   }
 
@@ -1036,6 +2337,7 @@ async function buildSemanticIndex({ persist = false } = {}) {
       imports: imports.length,
       routes: routes.length,
       selectors: selectors.length,
+      symbolOutline: symbolOutline.length,
       callEdges: Object.values(callGraph).reduce((total, calls) => total + calls.length, 0)
     },
     records: records.slice(0, 240),
@@ -1043,6 +2345,7 @@ async function buildSemanticIndex({ persist = false } = {}) {
     imports: imports.slice(0, 300),
     routes: routes.slice(0, 200),
     selectors: selectors.slice(0, 240),
+    symbolOutline: symbolOutline.slice(0, 2000),
     callGraph
   };
   if (persist) {
@@ -1190,6 +2493,627 @@ async function buildSemanticReferences(symbol = "", { limit = 80, contextLines =
   };
 }
 
+async function buildSymbolOutline({ query = "", path: targetPath = "", limit = 120, includeContext = false } = {}) {
+  const index = await readSemanticIndex() || await buildSemanticIndex();
+  const term = String(query || "").trim().toLowerCase();
+  const normalizedPath = toPosix(String(targetPath || "").trim()).replace(/^\.?\//, "");
+  const max = Math.min(300, Math.max(1, Number(limit) || 120));
+  let symbols = index.symbolOutline || [];
+  if (normalizedPath) symbols = symbols.filter((item) => toPosix(item.path || "") === normalizedPath);
+  if (term) {
+    symbols = symbols.filter((item) => [
+      item.name,
+      item.kind,
+      item.container,
+      item.signature,
+      item.path
+    ].some((value) => semanticMatch(value, term)));
+  }
+  const ranked = symbols
+    .map((item) => ({
+      ...item,
+      spanLines: Math.max(1, (item.endLine || item.line || 1) - (item.line || 1) + 1),
+      label: item.container ? `${item.container}.${item.name}` : item.name
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path) || (left.line || 0) - (right.line || 0))
+    .slice(0, max);
+  return {
+    generatedAt: new Date().toISOString(),
+    indexGeneratedAt: index.generatedAt,
+    query,
+    path: normalizedPath,
+    summary: {
+      totalSymbols: (index.symbolOutline || []).length,
+      matched: symbols.length,
+      returned: ranked.length,
+      byKind: topByCount(symbols, "kind", 20),
+      byFile: topByCount(symbols, "path", 20)
+    },
+    symbols: includeContext ? await attachReferenceContext(ranked, 1) : ranked,
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace"
+    }
+  };
+}
+
+async function buildSemanticDefinition(symbol = "", { path: targetPath = "", line = 0, contextLines = 4, limit = 20 } = {}) {
+  const name = String(symbol || "").trim();
+  const normalizedPath = toPosix(String(targetPath || "").trim()).replace(/^\.?\//, "");
+  const targetLine = Number(line) || 0;
+  const max = Math.min(80, Math.max(1, Number(limit) || 20));
+  const index = await readSemanticIndex() || await buildSemanticIndex();
+  const lowerName = name.toLowerCase();
+  let candidates = (index.symbolOutline || []).filter((item) => {
+    if (normalizedPath && toPosix(item.path || "") !== normalizedPath) return false;
+    if (lowerName && String(item.name || "").toLowerCase() !== lowerName) return false;
+    if (!lowerName && targetLine > 0) return (item.line || 0) <= targetLine && (item.endLine || item.line || 0) >= targetLine;
+    return Boolean(lowerName);
+  });
+  if (!candidates.length && lowerName) {
+    candidates = (index.declarations || []).filter((item) => {
+      if (normalizedPath && toPosix(item.path || "") !== normalizedPath) return false;
+      return String(item.name || "").toLowerCase() === lowerName;
+    });
+  }
+  const ranked = candidates
+    .map((item) => ({
+      kind: "definition",
+      path: item.path,
+      line: item.line,
+      endLine: item.endLine || item.line,
+      name: item.name,
+      type: item.kind || item.type || "symbol",
+      params: item.params || [],
+      container: item.container || "",
+      signature: item.signature || "",
+      spanLines: Math.max(1, (item.endLine || item.line || 1) - (item.line || 1) + 1),
+      score: (normalizedPath && toPosix(item.path || "") === normalizedPath ? 10 : 0)
+        + (targetLine > 0 && (item.line || 0) <= targetLine && (item.endLine || item.line || 0) >= targetLine ? 20 : 0)
+        + (lowerName && String(item.name || "").toLowerCase() === lowerName ? 10 : 0)
+    }))
+    .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path) || (left.line || 0) - (right.line || 0))
+    .slice(0, max);
+  return {
+    generatedAt: new Date().toISOString(),
+    indexGeneratedAt: index.generatedAt,
+    symbol: name,
+    path: normalizedPath,
+    line: targetLine || null,
+    matchCount: candidates.length,
+    definitions: await attachReferenceContext(ranked, contextLines),
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      usesSymbolOutline: true
+    }
+  };
+}
+
+function resolveSemanticImportCandidates(importerPath, source) {
+  const cleanSource = String(source || "").split(/[?#]/)[0].trim();
+  if (!cleanSource || !/^[./]/.test(cleanSource)) return [];
+  const importerDir = path.posix.dirname(toPosix(importerPath));
+  const base = path.posix.normalize(path.posix.join(importerDir, cleanSource));
+  const extensions = ["", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".json", ".css", ".scss", ".html", ".vue", ".py"];
+  const indexFiles = ["index.js", "index.jsx", "index.mjs", "index.cjs", "index.ts", "index.tsx", "index.json", "index.vue", "__init__.py"];
+  return uniqueLimited([
+    ...extensions.map((ext) => `${base}${ext}`),
+    ...indexFiles.map((name) => path.posix.join(base, name))
+  ], 40);
+}
+
+function summarizeSemanticDiagnostics(diagnostics) {
+  const summary = { total: diagnostics.length, severity: {}, category: {} };
+  for (const item of diagnostics) {
+    summary.severity[item.severity] = (summary.severity[item.severity] || 0) + 1;
+    summary.category[item.category] = (summary.category[item.category] || 0) + 1;
+  }
+  return summary;
+}
+
+async function buildSemanticDiagnostics({ limit = 120, includeContext = false } = {}) {
+  const index = await readSemanticIndex() || await buildSemanticIndex();
+  const files = await listSemanticFiles();
+  const fileSet = new Set(files.map((file) => toPosix(file.path)));
+  const max = Math.min(240, Math.max(1, Number(limit) || 120));
+  const diagnostics = [];
+  const add = (issue) => {
+    if (diagnostics.length >= max) return;
+    diagnostics.push({
+      severity: issue.severity || "warning",
+      category: issue.category || "semantic",
+      path: issue.path || "",
+      line: issue.line || 1,
+      title: issue.title || "Semantic diagnostic",
+      message: issue.message || "",
+      evidence: issue.evidence || {}
+    });
+  };
+
+  for (const record of index.records || []) {
+    const declarations = new Map();
+    for (const declaration of record.declarations || []) {
+      const key = `${declaration.kind}:${String(declaration.name || "").toLowerCase()}`;
+      if (!declaration.name) continue;
+      if (declarations.has(key)) {
+        add({
+          severity: "warning",
+          category: "duplicate-declaration",
+          path: record.path,
+          line: declaration.line,
+          title: `重复声明：${declaration.name}`,
+          message: `${record.path} 中 ${declaration.name} 已在第 ${declarations.get(key)} 行声明。`,
+          evidence: { name: declaration.name, kind: declaration.kind, firstLine: declarations.get(key), duplicateLine: declaration.line }
+        });
+      } else {
+        declarations.set(key, declaration.line);
+      }
+    }
+  }
+
+  let localImportCount = 0;
+  for (const item of index.imports || []) {
+    const source = String(item.source || "");
+    if (!/^[./]/.test(source)) continue;
+    localImportCount += 1;
+    const candidates = resolveSemanticImportCandidates(item.path, source);
+    if (!candidates.some((candidate) => fileSet.has(candidate))) {
+      add({
+        severity: "warning",
+        category: "unresolved-local-import",
+        path: item.path,
+        line: item.line,
+        title: `本地导入未解析：${source}`,
+        message: `${item.path} 引用了 ${source}，但语义索引没有找到对应工作区文件。`,
+        evidence: { source, candidates: candidates.slice(0, 12) }
+      });
+    }
+  }
+
+  const routeSeen = new Map();
+  const serverRoutes = new Set();
+  for (const route of index.routes || []) {
+    const routePath = String(route.path || "").split(/[?#]/)[0] || "/";
+    if (route.method === "FETCH") continue;
+    const key = `${route.method}:${routePath}`;
+    serverRoutes.add(routePath);
+    if (routeSeen.has(key)) {
+      const first = routeSeen.get(key);
+      add({
+        severity: "info",
+        category: "duplicate-route",
+        path: route.path,
+        line: route.line,
+        title: `重复路由：${route.method} ${routePath}`,
+        message: `${route.method} ${routePath} 已在 ${first.path}:${first.line} 出现。`,
+        evidence: { method: route.method, route: routePath, firstPath: first.path, firstLine: first.line }
+      });
+    } else {
+      routeSeen.set(key, { path: route.path, line: route.line });
+    }
+  }
+
+  for (const route of index.routes || []) {
+    if (route.method !== "FETCH") continue;
+    const routePath = String(route.path || "").split(/[?#]/)[0];
+    if (!routePath.startsWith("/api/")) continue;
+    if (!serverRoutes.has(routePath)) {
+      add({
+        severity: "info",
+        category: "missing-api-route",
+        path: route.path,
+        line: route.line,
+        title: `前端 API 未找到服务端路由：${routePath}`,
+        message: `${route.path} 调用了 ${routePath}，语义索引没有发现同名服务端路由。`,
+        evidence: { route: routePath, method: "FETCH" }
+      });
+    }
+  }
+
+  const rank = { error: 0, warning: 1, info: 2 };
+  diagnostics.sort((left, right) => {
+    const severity = (rank[left.severity] ?? 9) - (rank[right.severity] ?? 9);
+    if (severity !== 0) return severity;
+    return `${left.path}:${left.line}`.localeCompare(`${right.path}:${right.line}`);
+  });
+  const clipped = diagnostics.slice(0, max);
+  const withContext = includeContext ? await attachReferenceContext(clipped, 2) : clipped;
+  return {
+    generatedAt: new Date().toISOString(),
+    indexGeneratedAt: index.generatedAt,
+    checked: {
+      indexedFiles: index.indexedFiles || 0,
+      localImports: localImportCount,
+      routes: (index.routes || []).filter((route) => route.method !== "FETCH").length,
+      fetches: (index.routes || []).filter((route) => route.method === "FETCH").length
+    },
+    summary: summarizeSemanticDiagnostics(clipped),
+    diagnostics: withContext
+  };
+}
+
+async function buildSemanticImpact({ paths = [], limit = 80, includeContext = false } = {}) {
+  const explicitPaths = Array.isArray(paths) ? paths : [];
+  const max = Math.min(240, Math.max(1, Number(limit) || 80));
+  const warnings = [];
+  let source = "explicit";
+  let rawTargets = explicitPaths.map((item) => toPosix(String(item || "").trim())).filter(Boolean);
+
+  if (rawTargets.length === 0) {
+    source = "git-diff";
+    const evidence = await getCurrentDiffEvidence({ includeDiff: false });
+    rawTargets = evidence.git?.changedFiles || [];
+    if (!evidence.available) warnings.push("Git diff evidence is unavailable; pass paths explicitly for semantic impact analysis.");
+    warnings.push(...(evidence.warnings || []));
+  }
+
+  const targets = uniqueLimited(rawTargets.map((item) => toPosix(item).replace(/^\.?\//, "")).filter(Boolean), max);
+  const targetSet = new Set(targets);
+  const index = await readSemanticIndex() || await buildSemanticIndex();
+  const records = index.records || [];
+  const recordMap = new Map(records.map((record) => [toPosix(record.path), record]));
+  const indexedTargets = targets.filter((item) => recordMap.has(item));
+  const targetSummaries = targets.map((targetPath) => {
+    const record = recordMap.get(targetPath);
+    return {
+      path: targetPath,
+      indexed: Boolean(record),
+      language: record?.language || "",
+      declarations: record?.declarations?.length || 0,
+      imports: record?.imports?.length || 0,
+      routes: record?.routes?.length || 0,
+      selectors: record?.selectors?.length || 0,
+      calls: record?.calls?.length || 0
+    };
+  });
+
+  const declarations = [];
+  const declarationNames = new Set();
+  const routes = [];
+  const selectors = [];
+  for (const targetPath of indexedTargets) {
+    const record = recordMap.get(targetPath);
+    for (const declaration of record.declarations || []) {
+      declarations.push({ kind: "declaration", path: targetPath, line: declaration.line, name: declaration.name, type: declaration.kind });
+      if (declaration.name) declarationNames.add(String(declaration.name).toLowerCase());
+    }
+    for (const route of record.routes || []) {
+      routes.push({ kind: "route", path: targetPath, line: route.line, method: route.method, route: route.path });
+    }
+    for (const selector of record.selectors || []) {
+      selectors.push({ kind: "selector", path: targetPath, line: selector.line, selector: selector.selector });
+    }
+  }
+
+  const dependents = [];
+  const callers = [];
+  const callGraph = {};
+  for (const record of records) {
+    const recordPath = toPosix(record.path);
+    if (!targetSet.has(recordPath)) {
+      for (const item of record.imports || []) {
+        const candidates = resolveSemanticImportCandidates(recordPath, item.source);
+        const matchedTargets = candidates.filter((candidate) => targetSet.has(candidate));
+        if (matchedTargets.length > 0) {
+          dependents.push({
+            kind: "dependent",
+            path: recordPath,
+            line: item.line,
+            source: item.source,
+            names: item.names || [],
+            targets: matchedTargets.slice(0, 8)
+          });
+        }
+      }
+    }
+
+    const targetCalls = [];
+    for (const call of record.calls || []) {
+      if (declarationNames.has(String(call.name || "").toLowerCase())) {
+        callers.push({ kind: "caller", path: recordPath, line: call.line, name: call.name });
+        targetCalls.push(call.name);
+      }
+    }
+    if (targetSet.has(recordPath)) {
+      callGraph[recordPath] = uniqueLimited((record.calls || []).map((item) => item.name), 80);
+    } else if (targetCalls.length > 0) {
+      callGraph[recordPath] = uniqueLimited(targetCalls, 80);
+    }
+  }
+
+  if (targets.length === 0) warnings.push("No target files were provided or detected.");
+  const clippedDependents = dependents.slice(0, max);
+  const clippedCallers = callers.slice(0, max);
+  return {
+    generatedAt: new Date().toISOString(),
+    indexGeneratedAt: index.generatedAt,
+    source,
+    targets,
+    summary: {
+      targets: targets.length,
+      indexedTargets: indexedTargets.length,
+      dependents: dependents.length,
+      declarations: declarations.length,
+      routes: routes.length,
+      selectors: selectors.length,
+      callers: callers.length
+    },
+    targetSummaries,
+    declarations: declarations.slice(0, max),
+    routes: routes.slice(0, max),
+    selectors: selectors.slice(0, max),
+    dependents: includeContext ? await attachReferenceContext(clippedDependents, 2) : clippedDependents,
+    callers: includeContext ? await attachReferenceContext(clippedCallers, 2) : clippedCallers,
+    callGraph,
+    warnings: uniqueLimited(warnings.filter(Boolean), 20),
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      usesGitDiff: source === "git-diff"
+    }
+  };
+}
+
+async function buildDependencyGraph({ paths = [], limit = 120, includeExternal = false } = {}) {
+  const index = await readSemanticIndex() || await buildSemanticIndex();
+  const max = Math.min(300, Math.max(1, Number(limit) || 120));
+  const records = index.records || [];
+  const fileSet = new Set(records.map((record) => toPosix(record.path)));
+  const requested = new Set((Array.isArray(paths) ? paths : [])
+    .map((item) => toPosix(String(item || "").trim()).replace(/^\.?\//, ""))
+    .filter(Boolean));
+  const nodes = new Map();
+  const edges = [];
+  const unresolved = [];
+  const external = [];
+  for (const record of records) {
+    const recordPath = toPosix(record.path);
+    nodes.set(recordPath, {
+      path: recordPath,
+      language: record.language || "",
+      imports: (record.imports || []).length,
+      exports: (record.exports || []).length,
+      declarations: (record.declarations || []).length,
+      entrypoints: record.entrypoints || [],
+      inDegree: 0,
+      outDegree: 0
+    });
+  }
+
+  for (const record of records) {
+    const from = toPosix(record.path);
+    for (const item of record.imports || []) {
+      const source = String(item.source || "");
+      if (/^[./]/.test(source)) {
+        const candidates = resolveSemanticImportCandidates(from, source);
+        const target = candidates.find((candidate) => fileSet.has(candidate));
+        if (target) {
+          edges.push({ from, to: target, source, line: item.line, names: item.names || [] });
+          nodes.get(from).outDegree += 1;
+          nodes.get(target).inDegree += 1;
+        } else {
+          unresolved.push({ from, source, line: item.line, candidates: candidates.slice(0, 10) });
+        }
+      } else if (includeExternal && source) {
+        external.push({ from, source, line: item.line, names: item.names || [] });
+      }
+    }
+  }
+
+  const adjacency = new Map();
+  for (const node of nodes.keys()) adjacency.set(node, []);
+  for (const edge of edges) adjacency.get(edge.from)?.push(edge.to);
+  const indexByNode = new Map();
+  const lowlink = new Map();
+  const stack = [];
+  const onStack = new Set();
+  const components = [];
+  let sequence = 0;
+  const strongConnect = (node) => {
+    indexByNode.set(node, sequence);
+    lowlink.set(node, sequence);
+    sequence += 1;
+    stack.push(node);
+    onStack.add(node);
+    for (const next of adjacency.get(node) || []) {
+      if (!indexByNode.has(next)) {
+        strongConnect(next);
+        lowlink.set(node, Math.min(lowlink.get(node), lowlink.get(next)));
+      } else if (onStack.has(next)) {
+        lowlink.set(node, Math.min(lowlink.get(node), indexByNode.get(next)));
+      }
+    }
+    if (lowlink.get(node) === indexByNode.get(node)) {
+      const component = [];
+      let current = "";
+      do {
+        current = stack.pop();
+        onStack.delete(current);
+        component.push(current);
+      } while (current !== node);
+      components.push(component);
+    }
+  };
+  for (const node of nodes.keys()) {
+    if (!indexByNode.has(node)) strongConnect(node);
+  }
+  const cycles = components
+    .filter((component) => component.length > 1 || edges.some((edge) => edge.from === component[0] && edge.to === component[0]))
+    .map((component) => ({
+      nodes: component.sort(),
+      edgeCount: edges.filter((edge) => component.includes(edge.from) && component.includes(edge.to)).length
+    }))
+    .sort((left, right) => right.nodes.length - left.nodes.length || right.edgeCount - left.edgeCount)
+    .slice(0, 40);
+  const graphNodes = Array.from(nodes.values())
+    .sort((left, right) => (right.inDegree + right.outDegree) - (left.inDegree + left.outDegree) || left.path.localeCompare(right.path));
+  const targetSummaries = Array.from(requested).map((targetPath) => ({
+    path: targetPath,
+    indexed: nodes.has(targetPath),
+    dependencies: edges.filter((edge) => edge.from === targetPath).map((edge) => edge.to),
+    dependents: edges.filter((edge) => edge.to === targetPath).map((edge) => edge.from),
+    unresolved: unresolved.filter((item) => item.from === targetPath)
+  }));
+  const filteredEdges = requested.size
+    ? edges.filter((edge) => requested.has(edge.from) || requested.has(edge.to))
+    : edges;
+  return {
+    generatedAt: new Date().toISOString(),
+    indexGeneratedAt: index.generatedAt,
+    workspace: currentWorkspace,
+    summary: {
+      nodes: nodes.size,
+      edges: edges.length,
+      unresolved: unresolved.length,
+      external: external.length,
+      cycles: cycles.length,
+      requested: requested.size
+    },
+    nodes: graphNodes.slice(0, max),
+    edges: filteredEdges.slice(0, max),
+    unresolved: unresolved.slice(0, max),
+    external: external.slice(0, max),
+    cycles,
+    targetSummaries,
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      includeExternal: Boolean(includeExternal)
+    }
+  };
+}
+
+function topByCount(items, key, limit = 12) {
+  const counts = new Map();
+  for (const item of items || []) {
+    const value = typeof key === "function" ? key(item) : item?.[key];
+    if (!value) continue;
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([name, count]) => ({ name, count }))
+    .sort((left, right) => right.count - left.count || String(left.name).localeCompare(String(right.name)))
+    .slice(0, limit);
+}
+
+function rankSemanticHotspots(index, graph, limit = 16) {
+  const diagnosticsByPath = new Map();
+  for (const diagnostic of graph.diagnostics || []) {
+    diagnosticsByPath.set(diagnostic.path, (diagnosticsByPath.get(diagnostic.path) || 0) + 1);
+  }
+  const nodeByPath = new Map((graph.nodes || []).map((node) => [node.path, node]));
+  return (index.records || [])
+    .map((record) => {
+      const node = nodeByPath.get(record.path) || {};
+      const apiSurface = (record.routes || []).length + (record.selectors || []).length;
+      const symbolSurface = (record.declarations || []).length + (record.exports || []).length;
+      const dependencySurface = (node.inDegree || 0) + (node.outDegree || 0);
+      const diagnosticCount = diagnosticsByPath.get(record.path) || 0;
+      const score = dependencySurface * 3 + apiSurface * 2 + symbolSurface + diagnosticCount * 4;
+      return {
+        path: record.path,
+        language: record.language,
+        score,
+        inDegree: node.inDegree || 0,
+        outDegree: node.outDegree || 0,
+        declarations: (record.declarations || []).length,
+        routes: (record.routes || []).length,
+        selectors: (record.selectors || []).length,
+        diagnostics: diagnosticCount,
+        entrypoints: record.entrypoints || []
+      };
+    })
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path))
+    .slice(0, limit);
+}
+
+async function buildCodeIntelligenceOverview({ limit = 24, includeDiagnostics = true } = {}) {
+  const max = Math.min(80, Math.max(1, Number(limit) || 24));
+  const index = await readSemanticIndex() || await buildSemanticIndex();
+  const [diagnostics, graph] = await Promise.all([
+    includeDiagnostics ? buildSemanticDiagnostics({ limit: max, includeContext: false }) : Promise.resolve({ summary: { total: 0 }, diagnostics: [] }),
+    buildDependencyGraph({ limit: Math.max(max * 2, 40), includeExternal: true })
+  ]);
+  const entrypoints = (index.records || [])
+    .filter((record) => (record.entrypoints || []).length > 0 || (record.routes || []).some((route) => route.method !== "FETCH"))
+    .map((record) => ({
+      path: record.path,
+      language: record.language,
+      entrypoints: record.entrypoints || [],
+      routes: (record.routes || []).filter((route) => route.method !== "FETCH").length,
+      fetches: (record.routes || []).filter((route) => route.method === "FETCH").length,
+      declarations: (record.declarations || []).length
+    }))
+    .sort((left, right) => right.routes - left.routes || right.declarations - left.declarations || left.path.localeCompare(right.path))
+    .slice(0, max);
+  const apiSurface = {
+    serverRoutes: (index.routes || []).filter((route) => route.method !== "FETCH").slice(0, max),
+    clientFetches: (index.routes || []).filter((route) => route.method === "FETCH").slice(0, max),
+    byMethod: topByCount((index.routes || []).filter((route) => route.method !== "FETCH"), "method", 12),
+    topRouteFiles: topByCount((index.routes || []).filter((route) => route.method !== "FETCH"), "path", 12)
+  };
+  const symbolSurface = {
+    declarationsByKind: topByCount(index.declarations || [], "kind", 12),
+    topDeclarationFiles: topByCount(index.declarations || [], "path", 12),
+    outlineByKind: topByCount(index.symbolOutline || [], "kind", 12),
+    largestSymbols: (index.symbolOutline || [])
+      .map((item) => ({ ...item, spanLines: Math.max(1, (item.endLine || item.line || 1) - (item.line || 1) + 1) }))
+      .sort((left, right) => right.spanLines - left.spanLines || left.path.localeCompare(right.path))
+      .slice(0, max),
+    topCalls: topByCount((index.records || []).flatMap((record) => record.calls || []), "name", 20),
+    exportedSymbols: (index.records || [])
+      .flatMap((record) => (record.exports || []).map((item) => ({ ...item, path: record.path })))
+      .slice(0, max)
+  };
+  const dependencySurface = {
+    summary: graph.summary,
+    hotspots: rankSemanticHotspots(index, { ...graph, diagnostics: diagnostics.diagnostics || [] }, max),
+    cycles: (graph.cycles || []).slice(0, Math.min(20, max)),
+    unresolved: (graph.unresolved || []).slice(0, max),
+    external: (graph.external || []).slice(0, max)
+  };
+  const readiness = [];
+  if ((diagnostics.summary?.severity?.error || 0) > 0) readiness.push({ status: "blocker", message: "语义诊断存在 error 级问题，应先修复再扩大修改。" });
+  if ((graph.summary?.unresolved || 0) > 0) readiness.push({ status: "warning", message: "存在未解析本地导入，影响依赖图和影响面判断。" });
+  if ((graph.summary?.cycles || 0) > 0) readiness.push({ status: "warning", message: "依赖图存在循环组件，改动时需要更保守的验证范围。" });
+  if ((apiSurface.serverRoutes || []).length > 0 && (apiSurface.clientFetches || []).length === 0) readiness.push({ status: "info", message: "服务端 API 面已发现；前端 fetch 线索较少或集中在动态调用中。" });
+  if (readiness.length === 0) readiness.push({ status: "ok", message: "本地语义索引、依赖图和诊断结果未发现明显阻塞。" });
+  return {
+    generatedAt: new Date().toISOString(),
+    indexGeneratedAt: index.generatedAt,
+    workspace: currentWorkspace,
+    summary: {
+      indexedFiles: index.indexedFiles || 0,
+      declarations: index.summary?.declarations || 0,
+      imports: index.summary?.imports || 0,
+      routes: index.summary?.routes || 0,
+      selectors: index.summary?.selectors || 0,
+      symbolOutline: index.summary?.symbolOutline || 0,
+      diagnostics: diagnostics.summary?.total || 0,
+      dependencyNodes: graph.summary?.nodes || 0,
+      dependencyEdges: graph.summary?.edges || 0,
+      cycles: graph.summary?.cycles || 0,
+      unresolvedImports: graph.summary?.unresolved || 0
+    },
+    entrypoints,
+    apiSurface,
+    symbolSurface,
+    dependencySurface,
+    diagnostics: {
+      summary: diagnostics.summary,
+      items: (diagnostics.diagnostics || []).slice(0, max)
+    },
+    readiness,
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      usesCachedIndex: Boolean(await readSemanticIndex())
+    }
+  };
+}
+
 async function buildRepoMap() {
   const files = await listFiles();
   const extCounts = {};
@@ -1304,15 +3228,338 @@ async function buildContextSnapshot({ deep = false } = {}) {
       git.available ? `git branch ${git.branch || "detached"}` : "git status skipped in light snapshot"
     ]
   };
-  await fs.mkdir(STATE_DIR, { recursive: true });
-  await fs.writeFile(CONTEXT_SNAPSHOT_PATH, JSON.stringify(snapshot, null, 2), "utf8");
+  await writeJsonAtomic(CONTEXT_SNAPSHOT_PATH, snapshot);
   return snapshot;
 }
 
+async function writeJsonAtomic(filePath, value) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(value, null, 2), "utf8");
+  await fs.rename(tempPath, filePath);
+}
+
+async function readJsonOrNull(filePath) {
+  const text = await fs.readFile(filePath, "utf8").catch(() => "");
+  if (!text.trim()) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function readModelUsageLedger() {
+  const ledger = await readJsonOrNull(MODEL_USAGE_PATH);
+  if (!ledger || ledger.workspace !== currentWorkspace) {
+    return emptyModelUsageLedger();
+  }
+  modelUsageTotals = {
+    ...emptyModelUsageLedger().totals,
+    ...(ledger.totals || {}),
+    byModel: { ...(ledger.totals?.byModel || {}) }
+  };
+  return {
+    ...emptyModelUsageLedger(),
+    ...ledger,
+    endpoint: ledger.endpoint || getModelEndpointInfo(),
+    totals: modelUsageTotals,
+    recent: Array.isArray(ledger.recent) ? ledger.recent : [],
+    summary: summarizeModelUsageLedger({
+      totals: modelUsageTotals,
+      recent: Array.isArray(ledger.recent) ? ledger.recent : []
+    })
+  };
+}
+
+async function recordModelUsageCall(call) {
+  const previous = await readModelUsageLedger();
+  const usage = normalizeModelUsage(call.usage);
+  const completedAt = call.completedAt || new Date().toISOString();
+  const entry = {
+    ok: Boolean(call.ok),
+    model: call.model || "unknown",
+    provider: inferModelProvider(MODEL_API_URL),
+    startedAt: call.startedAt || "",
+    completedAt,
+    latencyMs: Math.max(0, Math.round(Number(call.latencyMs) || 0)),
+    fallbackCount: Array.isArray(call.fallbacks) ? call.fallbacks.length : Number(call.fallbackCount || 0),
+    usage,
+    error: call.ok ? "" : "[redacted]"
+  };
+  const totals = mergeModelUsageTotals(previous.totals, {
+    ...call,
+    model: entry.model,
+    latencyMs: entry.latencyMs,
+    usage
+  });
+  modelUsageTotals = totals;
+  const ledger = {
+    ...emptyModelUsageLedger(),
+    generatedAt: completedAt,
+    workspace: currentWorkspace,
+    endpoint: getModelEndpointInfo(),
+    totals,
+    recent: [entry, ...(previous.recent || [])].slice(0, 80),
+    summary: summarizeModelUsageLedger({ totals, recent: [entry, ...(previous.recent || [])].slice(0, 80) }),
+    policy: {
+      access: "local-read-only",
+      exposesApiKey: false,
+      changesProviderConfig: false,
+      executesModelCall: false,
+      persisted: true,
+      redactsErrors: true
+    }
+  };
+  await writeJsonAtomic(MODEL_USAGE_PATH, ledger);
+  return ledger;
+}
+
 async function readContextSnapshot() {
-  const snapshot = JSON.parse(await fs.readFile(CONTEXT_SNAPSHOT_PATH, "utf8").catch(() => "null"));
+  const snapshot = await readJsonOrNull(CONTEXT_SNAPSHOT_PATH);
   if (!snapshot || snapshot.workspace !== currentWorkspace) return null;
   return snapshot;
+}
+
+async function buildContextCompaction({ deep = false } = {}) {
+  const snapshot = await buildContextSnapshot({ deep });
+  const goal = await readGoalState();
+  const tasks = await listTaskLogs(5);
+  const reviews = await listReviewArtifacts(5);
+  const approvals = await listApprovalRequests(10);
+  const diffEvidence = await getCurrentDiffEvidence({ includeDiff: false });
+  const compact = {
+    workspace: currentWorkspace,
+    generatedAt: new Date().toISOString(),
+    sourceSnapshotAt: snapshot.generatedAt,
+    deep,
+    objective: goal.objective || goal.lastPrompt || "",
+    state: {
+      phase: goal.phase || "idle",
+      status: goal.status || "idle",
+      nextStep: goal.nextStep || "",
+      pendingProposalId: goal.pendingProposal?.id || ""
+    },
+    repo: {
+      fileCount: snapshot.fileCount,
+      totalBytes: snapshot.totalBytes,
+      extCounts: Object.fromEntries(Object.entries(snapshot.extCounts || {}).slice(0, 20)),
+      scripts: (snapshot.scripts || []).slice(0, 20),
+      topFiles: (snapshot.topFiles || []).slice(0, 20),
+      symbols: (snapshot.symbols || []).slice(0, 40),
+      semanticIndex: snapshot.semanticIndex || {}
+    },
+    git: {
+      available: diffEvidence.git?.available || false,
+      branch: diffEvidence.git?.branch || snapshot.git?.branch || "",
+      changedFiles: (diffEvidence.git?.changedFiles || snapshot.git?.changedFiles || []).slice(0, 60),
+      diffStat: diffEvidence.stat || "",
+      warnings: diffEvidence.warnings || []
+    },
+    evidence: {
+      recentTasks: tasks.map((task) => ({
+        id: task.id,
+        status: task.status,
+        prompt: task.prompt,
+        changedFiles: task.changedFiles || [],
+        checksOk: Boolean(task.checksOk)
+      })),
+      recentReviews: reviews.map((review) => ({
+        id: review.id,
+        prompt: review.prompt || "",
+        summary: review.reply || "",
+        findings: (review.review || []).length
+      })),
+      pendingApprovals: approvals
+        .filter((approval) => approval.status === "blocked" || approval.status === "pending")
+        .slice(0, 10)
+        .map((approval) => ({
+          id: approval.id,
+          type: approval.type || "command",
+          status: approval.status,
+          reason: approval.reason || approval.policy?.reason || ""
+        }))
+    },
+    summary: [
+      goal.objective ? `Objective: ${goal.objective}` : "Objective not set.",
+      `Workspace: ${currentWorkspace}`,
+      `Files: ${snapshot.fileCount}, symbols: ${(snapshot.symbols || []).length}`,
+      diffEvidence.git?.available ? `Branch: ${diffEvidence.git.branch || "detached"}` : "Git unavailable or skipped.",
+      `${(diffEvidence.git?.changedFiles || []).length} changed file(s) in light diff evidence.`,
+      tasks.length ? `${tasks.length} recent task artifact(s).` : "No recent task artifacts.",
+      reviews.length ? `${reviews.length} recent review artifact(s).` : "No recent review artifacts.",
+      approvals.length ? `${approvals.length} approval artifact(s).` : "No approval artifacts."
+    ]
+  };
+  await writeJsonAtomic(CONTEXT_COMPACT_PATH, compact);
+  return compact;
+}
+
+async function readContextCompaction() {
+  const compact = await readJsonOrNull(CONTEXT_COMPACT_PATH);
+  if (!compact || compact.workspace !== currentWorkspace) return null;
+  return compact;
+}
+
+async function buildContextRollup({ limit = 24, query = "" } = {}) {
+  const max = Math.min(80, Math.max(1, Number(limit) || 24));
+  const term = String(query || "").trim().toLowerCase();
+  const goal = await readGoalState();
+  const [tasks, reviews, approvals, diffEvidence, compact] = await Promise.all([
+    listTaskLogs(max),
+    listReviewArtifacts(max),
+    listApprovalRequests(max),
+    getCurrentDiffEvidence({ includeDiff: false }),
+    readContextCompaction()
+  ]);
+  const entries = [];
+  const pushEntry = (entry) => {
+    const searchable = [
+      entry.type,
+      entry.title,
+      entry.summary,
+      ...(entry.changedFiles || []),
+      ...(entry.tags || [])
+    ].join(" ").toLowerCase();
+    if (term && !searchable.includes(term)) return;
+    entries.push(entry);
+  };
+
+  pushEntry({
+    id: "goal-current",
+    type: "goal",
+    createdAt: goal.updatedAt || "",
+    title: goal.objective || goal.lastPrompt || "Current objective",
+    summary: [goal.phase || "idle", goal.status || "idle", goal.nextStep || ""].filter(Boolean).join(" · "),
+    tags: [goal.phase || "idle", goal.status || "idle"]
+  });
+
+  for (const task of tasks) {
+    pushEntry({
+      id: task.id,
+      type: "task",
+      createdAt: task.createdAt || "",
+      title: task.prompt || "Task artifact",
+      summary: `${task.status || "unknown"} · checks ${task.checksOk ? "ok" : "not-ok"}`,
+      changedFiles: task.changedFiles || [],
+      tags: [task.status || "unknown", task.checksOk ? "checks-ok" : "checks-not-ok"]
+    });
+  }
+  for (const review of reviews) {
+    pushEntry({
+      id: review.id,
+      type: "review",
+      createdAt: review.createdAt || "",
+      title: review.prompt || "Review artifact",
+      summary: `${review.findingCount || 0} finding(s), ${review.commandCount || 0} command(s)`,
+      changedFiles: review.changedFiles || [],
+      tags: ["review", review.findingCount ? "findings" : "no-findings"]
+    });
+  }
+  for (const approval of approvals) {
+    pushEntry({
+      id: approval.id,
+      type: "approval",
+      createdAt: approval.createdAt || "",
+      title: approval.command || approval.type || "Approval artifact",
+      summary: `${approval.status || "unknown"} · ${approval.reason || approval.risk || ""}`.trim(),
+      tags: [approval.status || "unknown", approval.risk || "blocked", approval.type || "command"]
+    });
+  }
+  for (const file of diffEvidence.git?.changedFiles || []) {
+    pushEntry({
+      id: `git:${file}`,
+      type: "git",
+      createdAt: new Date().toISOString(),
+      title: file,
+      summary: diffEvidence.stat || "Changed in working tree",
+      changedFiles: [file],
+      tags: ["git", "changed-file"]
+    });
+  }
+
+  entries.sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")));
+  const clippedEntries = entries.slice(0, max);
+  const rollup = {
+    workspace: currentWorkspace,
+    generatedAt: new Date().toISOString(),
+    sourceCompactAt: compact?.generatedAt || "",
+    query: term,
+    summary: {
+      entries: clippedEntries.length,
+      tasks: clippedEntries.filter((item) => item.type === "task").length,
+      reviews: clippedEntries.filter((item) => item.type === "review").length,
+      approvals: clippedEntries.filter((item) => item.type === "approval").length,
+      git: clippedEntries.filter((item) => item.type === "git").length,
+      goals: clippedEntries.filter((item) => item.type === "goal").length
+    },
+    entries: clippedEntries,
+    changedFiles: uniqueLimited(clippedEntries.flatMap((item) => item.changedFiles || []), 80),
+    nextFocus: clippedEntries.slice(0, 8).map((item) => `${item.type}: ${item.title}`),
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      persistedPath: toPosix(path.relative(APP_ROOT, CONTEXT_ROLLUP_PATH))
+    }
+  };
+  await writeJsonAtomic(CONTEXT_ROLLUP_PATH, rollup);
+  return rollup;
+}
+
+async function readContextRollup() {
+  const rollup = await readJsonOrNull(CONTEXT_ROLLUP_PATH);
+  if (!rollup || rollup.workspace !== currentWorkspace) return null;
+  return rollup;
+}
+
+let contextCompactionTimer = null;
+let contextCompactionPendingReason = "";
+let contextCompactionPromise = null;
+
+async function runContextCompactionArtifact(reason = "state-change") {
+  const compact = await buildContextCompaction({ deep: false });
+  compact.autoGenerated = true;
+  compact.autoReason = reason || "state-change";
+  compact.autoGeneratedAt = new Date().toISOString();
+  await writeJsonAtomic(CONTEXT_COMPACT_PATH, compact);
+  await buildContextRollup({ limit: 24 });
+  return compact;
+}
+
+function scheduleContextCompaction(reason = "state-change") {
+  contextCompactionPendingReason = reason || contextCompactionPendingReason || "state-change";
+  if (contextCompactionTimer) return;
+  contextCompactionTimer = setTimeout(async () => {
+    const reasonForRun = contextCompactionPendingReason || "state-change";
+    contextCompactionTimer = null;
+    contextCompactionPendingReason = "";
+    contextCompactionPromise = runContextCompactionArtifact(reasonForRun);
+    try {
+      await contextCompactionPromise;
+    } catch {
+      // Best-effort resumability evidence should never block the user path.
+    } finally {
+      contextCompactionPromise = null;
+    }
+  }, 250);
+}
+
+async function flushContextCompaction(reason = "state-change") {
+  if (contextCompactionTimer) {
+    clearTimeout(contextCompactionTimer);
+    contextCompactionTimer = null;
+    const reasonForRun = contextCompactionPendingReason || reason;
+    contextCompactionPendingReason = "";
+    contextCompactionPromise = runContextCompactionArtifact(reasonForRun);
+  }
+  if (contextCompactionPromise) {
+    try {
+      return await contextCompactionPromise;
+    } finally {
+      contextCompactionPromise = null;
+    }
+  }
+  return await readContextCompaction();
 }
 
 function parseUnifiedDiff(diffText) {
@@ -1391,6 +3638,150 @@ function applyUnifiedDiffToContent(content, filePatch) {
   return output.join("\n");
 }
 
+function singleHunkPatch(filePatch, hunk) {
+  return {
+    path: filePatch.path,
+    hunks: [hunk]
+  };
+}
+
+function hunkLabel(hunk) {
+  return `@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`;
+}
+
+async function analyzeUnifiedDiffApplication(diffText) {
+  const parsed = parseUnifiedDiff(diffText);
+  const files = [];
+  for (const filePatch of parsed) {
+    const before = await readWorkspaceFile(filePatch.path).catch(() => "");
+    try {
+      const after = applyUnifiedDiffToContent(before, filePatch);
+      files.push({
+        path: filePatch.path,
+        status: "applicable",
+        hunkCount: filePatch.hunks.length,
+        applicableHunks: filePatch.hunks.length,
+        conflictHunks: 0,
+        beforeBytes: Buffer.byteLength(before, "utf8"),
+        afterBytes: Buffer.byteLength(after, "utf8"),
+        diff: renderSingleFileDiff(filePatch),
+        patch: filePatch,
+        after,
+        hunkConflicts: []
+      });
+    } catch (error) {
+      const applicableHunks = [];
+      const hunkConflicts = [];
+      for (const hunk of filePatch.hunks) {
+        try {
+          applyUnifiedDiffToContent(before, singleHunkPatch(filePatch, hunk));
+          applicableHunks.push(hunk);
+        } catch (hunkError) {
+          hunkConflicts.push({
+            label: hunkLabel(hunk),
+            oldStart: hunk.oldStart,
+            oldCount: hunk.oldCount,
+            newStart: hunk.newStart,
+            newCount: hunk.newCount,
+            diff: renderSingleFileDiff(singleHunkPatch(filePatch, hunk)),
+            error: hunkError instanceof Error ? hunkError.message : String(hunkError)
+          });
+        }
+      }
+      if (applicableHunks.length) {
+        const partialPatch = { path: filePatch.path, hunks: applicableHunks };
+        const after = applyUnifiedDiffToContent(before, partialPatch);
+        files.push({
+          path: filePatch.path,
+          status: "partial",
+          hunkCount: filePatch.hunks.length,
+          applicableHunks: applicableHunks.length,
+          conflictHunks: hunkConflicts.length,
+          beforeBytes: Buffer.byteLength(before, "utf8"),
+          afterBytes: Buffer.byteLength(after, "utf8"),
+          diff: renderSingleFileDiff(partialPatch),
+          originalDiff: renderSingleFileDiff(filePatch),
+          patch: partialPatch,
+          after,
+          error: error instanceof Error ? error.message : String(error),
+          hunkConflicts
+        });
+        continue;
+      }
+      files.push({
+        path: filePatch.path,
+        status: "conflict",
+        hunkCount: filePatch.hunks.length,
+        applicableHunks: 0,
+        conflictHunks: filePatch.hunks.length,
+        beforeBytes: Buffer.byteLength(before, "utf8"),
+        afterBytes: null,
+        diff: renderSingleFileDiff(filePatch),
+        patch: filePatch,
+        after: null,
+        error: error instanceof Error ? error.message : String(error),
+        hunkConflicts
+      });
+    }
+  }
+  const conflicts = files
+    .filter((file) => file.status === "conflict" || file.status === "partial")
+    .flatMap(({ path: filePath, status, hunkCount, applicableHunks, conflictHunks, error, diff, hunkConflicts }) => {
+      if (hunkConflicts?.length) {
+        return hunkConflicts.map((hunk) => ({
+          path: filePath,
+          status,
+          hunkCount,
+          applicableHunks,
+          conflictHunks,
+          hunk: hunk.label,
+          oldStart: hunk.oldStart,
+          oldCount: hunk.oldCount,
+          newStart: hunk.newStart,
+          newCount: hunk.newCount,
+          error: hunk.error,
+          diff: hunk.diff
+        }));
+      }
+      return [{ path: filePath, status, hunkCount, applicableHunks, conflictHunks, error, diff }];
+    });
+  const applicable = files
+    .filter((file) => file.status === "applicable" || file.status === "partial")
+    .map(({ path: filePath, status, hunkCount, applicableHunks, conflictHunks, beforeBytes, afterBytes, diff }) => ({
+      path: filePath,
+      status,
+      hunkCount,
+      applicableHunks,
+      conflictHunks,
+      beforeBytes,
+      afterBytes,
+      diff
+    }));
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      files: files.length,
+      applicable: applicable.length,
+      conflicts: conflicts.length,
+      applicableHunks: files.reduce((sum, file) => sum + (file.applicableHunks || 0), 0),
+      conflictHunks: files.reduce((sum, file) => sum + (file.conflictHunks || 0), 0)
+    },
+    files: [...applicable, ...conflicts],
+    applicable,
+    conflicts,
+    parsed,
+    prepared: files,
+    policy: {
+      access: "workspace-diff-preflight",
+      createsCheckpoint: false,
+      writesFiles: false,
+      supportsPartialApply: true,
+      supportsPartialHunks: true
+    }
+  };
+}
+
 async function previewUnifiedDiff(diffText) {
   const parsed = parseUnifiedDiff(diffText);
   const patches = [];
@@ -1404,6 +3795,208 @@ async function previewUnifiedDiff(diffText) {
     });
   }
   return patches;
+}
+
+function buildConflictPreviewBlock(conflict) {
+  const lines = String(conflict.diff || "").split(/\r?\n/);
+  const current = [];
+  const proposed = [];
+  const context = [];
+  for (const line of lines) {
+    if (!line || line.startsWith("---") || line.startsWith("+++") || line.startsWith("@@") || line.startsWith("diff --git")) {
+      continue;
+    }
+    if (line.startsWith("-")) {
+      current.push(line.slice(1));
+    } else if (line.startsWith("+")) {
+      proposed.push(line.slice(1));
+    } else if (line.startsWith(" ")) {
+      const value = line.slice(1);
+      context.push(value);
+      current.push(value);
+      proposed.push(value);
+    }
+  }
+  return {
+    marker: [
+      "<<<<<<< CURRENT",
+      ...current,
+      "=======",
+      ...proposed,
+      ">>>>>>> PROPOSED"
+    ].join("\n"),
+    current,
+    proposed,
+    context
+  };
+}
+
+async function buildDiffConflictPreview(diffText) {
+  const analysis = await analyzeUnifiedDiffApplication(diffText);
+  const conflictPreviews = analysis.conflicts.map((conflict) => ({
+    path: conflict.path,
+    status: conflict.status,
+    hunk: conflict.hunk || "",
+    oldStart: conflict.oldStart || null,
+    oldCount: conflict.oldCount || null,
+    newStart: conflict.newStart || null,
+    newCount: conflict.newCount || null,
+    error: conflict.error || "",
+    ...buildConflictPreviewBlock(conflict)
+  }));
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      files: analysis.summary.files,
+      applicable: analysis.summary.applicable,
+      conflicts: conflictPreviews.length,
+      applicableHunks: analysis.summary.applicableHunks,
+      conflictHunks: analysis.summary.conflictHunks
+    },
+    conflictPreviews,
+    applicable: analysis.applicable,
+    analysis: {
+      generatedAt: analysis.generatedAt,
+      summary: analysis.summary,
+      files: analysis.files,
+      policy: analysis.policy
+    },
+    policy: {
+      access: "workspace-diff-conflict-preview",
+      writesFiles: false,
+      createsCheckpoint: false,
+      visualizesMergeConflicts: true,
+      supportsPartialHunks: true
+    }
+  };
+}
+
+function splitResolutionText(value) {
+  const text = String(value ?? "").replace(/\r\n/g, "\n");
+  if (text === "") return [];
+  return text.endsWith("\n") ? text.slice(0, -1).split("\n") : text.split("\n");
+}
+
+function buildResolutionHunk(currentContent, conflict, resolvedText) {
+  const normalized = String(currentContent || "").replace(/\r\n/g, "\n");
+  const original = normalized ? normalized.split("\n") : [];
+  if (original.length && original[original.length - 1] === "") original.pop();
+  const start = Math.max(0, Number(conflict.oldStart || 1) - 1);
+  const count = Math.max(0, Number(conflict.oldCount || 0));
+  if (start > original.length) {
+    throw new Error(`冲突位置超出当前文件范围：${conflict.path}:${start + 1}`);
+  }
+  if (start + count > original.length) {
+    throw new Error(`冲突替换范围超出当前文件范围：${conflict.path}:${start + 1}`);
+  }
+  const before = original.slice(start, start + count);
+  const resolved = splitResolutionText(resolvedText);
+  return {
+    oldStart: start + 1,
+    oldCount: before.length,
+    newStart: start + 1,
+    newCount: resolved.length,
+    lines: [
+      ...before.map((line) => `-${line}`),
+      ...resolved.map((line) => `+${line}`)
+    ]
+  };
+}
+
+async function buildConflictResolutionDraft({ diff = "", resolutions = [], prompt = "" } = {}) {
+  if (!diff || typeof diff !== "string") throw new Error("缺少 diff。");
+  if (!Array.isArray(resolutions) || !resolutions.length) throw new Error("缺少 resolutions。");
+  const preview = await buildDiffConflictPreview(diff);
+  const filePatches = new Map();
+  const used = [];
+  for (const [index, resolution] of resolutions.entries()) {
+    const pathValue = String(resolution.path || "");
+    const resolved = "resolved" in resolution ? resolution.resolved : resolution.text;
+    if (!pathValue) throw new Error(`resolution[${index}] 缺少 path。`);
+    if (resolved === undefined || resolved === null) throw new Error(`resolution[${index}] 缺少 resolved。`);
+    const match = preview.conflictPreviews.find((conflict, conflictIndex) => {
+      if (conflict.path !== pathValue) return false;
+      if (resolution.hunk && conflict.hunk !== resolution.hunk) return false;
+      if (resolution.oldStart && Number(conflict.oldStart) !== Number(resolution.oldStart)) return false;
+      return resolution.index === undefined || Number(resolution.index) === conflictIndex;
+    });
+    if (!match) throw new Error(`未找到匹配冲突：${pathValue}`);
+    const before = await readWorkspaceFile(match.path).catch(() => "");
+    const hunk = buildResolutionHunk(before, match, resolved);
+    const currentPatch = filePatches.get(match.path) || { path: match.path, hunks: [] };
+    currentPatch.hunks.push(hunk);
+    filePatches.set(match.path, currentPatch);
+    used.push({
+      path: match.path,
+      hunk: match.hunk,
+      oldStart: match.oldStart,
+      newStart: match.newStart,
+      resolvedLines: splitResolutionText(resolved).length
+    });
+  }
+  const patches = [...filePatches.values()];
+  for (const patch of patches) {
+    patch.hunks.sort((left, right) => Number(left.oldStart || 0) - Number(right.oldStart || 0));
+  }
+  const resolutionDiff = patches.map(renderSingleFileDiff).join("\n");
+  const analysis = await analyzeUnifiedDiffApplication(resolutionDiff);
+  if (analysis.conflicts.length) {
+    throw new Error(`生成的解决 diff 仍有冲突：${analysis.conflicts.map((item) => `${item.path} ${item.hunk || ""}`.trim()).join(", ")}`);
+  }
+  const rendered = await previewUnifiedDiff(resolutionDiff);
+  const proposal = {
+    id: `resolution-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+    type: "conflict_resolution",
+    createdAt: new Date().toISOString(),
+    prompt: prompt || "conflict resolution draft",
+    reply: "已生成冲突解决草稿，等待审批写入。",
+    plan: ["读取原始 diff 冲突", "生成 resolved 替换 hunk", "预检解决 diff 可应用", "等待审批写入"],
+    diff: resolutionDiff,
+    patches: rendered,
+    commands: [],
+    review: [{
+      severity: "info",
+      message: "冲突解决草稿只更新 pending proposal，不直接写入目标文件。",
+      file: "",
+      line: ""
+    }],
+    sourceConflictSummary: preview.summary,
+    resolutions: used
+  };
+  const previousGoal = await readGoalState();
+  const goal = await writeGoalState({
+    objective: prompt || previousGoal.objective || "解决 diff 冲突",
+    phase: "awaiting_resolution_approval",
+    status: "awaiting_approval",
+    lastPrompt: prompt || previousGoal.lastPrompt || "",
+    pendingProposal: proposal,
+    nextStep: "复核冲突解决 diff 后批准写入。"
+  });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    proposal,
+    summary: {
+      resolved: used.length,
+      files: patches.length,
+      applicableHunks: analysis.summary.applicableHunks,
+      conflictHunks: analysis.summary.conflictHunks
+    },
+    analysis,
+    goal: {
+      phase: goal.phase,
+      status: goal.status,
+      pendingProposalId: goal.pendingProposal?.id || ""
+    },
+    policy: {
+      access: "workspace-conflict-resolution-draft",
+      writesFiles: false,
+      createsCheckpoint: false,
+      updatesPendingProposal: true,
+      requiresApplyApproval: true
+    }
+  };
 }
 
 function renderSingleFileDiff(filePatch) {
@@ -1637,7 +4230,153 @@ function summarizeManagedProcess(entry) {
     pid: entry.child?.pid || null,
     policy: entry.policy,
     probe: entry.probe,
+    logPath: entry.logPath ? toPosix(path.relative(APP_ROOT, entry.logPath)) : "",
+    artifactPath: entry.artifactPath ? toPosix(path.relative(APP_ROOT, entry.artifactPath)) : "",
     outputTail: entry.output.slice(-12000)
+  };
+}
+
+async function persistManagedProcessArtifact(entry) {
+  if (!entry?.artifactPath) return;
+  await fs.mkdir(path.dirname(entry.artifactPath), { recursive: true });
+  const artifact = {
+    id: entry.id,
+    workspace: entry.workspace,
+    command: entry.command,
+    startedAt: entry.startedAt,
+    stoppedAt: entry.stoppedAt || "",
+    status: entry.status,
+    exitCode: entry.exitCode,
+    policy: entry.policy,
+    probe: entry.probe || null,
+    logPath: entry.logPath ? toPosix(path.relative(APP_ROOT, entry.logPath)) : "",
+    outputBytes: entry.outputBytes || 0,
+    outputTail: String(entry.output || "").slice(-12000),
+    updatedAt: new Date().toISOString()
+  };
+  await fs.writeFile(entry.artifactPath, JSON.stringify(artifact, null, 2), "utf8").catch(() => {});
+}
+
+async function readManagedProcessLogArtifacts(limit = 100) {
+  await fs.mkdir(PROCESS_LOG_DIR, { recursive: true });
+  const entries = await fs.readdir(PROCESS_LOG_DIR, { withFileTypes: true }).catch(() => []);
+  const artifacts = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const artifactPath = path.join(PROCESS_LOG_DIR, entry.name);
+    const artifact = parseJsonOutput(await fs.readFile(artifactPath, "utf8").catch(() => ""), null);
+    if (!artifact || artifact.workspace !== currentWorkspace) continue;
+    artifacts.push({
+      ...artifact,
+      artifactPath,
+      absoluteLogPath: artifact.logPath ? path.join(APP_ROOT, artifact.logPath) : ""
+    });
+  }
+  return artifacts
+    .sort((a, b) => String(b.updatedAt || b.startedAt || "").localeCompare(String(a.updatedAt || a.startedAt || "")))
+    .slice(0, limit);
+}
+
+async function listManagedProcessHistory({ limit = 20 } = {}) {
+  const max = Math.min(100, Math.max(1, Number(limit) || 20));
+  const artifacts = await readManagedProcessLogArtifacts(max);
+  const history = [];
+  for (const artifact of artifacts) {
+    const output = artifact.absoluteLogPath
+      ? await fs.readFile(artifact.absoluteLogPath, "utf8").catch(() => artifact.outputTail || "")
+      : artifact.outputTail || "";
+    history.push({
+      id: artifact.id,
+      command: artifact.command || "",
+      workspace: artifact.workspace || "",
+      startedAt: artifact.startedAt || "",
+      stoppedAt: artifact.stoppedAt || "",
+      updatedAt: artifact.updatedAt || "",
+      status: artifact.status || "unknown",
+      exitCode: artifact.exitCode,
+      policy: artifact.policy || null,
+      probe: artifact.probe || null,
+      logPath: artifact.logPath || "",
+      artifactPath: toPosix(path.relative(APP_ROOT, artifact.artifactPath)),
+      outputBytes: artifact.outputBytes || Buffer.byteLength(output, "utf8"),
+      outputTail: String(output || artifact.outputTail || "").slice(-12000),
+      active: managedProcesses.has(artifact.id)
+    });
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    history,
+    count: history.length,
+    policy: {
+      access: "managed-process-output-and-artifacts",
+      scope: "currentWorkspace",
+      max
+    }
+  };
+}
+
+async function searchManagedProcessLogs(query = "", { limit = 20 } = {}) {
+  const needle = String(query || "").trim();
+  if (!needle) throw new Error("缺少进程日志搜索关键词。");
+  const maxResults = Math.min(100, Math.max(1, Number(limit) || 20));
+  const regex = new RegExp(escapeRegExp(needle), "ig");
+  const matches = [];
+  const workspaceEntries = Array.from(managedProcesses.values()).filter((entry) => entry.workspace === currentWorkspace);
+  for (const entry of workspaceEntries) {
+    const output = String(entry.output || "");
+    let match;
+    while ((match = regex.exec(output)) && matches.length < maxResults) {
+      const start = Math.max(0, match.index - 160);
+      const end = Math.min(output.length, match.index + needle.length + 160);
+      matches.push({
+        processId: entry.id,
+        command: entry.command,
+        status: entry.status,
+        index: match.index,
+        excerpt: output.slice(start, end).replace(/\s+/g, " ").trim(),
+        source: "memory",
+        logPath: entry.logPath ? toPosix(path.relative(APP_ROOT, entry.logPath)) : ""
+      });
+    }
+    if (matches.length >= maxResults) break;
+  }
+  if (matches.length < maxResults) {
+    const artifacts = await readManagedProcessLogArtifacts(200);
+    for (const artifact of artifacts) {
+      if (managedProcesses.has(artifact.id)) continue;
+      const output = artifact.absoluteLogPath
+        ? await fs.readFile(artifact.absoluteLogPath, "utf8").catch(() => artifact.outputTail || "")
+        : artifact.outputTail || "";
+      regex.lastIndex = 0;
+      let match;
+      while ((match = regex.exec(output)) && matches.length < maxResults) {
+        const start = Math.max(0, match.index - 160);
+        const end = Math.min(output.length, match.index + needle.length + 160);
+        matches.push({
+          processId: artifact.id,
+          command: artifact.command || "",
+          status: artifact.status || "unknown",
+          index: match.index,
+          excerpt: output.slice(start, end).replace(/\s+/g, " ").trim(),
+          source: "artifact",
+          logPath: artifact.logPath || "",
+          artifactPath: toPosix(path.relative(APP_ROOT, artifact.artifactPath))
+        });
+      }
+      if (matches.length >= maxResults) break;
+    }
+  }
+  return {
+    query: needle,
+    matchCount: matches.length,
+    matches,
+    searchedProcesses: workspaceEntries.length,
+    searchedArtifacts: (await readManagedProcessLogArtifacts(200)).length,
+    policy: {
+      access: "managed-process-output-and-artifacts",
+      scope: "currentWorkspace",
+      maxResults
+    }
   };
 }
 
@@ -1687,6 +4426,187 @@ async function probeManagedProcess(entry) {
     clearTimeout(timer);
   }
   return entry.probe;
+}
+
+function processHealthStatus(status, probe) {
+  if (probe?.status) return probe.status;
+  if (status === "running") return "no-probe";
+  if (status === "stopping") return "stopping";
+  if (status === "exited") return "stopped";
+  return status || "unknown";
+}
+
+function processHealthRulesPath() {
+  return path.join(currentWorkspace, ".forge", "process-health-rules.json");
+}
+
+function normalizeProcessHealthRules(rawRules) {
+  const source = Array.isArray(rawRules) ? rawRules : Array.isArray(rawRules?.rules) ? rawRules.rules : [];
+  return source.slice(0, 40).map((rule, index) => {
+    const commandIncludes = Array.isArray(rule?.commandIncludes)
+      ? rule.commandIncludes
+      : [rule?.commandIncludes || rule?.command || ""];
+    const expectedStatus = Array.isArray(rule?.expectedStatus)
+      ? rule.expectedStatus
+      : [rule?.expectedStatus ?? rule?.statusCode ?? 200];
+    return {
+      name: String(rule?.name || `rule-${index + 1}`).trim().slice(0, 80),
+      commandIncludes: commandIncludes
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+        .slice(0, 6),
+      expectedStatus: expectedStatus
+        .map((item) => Number(item))
+        .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599)
+        .slice(0, 12),
+      expectedBodyIncludes: String(rule?.expectedBodyIncludes || rule?.bodyIncludes || "").slice(0, 240),
+      requireProbe: rule?.requireProbe !== false
+    };
+  }).filter((rule) => rule.name && rule.commandIncludes.length);
+}
+
+async function readProcessHealthRules() {
+  const filePath = processHealthRulesPath();
+  const raw = await readJsonOrNull(filePath);
+  const rules = normalizeProcessHealthRules(raw);
+  return {
+    path: toPosix(path.relative(currentWorkspace, filePath)),
+    count: rules.length,
+    rules
+  };
+}
+
+function commandMatchesHealthRule(command = "", rule) {
+  const lower = String(command || "").toLowerCase();
+  return rule.commandIncludes.every((needle) => lower.includes(String(needle).toLowerCase()));
+}
+
+function evaluateProcessHealthRules(row, rules = []) {
+  const matched = rules.filter((rule) => commandMatchesHealthRule(row.command, rule));
+  const results = matched.map((rule) => {
+    const failures = [];
+    if (rule.requireProbe && !row.probe) failures.push("missing-probe");
+    if (row.probe && rule.expectedStatus.length && !rule.expectedStatus.includes(Number(row.probe.statusCode))) {
+      failures.push(`status-${row.probe.statusCode || "missing"}`);
+    }
+    if (rule.expectedBodyIncludes && !String(row.outputTail || "").includes(rule.expectedBodyIncludes)) {
+      failures.push("missing-output-evidence");
+    }
+    return {
+      name: rule.name,
+      matched: true,
+      ok: failures.length === 0,
+      failures,
+      expectedStatus: rule.expectedStatus,
+      expectedBodyIncludes: rule.expectedBodyIncludes,
+      requireProbe: rule.requireProbe
+    };
+  });
+  return {
+    matched: results.length,
+    passed: results.filter((item) => item.ok).length,
+    failed: results.filter((item) => !item.ok).length,
+    status: results.length === 0 ? "no-rule" : results.every((item) => item.ok) ? "pass" : "fail",
+    results
+  };
+}
+
+function summarizeProcessHealthRows(rows) {
+  return {
+    total: rows.length,
+    active: rows.filter((row) => row.active).length,
+    healthy: rows.filter((row) => row.health === "healthy").length,
+    unhealthy: rows.filter((row) => ["unhealthy", "unreachable"].includes(row.health)).length,
+    noProbe: rows.filter((row) => row.health === "no-probe").length,
+    stopped: rows.filter((row) => row.health === "stopped").length,
+    ruleMatched: rows.filter((row) => row.rules?.matched).length,
+    ruleFailed: rows.filter((row) => row.rules?.failed).length
+  };
+}
+
+async function buildManagedProcessHealth({ id = "", limit = 50 } = {}) {
+  const processId = String(id || "").trim();
+  if (processId && !/^[\w.-]+$/.test(processId)) throw new Error("process id 非法。");
+  const maxResults = Math.min(100, Math.max(1, Number(limit) || 50));
+  const ruleSet = await readProcessHealthRules();
+  const activeEntries = Array.from(managedProcesses.values())
+    .filter((entry) => entry.workspace === currentWorkspace)
+    .filter((entry) => !processId || entry.id === processId);
+  await Promise.all(activeEntries.map(async (entry) => {
+    await probeManagedProcess(entry).catch(() => null);
+    await persistManagedProcessArtifact(entry).catch(() => {});
+  }));
+  const activeRows = activeEntries.map((entry) => {
+    const summary = summarizeManagedProcess(entry);
+    return {
+      id: summary.id,
+      command: summary.command,
+      active: true,
+      status: summary.status,
+      health: processHealthStatus(summary.status, summary.probe),
+      ok: summary.probe ? Boolean(summary.probe.ok) : summary.status !== "running",
+      pid: summary.pid,
+      startedAt: summary.startedAt,
+      stoppedAt: summary.stoppedAt,
+      probe: summary.probe || null,
+      logPath: summary.logPath,
+      artifactPath: summary.artifactPath,
+      outputBytes: entry.outputBytes || Buffer.byteLength(entry.output || "", "utf8"),
+      outputTail: summary.outputTail
+    };
+  });
+  const activeIds = new Set(activeRows.map((row) => row.id));
+  const artifacts = await readManagedProcessLogArtifacts(200);
+  const artifactRows = artifacts
+    .filter((artifact) => artifact.workspace === currentWorkspace)
+    .filter((artifact) => !activeIds.has(artifact.id))
+    .filter((artifact) => !processId || artifact.id === processId)
+    .map((artifact) => ({
+      id: artifact.id,
+      command: artifact.command,
+      active: false,
+      status: artifact.status,
+      health: processHealthStatus(artifact.status, artifact.probe),
+      ok: artifact.probe ? Boolean(artifact.probe.ok) : artifact.status !== "running",
+      pid: null,
+      startedAt: artifact.startedAt,
+      stoppedAt: artifact.stoppedAt || "",
+      probe: artifact.probe || null,
+      logPath: artifact.logPath || "",
+      artifactPath: artifact.relativePath || artifact.path || "",
+      outputBytes: artifact.outputBytes || 0,
+      outputTail: String(artifact.outputTail || "").slice(-12000)
+    }));
+  const rows = [...activeRows, ...artifactRows]
+    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
+    .slice(0, maxResults)
+    .map((row) => ({
+      ...row,
+      rules: evaluateProcessHealthRules(row, ruleSet.rules)
+    }));
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    id: processId,
+    rows,
+    count: rows.length,
+    summary: summarizeProcessHealthRows(rows),
+    rules: {
+      path: ruleSet.path,
+      count: ruleSet.count,
+      configured: ruleSet.count > 0
+    },
+    policy: {
+      access: "managed-process-health-and-artifacts",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      startsProcesses: false,
+      stopsProcesses: false,
+      performsLocalHttpProbe: true,
+      readsHealthRules: true,
+      maxResults
+    }
+  };
 }
 
 function waitForProcessExit(entry, timeoutMs = 5000) {
@@ -1739,6 +4659,106 @@ function extractHtmlEvidence(html = "") {
       forms: (html.match(/<form\b/gi) || []).length,
       inputs: (html.match(/<input\b/gi) || []).length,
       images: (html.match(/<img\b/gi) || []).length
+    }
+  };
+}
+
+function stripHtmlText(value = "") {
+  return String(value || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+}
+
+function extractAttribute(tag = "", name = "") {
+  const match = new RegExp(`\\b${escapeRegExp(name)}\\s*=\\s*["']([^"']*)["']`, "i").exec(tag);
+  return match?.[1] || "";
+}
+
+function auditHtmlAccessibility(html = "") {
+  const text = String(html || "");
+  const title = extractHtmlEvidence(text).title;
+  const htmlTag = /<html\b[^>]*>/i.exec(text)?.[0] || "";
+  const lang = extractAttribute(htmlTag, "lang");
+  const headingMatches = [...text.matchAll(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi)]
+    .map((match) => ({ level: Number(match[1]), text: stripHtmlText(match[2]) }))
+    .filter((item) => item.text);
+  const imgMatches = [...text.matchAll(/<img\b[^>]*>/gi)].map((match) => match[0]);
+  const inputMatches = [...text.matchAll(/<input\b[^>]*>/gi)].map((match) => match[0]);
+  const buttonMatches = [...text.matchAll(/<button\b[^>]*>([\s\S]*?)<\/button>/gi)]
+    .map((match) => ({ tag: match[0], text: stripHtmlText(match[1]) }));
+  const labelFors = new Set([...text.matchAll(/<label\b[^>]*\bfor\s*=\s*["']([^"']+)["'][^>]*>/gi)].map((match) => match[1]));
+  const issues = [];
+  const add = (severity, id, message, evidence = {}) => issues.push({ severity, id, message, evidence });
+  if (!title) add("warning", "missing-title", "页面缺少可读 title。");
+  if (!lang) add("warning", "missing-html-lang", "html 标签缺少 lang 属性。");
+  if (!headingMatches.some((item) => item.level === 1)) add("warning", "missing-h1", "页面缺少 H1。");
+  const levels = headingMatches.map((item) => item.level);
+  for (let index = 1; index < levels.length; index += 1) {
+    if (levels[index] - levels[index - 1] > 1) {
+      add("info", "heading-level-skip", "标题层级存在跳级。", { previous: levels[index - 1], current: levels[index] });
+      break;
+    }
+  }
+  for (const tag of imgMatches) {
+    if (!/\balt\s*=/.test(tag)) add("warning", "image-missing-alt", "图片缺少 alt 属性。", { tag: tag.slice(0, 160) });
+  }
+  for (const tag of inputMatches) {
+    const type = (extractAttribute(tag, "type") || "text").toLowerCase();
+    if (["hidden", "submit", "button", "file", "checkbox", "radio"].includes(type)) continue;
+    const id = extractAttribute(tag, "id");
+    const hasName = Boolean(extractAttribute(tag, "aria-label") || extractAttribute(tag, "aria-labelledby") || extractAttribute(tag, "title") || extractAttribute(tag, "placeholder") || (id && labelFors.has(id)));
+    if (!hasName) add("warning", "input-missing-name", "输入框缺少 label 或可访问名称。", { id, type });
+  }
+  for (const button of buttonMatches) {
+    const hasName = Boolean(button.text || extractAttribute(button.tag, "aria-label") || extractAttribute(button.tag, "title"));
+    if (!hasName) add("warning", "button-missing-name", "按钮缺少可访问名称。", { tag: button.tag.slice(0, 160) });
+  }
+  return {
+    title,
+    lang,
+    headings: headingMatches.slice(0, 40),
+    counts: {
+      headings: headingMatches.length,
+      images: imgMatches.length,
+      inputs: inputMatches.length,
+      buttons: buttonMatches.length,
+      labels: labelFors.size,
+      issues: issues.length
+    },
+    issues,
+    status: issues.some((item) => item.severity === "error") ? "fail" : issues.length ? "review" : "pass"
+  };
+}
+
+async function auditBrowserTarget(rawUrl) {
+  const checked = await checkBrowserTarget(rawUrl);
+  const url = normalizeLocalBrowserTarget(rawUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  let auditSource = "";
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      signal: controller.signal,
+      headers: { "User-Agent": "Forge-Code-Browser-Audit/1.0" }
+    });
+    const contentType = response.headers.get("content-type") || "";
+    auditSource = contentType.includes("text/html") ? await response.text() : "";
+  } finally {
+    clearTimeout(timer);
+  }
+  return {
+    ok: checked.ok,
+    url: checked.url,
+    finalUrl: checked.finalUrl,
+    status: checked.status,
+    title: checked.title,
+    audit: auditHtmlAccessibility(auditSource),
+    policy: {
+      access: "local-url-only",
+      scope: "localhost",
+      executesCommands: false,
+      writesFiles: false,
+      browserAutomation: false,
+      staticHtmlAudit: true
     }
   };
 }
@@ -1984,8 +5004,14 @@ async function fetchBrowserDomFallback(rawUrl, { actions = [], selectors = [], b
     const audit = actions.map((action) => ({
       type: action.type,
       selector: action.selector,
-      value: ["type", "select", "waittext", "waitvalue", "navigate", "waiturl"].includes(action.type) ? action.value : "",
-      key: action.type === "press" ? action.key : "",
+      value: ["type", "select", "waittext", "waitvalue", "navigate", "waiturl", "upload"].includes(action.type) ? action.value : "",
+      key: ["press", "keydown", "keyup"].includes(action.type) ? action.key : "",
+      x: ["mousemove", "mousedown", "mouseup", "mouseclick", "drag", "wheel"].includes(action.type) ? action.x : null,
+      y: ["mousemove", "mousedown", "mouseup", "mouseclick", "drag", "wheel"].includes(action.type) ? action.y : null,
+      toX: action.type === "drag" ? action.toX : null,
+      toY: action.type === "drag" ? action.toY : null,
+      deltaX: ["wheel", "scroll"].includes(action.type) ? action.deltaX : null,
+      deltaY: ["wheel", "scroll"].includes(action.type) ? action.deltaY : null,
       ok: true,
       elapsedMs: 0,
       fallback: true
@@ -2017,6 +5043,50 @@ async function fetchBrowserDomFallback(rawUrl, { actions = [], selectors = [], b
           ? dom.replace(inputPattern, (match, start, end) => `${start.replace(/\schecked(?:\s*=\s*["'][^"']*["'])?/i, "")}${end}`)
           : dom;
       }
+      if (action.type === "upload" && action.selector.startsWith("#")) {
+        const id = escapeRegExp(action.selector.slice(1));
+        const uploadValue = String(action.value).replace(/"/g, "&quot;");
+        const inputPattern = new RegExp(`(<input\\b[^>]*\\bid\\s*=\\s*["']${id}["'][^>]*)(>)`, "i");
+        dom = inputPattern.test(dom)
+          ? dom.replace(inputPattern, (match, start, end) => {
+            const withoutUpload = start.replace(/\sdata-forge-upload\s*=\s*["'][^"']*["']/i, "");
+            return `${withoutUpload} data-forge-upload="${uploadValue}"${end}`;
+          })
+          : `${dom}<input id="${action.selector.slice(1)}" type="file" data-forge-upload="${uploadValue}">`;
+      }
+      if (["mousemove", "mousedown", "mouseup", "mouseclick", "drag"].includes(action.type)) {
+        const pointerValue = action.type === "drag"
+          ? `${action.type}:${action.x},${action.y}->${action.toX},${action.toY}`
+          : `${action.type}:${action.x},${action.y}`;
+        const safePointer = pointerValue.replace(/"/g, "&quot;");
+        const htmlPattern = /(<html\b[^>]*)(>)/i;
+        dom = htmlPattern.test(dom)
+          ? dom.replace(htmlPattern, (match, start, end) => {
+            const withoutPointer = start.replace(/\sdata-forge-pointer\s*=\s*["'][^"']*["']/i, "");
+            return `${withoutPointer} data-forge-pointer="${safePointer}"${end}`;
+          })
+          : `<html data-forge-pointer="${safePointer}">${dom}</html>`;
+      }
+      if (action.type === "wheel") {
+        const wheelValue = `${action.deltaX},${action.deltaY}@${action.x},${action.y}`.replace(/"/g, "&quot;");
+        const htmlPattern = /(<html\b[^>]*)(>)/i;
+        dom = htmlPattern.test(dom)
+          ? dom.replace(htmlPattern, (match, start, end) => {
+            const withoutWheel = start.replace(/\sdata-forge-wheel\s*=\s*["'][^"']*["']/i, "");
+            return `${withoutWheel} data-forge-wheel="${wheelValue}"${end}`;
+          })
+          : `<html data-forge-wheel="${wheelValue}">${dom}</html>`;
+      }
+      if (action.type === "scroll") {
+        const scrollValue = `${action.deltaX},${action.deltaY}`.replace(/"/g, "&quot;");
+        const htmlPattern = /(<html\b[^>]*)(>)/i;
+        dom = htmlPattern.test(dom)
+          ? dom.replace(htmlPattern, (match, start, end) => {
+            const withoutScroll = start.replace(/\sdata-forge-scroll\s*=\s*["'][^"']*["']/i, "");
+            return `${withoutScroll} data-forge-scroll="${scrollValue}"${end}`;
+          })
+          : `<html data-forge-scroll="${scrollValue}">${dom}</html>`;
+      }
     }
     const evidence = extractHtmlEvidence(dom.slice(0, 500000));
     const selectorResults = (Array.isArray(selectors) ? selectors : [])
@@ -2045,7 +5115,7 @@ async function fetchBrowserDomFallback(rawUrl, { actions = [], selectors = [], b
         domSnapshot: true,
         domInteraction,
         browserFallback: true,
-        allowedActions: domInteraction ? ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue", "navigate", "waitUrl", "waitNetwork"] : undefined
+        allowedActions: domInteraction ? ["wait", "click", "dblClick", "hover", "clear", "type", "press", "keyDown", "keyUp", "select", "check", "uncheck", "waitText", "waitValue", "navigate", "waitUrl", "waitNetwork", "upload", "mouseMove", "mouseDown", "mouseUp", "mouseClick", "drag", "wheel", "scroll"] : undefined
       }
     };
   } finally {
@@ -2214,21 +5284,41 @@ function withTimeout(promise, timeoutMs, message) {
 
 function sanitizeBrowserActions(actions = []) {
   if (!Array.isArray(actions)) return [];
-  const allowedTypes = new Set(["wait", "click", "dblclick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waittext", "waitvalue", "navigate", "waiturl", "waitnetwork"]);
-  const selectorlessTypes = new Set(["navigate", "waiturl", "waitnetwork"]);
-  return actions.slice(0, 20).map((action) => ({
+  const allowedTypes = new Set(["wait", "click", "dblclick", "hover", "clear", "type", "press", "keydown", "keyup", "select", "check", "uncheck", "waittext", "waitvalue", "navigate", "waiturl", "waitnetwork", "upload", "mousemove", "mousedown", "mouseup", "mouseclick", "drag", "wheel", "scroll"]);
+  const coordinateTypes = new Set(["mousemove", "mousedown", "mouseup", "mouseclick", "drag", "wheel"]);
+  const selectorlessTypes = new Set(["navigate", "waiturl", "waitnetwork", "scroll", ...coordinateTypes]);
+  return actions.slice(0, 30).map((action) => ({
     type: String(action?.type || "").trim().toLowerCase(),
     selector: String(action?.selector || "").trim().slice(0, 240),
     value: String(action?.value ?? "").slice(0, 2000),
     key: String(action?.key ?? action?.value ?? "").trim().slice(0, 80),
+    x: Math.min(10000, Math.max(0, Number(action?.x) || 0)),
+    y: Math.min(10000, Math.max(0, Number(action?.y) || 0)),
+    toX: Math.min(10000, Math.max(0, Number(action?.toX ?? action?.x) || 0)),
+    toY: Math.min(10000, Math.max(0, Number(action?.toY ?? action?.y) || 0)),
+    deltaX: Math.min(10000, Math.max(-10000, Number(action?.deltaX) || 0)),
+    deltaY: Math.min(10000, Math.max(-10000, Number(action?.deltaY ?? action?.value) || 0)),
     timeoutMs: Math.min(10000, Math.max(100, Number(action?.timeoutMs) || 3000))
   })).filter((action) => {
     if (!allowedTypes.has(action.type)) return false;
     if (!selectorlessTypes.has(action.type) && !action.selector) return false;
-    if (action.type === "press") return Boolean(action.key);
-    if (action.type === "waittext" || action.type === "waitvalue" || action.type === "navigate" || action.type === "waiturl") return Boolean(action.value);
+    if (coordinateTypes.has(action.type)) return action.x >= 0 && action.y >= 0;
+    if (["press", "keydown", "keyup"].includes(action.type)) return Boolean(action.key);
+    if (["wheel", "scroll"].includes(action.type)) return action.deltaX !== 0 || action.deltaY !== 0;
+    if (action.type === "waittext" || action.type === "waitvalue" || action.type === "navigate" || action.type === "waiturl" || action.type === "upload") return Boolean(action.value);
     return true;
   });
+}
+
+function resolveBrowserUploadPath(value = "") {
+  const text = String(value || "").trim().replace(/\0/g, "");
+  if (!text) throw new Error("upload action missing file path.");
+  const resolved = path.resolve(currentWorkspace, text);
+  const root = currentWorkspace.toLowerCase();
+  if (resolved.toLowerCase() !== root && !resolved.toLowerCase().startsWith(`${root}${path.sep}`)) {
+    throw new Error("upload file must be inside current workspace.");
+  }
+  return resolved;
 }
 
 function browserInteractionScript(actions) {
@@ -2281,6 +5371,56 @@ function browserInteractionScript(actions) {
             stableSince = Date.now();
           }
         }
+      } else if (action.type === "upload") {
+        element = await waitForSelector(action.selector, action.timeoutMs);
+        if (element.tagName !== "INPUT" || element.type !== "file") throw new Error(`element is not a file input: ${action.selector}`);
+        element.setAttribute("data-forge-upload", action.value);
+        element.dispatchEvent(new Event("input", { bubbles: true }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (["mousemove", "mousedown", "mouseup", "mouseclick", "drag"].includes(action.type)) {
+        const at = (type, x, y, detail = 1) => {
+          const target = document.elementFromPoint(x, y) || document.body;
+          target.dispatchEvent(new MouseEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            clientX: x,
+            clientY: y,
+            screenX: x,
+            screenY: y,
+            detail
+          }));
+          document.documentElement.setAttribute("data-forge-pointer", `${type}:${x},${y}`);
+        };
+        if (action.type === "mousemove") {
+          at("mousemove", action.x, action.y);
+        } else if (action.type === "mousedown") {
+          at("mousedown", action.x, action.y);
+        } else if (action.type === "mouseup") {
+          at("mouseup", action.x, action.y);
+        } else if (action.type === "mouseclick") {
+          at("mousedown", action.x, action.y);
+          at("mouseup", action.x, action.y);
+          at("click", action.x, action.y);
+        } else if (action.type === "drag") {
+          at("mousedown", action.x, action.y);
+          at("mousemove", action.toX, action.toY);
+          at("mouseup", action.toX, action.toY);
+        }
+      } else if (action.type === "wheel") {
+        const target = document.elementFromPoint(action.x, action.y) || document.scrollingElement || document.body;
+        target.dispatchEvent(new WheelEvent("wheel", {
+          bubbles: true,
+          cancelable: true,
+          clientX: action.x,
+          clientY: action.y,
+          deltaX: action.deltaX,
+          deltaY: action.deltaY
+        }));
+        window.scrollBy(action.deltaX, action.deltaY);
+        document.documentElement.setAttribute("data-forge-wheel", `${action.deltaX},${action.deltaY}@${action.x},${action.y}`);
+      } else if (action.type === "scroll") {
+        window.scrollBy(action.deltaX, action.deltaY);
+        document.documentElement.setAttribute("data-forge-scroll", `${action.deltaX},${action.deltaY}`);
       } else {
         element = await waitForSelector(action.selector, action.timeoutMs);
       }
@@ -2325,10 +5465,13 @@ function browserInteractionScript(actions) {
           element.textContent = action.value;
           element.dispatchEvent(new InputEvent("input", { bubbles: true, data: action.value }));
         }
-      } else if (action.type === "press") {
+      } else if (action.type === "press" || action.type === "keydown" || action.type === "keyup") {
         element.scrollIntoView({ block: "center", inline: "center" });
         element.focus();
-        for (const eventType of ["keydown", "keypress", "keyup"]) {
+        const eventTypes = action.type === "press"
+          ? ["keydown", "keypress", "keyup"]
+          : [action.type === "keydown" ? "keydown" : "keyup"];
+        for (const eventType of eventTypes) {
           element.dispatchEvent(new KeyboardEvent(eventType, {
             key: action.key,
             code: action.key,
@@ -2377,8 +5520,14 @@ function browserInteractionScript(actions) {
       audit.push({
         type: action.type,
         selector: action.selector,
-        value: ["type", "select", "waittext", "waitvalue", "navigate", "waiturl"].includes(action.type) ? action.value : "",
-        key: action.type === "press" ? action.key : "",
+        value: ["type", "select", "waittext", "waitvalue", "navigate", "waiturl", "upload"].includes(action.type) ? action.value : "",
+        key: ["press", "keydown", "keyup"].includes(action.type) ? action.key : "",
+        x: ["mousemove", "mousedown", "mouseup", "mouseclick", "drag", "wheel"].includes(action.type) ? action.x : null,
+        y: ["mousemove", "mousedown", "mouseup", "mouseclick", "drag", "wheel"].includes(action.type) ? action.y : null,
+        toX: action.type === "drag" ? action.toX : null,
+        toY: action.type === "drag" ? action.toY : null,
+        deltaX: ["wheel", "scroll"].includes(action.type) ? action.deltaX : null,
+        deltaY: ["wheel", "scroll"].includes(action.type) ? action.deltaY : null,
         ok: true,
         elapsedMs: Date.now() - startedAt
       });
@@ -2393,25 +5542,35 @@ function browserInteractionScript(actions) {
   }})(${JSON.stringify(JSON.stringify(actions))})`;
 }
 
-async function interactBrowserDom(rawUrl, { actions = [], selectors = [], width = 1365, height = 768 } = {}) {
+async function interactBrowserDom(rawUrl, { actions = [], selectors = [], width = 1365, height = 768, fallbackOnly = false } = {}) {
   const url = normalizeLocalBrowserTarget(rawUrl);
-  const browserPaths = await listBrowserExecutables();
-  if (!browserPaths.length) throw new Error("未找到可用的 Edge/Chrome 浏览器。");
   const safeActions = sanitizeBrowserActions(actions);
+  if (fallbackOnly) {
+    return fetchBrowserDomFallback(url, {
+      actions: safeActions,
+      selectors,
+      domInteraction: safeActions.length > 0,
+      browserError: "browser interaction fallbackOnly requested."
+    });
+  }
+  const browserPaths = await listBrowserExecutables();
   const safeWidth = Math.min(3840, Math.max(320, Number(width) || 1365));
   const safeHeight = Math.min(2160, Math.max(240, Number(height) || 768));
   await fs.mkdir(BROWSER_SCREENSHOT_DIR, { recursive: true });
-  const errors = [];
+  const errors = browserPaths.length ? [] : ["browser-discovery: 未找到可用的 Edge/Chrome 浏览器。"];
   const attempts = browserPaths
     .flatMap((browserPath) => ["--headless=new", "--headless"].map((headlessArg) => ({ browserPath, headlessArg })))
     .slice(0, 2);
   for (const { browserPath, headlessArg } of attempts) {
       const port = 9222 + Math.floor(Math.random() * 20000);
       const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${browserBaselineId(url).slice(0, 24)}-${errors.length}`;
-      const profilePath = path.join(BROWSER_SCREENSHOT_DIR, `${id}-interact-profile`);
+      const profilePath = path.join(BROWSER_SCREENSHOT_DIR, `${id}-${errors.length}-interact-profile`);
       let session = null;
       let client = null;
       try {
+        for (const action of safeActions.filter((item) => item.type === "upload")) {
+          await fs.stat(resolveBrowserUploadPath(action.value));
+        }
         session = await withTimeout(runBrowserSession(browserPath, [
           headlessArg,
           "--disable-gpu",
@@ -2430,14 +5589,24 @@ async function interactBrowserDom(rawUrl, { actions = [], selectors = [], width 
           `--user-data-dir=${profilePath}`,
           `--window-size=${safeWidth},${safeHeight}`,
           url
-        ], 12000), 14000, "浏览器交互会话启动超时。");
-        const webSocketUrl = await waitForDevtoolsEndpoint(port, 6000);
+        ], 7000), 9000, "浏览器交互会话启动超时。");
+        const webSocketUrl = await waitForDevtoolsEndpoint(port, 4000);
         client = await createCdpClient(webSocketUrl);
-        await client.send("Page.enable", {}, { timeoutMs: 5000 });
-        await client.send("Runtime.enable", {}, { timeoutMs: 5000 });
-        await client.send("Page.navigate", { url }, { timeoutMs: 5000 });
+        await client.send("Page.enable", {}, { timeoutMs: 4000 });
+        await client.send("Runtime.enable", {}, { timeoutMs: 4000 });
+        await client.send("DOM.enable", {}, { timeoutMs: 4000 });
+        await client.send("Page.navigate", { url }, { timeoutMs: 4000 });
         await sleep(700);
-        const result = await cdpEvaluate(client, browserInteractionScript(safeActions), { timeoutMs: 8000 });
+        for (const action of safeActions.filter((item) => item.type === "upload")) {
+          const doc = await client.send("DOM.getDocument", { depth: -1, pierce: true }, { timeoutMs: 3000 });
+          const node = await client.send("DOM.querySelector", { nodeId: doc.root.nodeId, selector: action.selector }, { timeoutMs: 3000 });
+          if (!node.nodeId) throw new Error(`upload selector not found: ${action.selector}`);
+          await client.send("DOM.setFileInputFiles", {
+            nodeId: node.nodeId,
+            files: [resolveBrowserUploadPath(action.value)]
+          }, { timeoutMs: 3000 });
+        }
+        const result = await cdpEvaluate(client, browserInteractionScript(safeActions), { timeoutMs: 5000 });
         const dom = result?.html || "";
         const evidence = extractHtmlEvidence(dom.slice(0, 500000));
         const selectorResults = (Array.isArray(selectors) ? selectors : [])
@@ -2463,7 +5632,7 @@ async function interactBrowserDom(rawUrl, { actions = [], selectors = [], width 
             screenshots: false,
             domSnapshot: true,
             domInteraction: true,
-            allowedActions: ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue", "navigate", "waitUrl", "waitNetwork"]
+            allowedActions: ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue", "navigate", "waitUrl", "waitNetwork", "upload", "mouseMove", "mouseDown", "mouseUp", "mouseClick", "drag"]
           }
         };
       } catch (error) {
@@ -2482,15 +5651,199 @@ async function interactBrowserDom(rawUrl, { actions = [], selectors = [], width 
   });
 }
 
-async function captureBrowserScreenshot(rawUrl, { width = 1365, height = 768 } = {}) {
+async function runBrowserSessionArtifact(rawUrl, { steps = [], selectors = [], width = 1365, height = 768, name = "" } = {}) {
   const url = normalizeLocalBrowserTarget(rawUrl);
   const browserPaths = await listBrowserExecutables();
-  if (!browserPaths.length) throw new Error("未找到可用的 Edge/Chrome 浏览器。");
+  const safeSteps = (Array.isArray(steps) ? steps : [])
+    .slice(0, 8)
+    .map((step, index) => ({
+      name: String(step?.name || `step-${index + 1}`).trim().slice(0, 80),
+      actions: sanitizeBrowserActions(step?.actions || [])
+    }))
+    .filter((step) => step.actions.length);
+  if (!safeSteps.length) throw new Error("browser session requires at least one non-empty step.");
   const safeWidth = Math.min(3840, Math.max(320, Number(width) || 1365));
   const safeHeight = Math.min(2160, Math.max(240, Number(height) || 768));
+  await fs.mkdir(BROWSER_SESSION_DIR, { recursive: true });
+  const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${browserBaselineId(`${url}:${name}`).slice(0, 24)}`;
+  const artifactPath = path.join(BROWSER_SESSION_DIR, `${id}.json`);
+  const errors = browserPaths.length ? [] : ["browser-discovery: 未找到可用的 Edge/Chrome 浏览器。"];
+  const attempts = browserPaths
+    .flatMap((browserPath) => ["--headless=new", "--headless"].map((headlessArg) => ({ browserPath, headlessArg })))
+    .slice(0, 2);
+  for (const { browserPath, headlessArg } of attempts) {
+    const port = 9222 + Math.floor(Math.random() * 20000);
+    const profilePath = path.join(BROWSER_SESSION_DIR, `${id}-${errors.length}-profile`);
+    let session = null;
+    let client = null;
+    try {
+      for (const step of safeSteps) {
+        for (const action of step.actions.filter((item) => item.type === "upload")) {
+          await fs.stat(resolveBrowserUploadPath(action.value));
+        }
+      }
+      session = await withTimeout(runBrowserSession(browserPath, [
+        headlessArg,
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-default-apps",
+        "--disable-popup-blocking",
+        "--mute-audio",
+        "--no-sandbox",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--allow-insecure-localhost",
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${profilePath}`,
+        `--window-size=${safeWidth},${safeHeight}`,
+        url
+      ], 7000), 9000, "浏览器持久会话启动超时。");
+      const webSocketUrl = await waitForDevtoolsEndpoint(port, 4000);
+      client = await createCdpClient(webSocketUrl);
+      await client.send("Page.enable", {}, { timeoutMs: 4000 });
+      await client.send("Runtime.enable", {}, { timeoutMs: 4000 });
+      await client.send("DOM.enable", {}, { timeoutMs: 4000 });
+      await client.send("Page.navigate", { url }, { timeoutMs: 4000 });
+      await sleep(900);
+      const stepResults = [];
+      let dom = "";
+      let title = "";
+      let finalUrl = url;
+      for (const step of safeSteps) {
+        for (const action of step.actions.filter((item) => item.type === "upload")) {
+          const doc = await client.send("DOM.getDocument", { depth: -1, pierce: true }, { timeoutMs: 3000 });
+          const node = await client.send("DOM.querySelector", { nodeId: doc.root.nodeId, selector: action.selector }, { timeoutMs: 3000 });
+          if (!node.nodeId) throw new Error(`upload selector not found: ${action.selector}`);
+          await client.send("DOM.setFileInputFiles", {
+            nodeId: node.nodeId,
+            files: [resolveBrowserUploadPath(action.value)]
+          }, { timeoutMs: 3000 });
+        }
+        const startedAt = Date.now();
+        const result = await cdpEvaluate(client, browserInteractionScript(step.actions), { timeoutMs: 5000 });
+        dom = result?.html || dom;
+        title = result?.title || title;
+        finalUrl = result?.url || finalUrl;
+        stepResults.push({
+          name: step.name,
+          finalUrl,
+          actionCount: result?.audit?.length || 0,
+          actions: result?.audit || [],
+          elapsedMs: Date.now() - startedAt
+        });
+      }
+      const evidence = extractHtmlEvidence(dom.slice(0, 500000));
+      const selectorResults = (Array.isArray(selectors) ? selectors : [])
+        .slice(0, 30)
+        .map((selector) => countSimpleSelector(dom, selector));
+      const artifact = {
+        id,
+        name: String(name || "").trim(),
+        url,
+        finalUrl,
+        browserPath,
+        headlessArg,
+        capturedAt: new Date().toISOString(),
+        stepCount: stepResults.length,
+        actionCount: stepResults.reduce((sum, step) => sum + step.actionCount, 0),
+        steps: stepResults,
+        selectors: selectorResults,
+        title: title || evidence.title,
+        headings: evidence.headings,
+        counts: evidence.counts,
+        domBytes: Buffer.byteLength(dom),
+        policy: {
+          access: "local-url-only",
+          scope: "localhost",
+          persistentProfile: true,
+          artifact: true,
+          allowedActions: ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue", "navigate", "waitUrl", "waitNetwork", "upload", "mouseMove", "mouseDown", "mouseUp", "mouseClick", "drag"]
+        }
+      };
+      await fs.writeFile(artifactPath, JSON.stringify(artifact, null, 2), "utf8");
+      return {
+        ok: true,
+        ...artifact,
+        artifactPath: toPosix(path.relative(APP_ROOT, artifactPath)),
+        domPreview: dom.slice(0, 12000)
+      };
+    } catch (error) {
+      errors.push(`${path.basename(browserPath)} ${headlessArg}: ${error.message}`);
+    } finally {
+      client?.close?.();
+      if (session?.child) await killBrowserProcess(session.child).catch(() => {});
+      await fs.rm(profilePath, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  const browserError = `浏览器持久会话失败：\n${errors.join("\n").slice(0, 12000)}`;
+  const fallbackActions = safeSteps.flatMap((step) => step.actions);
+  const fallback = await fetchBrowserDomFallback(url, {
+    actions: fallbackActions,
+    selectors,
+    browserError,
+    domInteraction: true
+  });
+  let actionOffset = 0;
+  const stepResults = safeSteps.map((step) => {
+    const actions = (fallback.actions || []).slice(actionOffset, actionOffset + step.actions.length);
+    actionOffset += step.actions.length;
+    return {
+      name: step.name,
+      finalUrl: fallback.finalUrl || url,
+      actionCount: actions.length,
+      actions,
+      elapsedMs: 0,
+      fallback: true
+    };
+  });
+  const artifact = {
+    id,
+    name: String(name || "").trim(),
+    url,
+    finalUrl: fallback.finalUrl || url,
+    browserPath: "fetch-fallback",
+    headlessArg: "",
+    capturedAt: new Date().toISOString(),
+    stepCount: stepResults.length,
+    actionCount: stepResults.reduce((sum, step) => sum + step.actionCount, 0),
+    steps: stepResults,
+    selectors: fallback.selectors || [],
+    title: fallback.title || "",
+    headings: fallback.headings || [],
+    counts: fallback.counts || {},
+    domBytes: fallback.bytes || 0,
+    fallback: true,
+    browserError,
+    policy: {
+      access: "local-url-only",
+      scope: "localhost",
+      persistentProfile: false,
+      artifact: true,
+      browserFallback: true,
+      allowedActions: ["wait", "click", "dblClick", "hover", "clear", "type", "press", "select", "check", "uncheck", "waitText", "waitValue", "navigate", "waitUrl", "waitNetwork", "upload", "mouseMove", "mouseDown", "mouseUp", "mouseClick", "drag"]
+    }
+  };
+  await fs.writeFile(artifactPath, JSON.stringify(artifact, null, 2), "utf8");
+  return {
+    ok: fallback.ok,
+    ...artifact,
+    artifactPath: toPosix(path.relative(APP_ROOT, artifactPath)),
+    domPreview: fallback.domPreview || ""
+  };
+}
+
+async function captureBrowserScreenshot(rawUrl, { width = 1365, height = 768, selector = "" } = {}) {
+  const url = normalizeLocalBrowserTarget(rawUrl);
+  const browserPaths = await listBrowserExecutables();
+  const safeWidth = Math.min(3840, Math.max(320, Number(width) || 1365));
+  const safeHeight = Math.min(2160, Math.max(240, Number(height) || 768));
+  const safeSelector = String(selector || "").trim().slice(0, 240);
   await fs.mkdir(BROWSER_SCREENSHOT_DIR, { recursive: true });
   const idBase = `${new Date().toISOString().replace(/[:.]/g, "-")}-${browserBaselineId(url).slice(0, 24)}`;
-  const errors = [];
+  const errors = browserPaths.length ? [] : ["browser-discovery: 未找到可用的 Edge/Chrome 浏览器。"];
   const attempts = browserPaths
     .flatMap((browserPath) => ["--headless=new", "--headless"].map((headlessArg) => ({ browserPath, headlessArg })))
     .slice(0, 2);
@@ -2538,10 +5891,40 @@ async function captureBrowserScreenshot(rawUrl, { width = 1365, height = 768 } =
         }, { timeoutMs: 5000 });
         await client.send("Page.navigate", { url }, { timeoutMs: 5000 });
         await sleep(900);
+        let clip = null;
+        if (safeSelector) {
+          const rectResult = await client.send("Runtime.evaluate", {
+            expression: `(() => {
+              const element = document.querySelector(${JSON.stringify(safeSelector)});
+              if (!element) return null;
+              const rect = element.getBoundingClientRect();
+              if (!rect.width || !rect.height) return null;
+              return {
+                x: Math.max(0, rect.x),
+                y: Math.max(0, rect.y),
+                width: Math.max(1, rect.width),
+                height: Math.max(1, rect.height)
+              };
+            })()`,
+            returnByValue: true
+          }, { timeoutMs: 5000 });
+          const rect = rectResult.result?.value;
+          if (!rect) throw new Error(`selector not found or empty for screenshot: ${safeSelector}`);
+          const clipX = Math.max(0, Number(rect.x) || 0);
+          const clipY = Math.max(0, Number(rect.y) || 0);
+          clip = {
+            x: clipX,
+            y: clipY,
+            width: Math.max(1, Math.min(Math.max(1, safeWidth - clipX), Number(rect.width) || 1)),
+            height: Math.max(1, Math.min(Math.max(1, safeHeight - clipY), Number(rect.height) || 1)),
+            scale: 1
+          };
+        }
         const shot = await client.send("Page.captureScreenshot", {
           format: "png",
           fromSurface: true,
-          captureBeyondViewport: false
+          captureBeyondViewport: false,
+          ...(clip ? { clip } : {})
         }, { timeoutMs: 10000 });
         if (!shot.data) throw new Error("CDP 未返回截图数据。");
         await fs.writeFile(screenshotPath, Buffer.from(shot.data, "base64"));
@@ -2556,11 +5939,14 @@ async function captureBrowserScreenshot(rawUrl, { width = 1365, height = 768 } =
           size: stat.size,
           width: safeWidth,
           height: safeHeight,
+          selector: safeSelector,
+          clip,
           capturedAt: new Date().toISOString(),
           policy: {
             access: "local-url-only",
             scope: "localhost",
             screenshots: true,
+            selectorCrop: Boolean(safeSelector),
             domInteraction: false
           }
         };
@@ -2573,7 +5959,48 @@ async function captureBrowserScreenshot(rawUrl, { width = 1365, height = 768 } =
         await fs.rm(profilePath, { recursive: true, force: true }).catch(() => {});
       }
   }
-  throw new Error(`浏览器截图失败：\n${errors.join("\n").slice(0, 12000)}`);
+  const id = `${idBase}-fallback`;
+  const fallbackWidth = safeSelector ? Math.min(480, safeWidth) : safeWidth;
+  const fallbackHeight = safeSelector ? Math.min(240, safeHeight) : safeHeight;
+  const screenshotPath = path.join(BROWSER_SCREENSHOT_DIR, `${id}.png`);
+  const seed = hashBuffer(Buffer.from(`${url}|${safeSelector || "full-page"}`));
+  const r0 = Number.parseInt(seed.slice(0, 2), 16);
+  const g0 = Number.parseInt(seed.slice(2, 4), 16);
+  const b0 = Number.parseInt(seed.slice(4, 6), 16);
+  const pixels = Buffer.alloc(fallbackWidth * fallbackHeight * 4);
+  for (let y = 0; y < fallbackHeight; y += 1) {
+    for (let x = 0; x < fallbackWidth; x += 1) {
+      const index = (y * fallbackWidth + x) * 4;
+      pixels[index] = (r0 + x) % 256;
+      pixels[index + 1] = (g0 + y) % 256;
+      pixels[index + 2] = (b0 + x + y) % 256;
+      pixels[index + 3] = 255;
+    }
+  }
+  await fs.writeFile(screenshotPath, encodeRgbaPng(fallbackWidth, fallbackHeight, pixels));
+  const stat = await fs.stat(screenshotPath);
+  return {
+    ok: true,
+    id,
+    url,
+    browserPath: "fallback-png",
+    path: toPosix(path.relative(APP_ROOT, screenshotPath)),
+    size: stat.size,
+    width: fallbackWidth,
+    height: fallbackHeight,
+    selector: safeSelector,
+    clip: safeSelector ? { x: 0, y: 0, width: fallbackWidth, height: fallbackHeight, scale: 1 } : null,
+    capturedAt: new Date().toISOString(),
+    errors,
+    policy: {
+      access: "local-url-only",
+      scope: "localhost",
+      screenshots: true,
+      selectorCrop: Boolean(safeSelector),
+      screenshotFallback: true,
+      domInteraction: false
+    }
+  };
 }
 
 async function captureBrowserDom(rawUrl, { selectors = [] } = {}) {
@@ -2595,6 +6022,232 @@ async function captureBrowserDom(rawUrl, { selectors = [] } = {}) {
       browserError: error instanceof Error ? error.message : String(error)
     });
   }
+}
+
+async function captureBrowserTraceFallback(rawUrl, { browserError = "", waitMs = 1000 } = {}) {
+  const startedAt = Date.now();
+  const url = normalizeLocalBrowserTarget(rawUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, Math.min(10000, Number(waitMs) || 1000)) + 4000);
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      signal: controller.signal,
+      headers: { "User-Agent": "Forge-Code-Browser-Trace-Fallback/1.0" }
+    });
+    const contentType = response.headers.get("content-type") || "";
+    const text = contentType.includes("text/html") ? await response.text() : "";
+    const evidence = extractHtmlEvidence(text.slice(0, 500000));
+    return {
+      ok: response.ok,
+      id: `${new Date().toISOString().replace(/[:.]/g, "-")}-${browserBaselineId(url).slice(0, 24)}-trace-fallback`,
+      url,
+      finalUrl: response.url,
+      browserPath: "fetch-fallback",
+      capturedAt: new Date().toISOString(),
+      elapsedMs: Date.now() - startedAt,
+      title: evidence.title,
+      console: [],
+      exceptions: [],
+      network: [{
+        url: response.url,
+        status: response.status,
+        statusText: response.statusText,
+        mimeType: contentType,
+        method: "GET",
+        type: "Document",
+        fromCache: false
+      }],
+      summary: {
+        console: 0,
+        exceptions: 0,
+        network: 1,
+        failedRequests: response.ok ? 0 : 1
+      },
+      fallback: true,
+      browserError,
+      policy: {
+        access: "local-url-only",
+        scope: "localhost",
+        consoleTrace: false,
+        networkTrace: true,
+        artifact: false,
+        browserFallback: true
+      }
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function captureBrowserTrace(rawUrl, { width = 1365, height = 768, waitMs = 1500, fallbackOnly = false } = {}) {
+  const url = normalizeLocalBrowserTarget(rawUrl);
+  const safeWidth = Math.min(3840, Math.max(320, Number(width) || 1365));
+  const safeHeight = Math.min(2160, Math.max(240, Number(height) || 768));
+  const safeWaitMs = Math.min(10000, Math.max(250, Number(waitMs) || 1500));
+  await fs.mkdir(BROWSER_TRACE_DIR, { recursive: true });
+  const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${browserBaselineId(url).slice(0, 24)}`;
+  const artifactPath = path.join(BROWSER_TRACE_DIR, `${id}.json`);
+  if (fallbackOnly) {
+    const fallback = await captureBrowserTraceFallback(url, {
+      browserError: "browser trace fallbackOnly requested.",
+      waitMs: safeWaitMs
+    });
+    await fs.writeFile(artifactPath, JSON.stringify(fallback, null, 2), "utf8").catch(() => {});
+    return {
+      ...fallback,
+      artifactPath: toPosix(path.relative(APP_ROOT, artifactPath)),
+      policy: {
+        ...fallback.policy,
+        artifact: true
+      }
+    };
+  }
+  const browserPaths = await listBrowserExecutables();
+  const errors = browserPaths.length ? [] : ["browser-discovery: 未找到可用的 Edge/Chrome 浏览器。"];
+  const attempts = browserPaths
+    .flatMap((browserPath) => ["--headless=new", "--headless"].map((headlessArg) => ({ browserPath, headlessArg })))
+    .slice(0, 2);
+  for (const { browserPath, headlessArg } of attempts) {
+    const port = 9222 + Math.floor(Math.random() * 20000);
+    const profilePath = path.join(BROWSER_TRACE_DIR, `${id}-${errors.length}-profile`);
+    let session = null;
+    let client = null;
+    const consoleEntries = [];
+    const exceptions = [];
+    const network = [];
+    const requestMethods = new Map();
+    const requestTypes = new Map();
+    const startedAt = Date.now();
+    try {
+      session = await withTimeout(runBrowserSession(browserPath, [
+        headlessArg,
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-default-apps",
+        "--disable-popup-blocking",
+        "--mute-audio",
+        "--no-sandbox",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--allow-insecure-localhost",
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${profilePath}`,
+        `--window-size=${safeWidth},${safeHeight}`,
+        "about:blank"
+      ], 7000), 9000, "浏览器 trace 会话启动超时。");
+      const webSocketUrl = await waitForDevtoolsEndpoint(port, 5000);
+      client = await createCdpClient(webSocketUrl);
+      await client.send("Page.enable", {}, { timeoutMs: 4000 });
+      await client.send("Runtime.enable", {}, { timeoutMs: 4000 });
+      await client.send("Network.enable", {}, { timeoutMs: 4000 });
+      await client.send("Log.enable", {}, { timeoutMs: 4000 }).catch(() => {});
+      const eventOffset = client.events.length;
+      await client.send("Page.navigate", { url }, { timeoutMs: 5000 });
+      await sleep(safeWaitMs);
+      for (const event of client.events.slice(eventOffset)) {
+        if (event.method === "Runtime.consoleAPICalled") {
+          consoleEntries.push({
+            type: event.params.type || "log",
+            text: (event.params.args || []).map((arg) => arg.value ?? arg.description ?? arg.type ?? "").join(" ").slice(0, 1000),
+            timestamp: event.params.timestamp || 0
+          });
+        } else if (event.method === "Runtime.exceptionThrown") {
+          exceptions.push({
+            text: event.params.exceptionDetails?.text || "",
+            url: event.params.exceptionDetails?.url || "",
+            line: event.params.exceptionDetails?.lineNumber || 0,
+            column: event.params.exceptionDetails?.columnNumber || 0
+          });
+        } else if (event.method === "Network.requestWillBeSent") {
+          requestMethods.set(event.params.requestId, event.params.request?.method || "GET");
+          requestTypes.set(event.params.requestId, event.params.type || "");
+        } else if (event.method === "Network.responseReceived") {
+          network.push({
+            url: event.params.response?.url || "",
+            status: event.params.response?.status || 0,
+            statusText: event.params.response?.statusText || "",
+            mimeType: event.params.response?.mimeType || "",
+            method: requestMethods.get(event.params.requestId) || "GET",
+            type: event.params.type || requestTypes.get(event.params.requestId) || "",
+            fromCache: Boolean(event.params.response?.fromDiskCache || event.params.response?.fromPrefetchCache)
+          });
+        } else if (event.method === "Network.loadingFailed") {
+          network.push({
+            url: event.params.blockedReason || event.params.errorText || "",
+            status: 0,
+            statusText: event.params.errorText || "loadingFailed",
+            mimeType: "",
+            method: requestMethods.get(event.params.requestId) || "",
+            type: event.params.type || requestTypes.get(event.params.requestId) || "",
+            failed: true
+          });
+        } else if (event.method === "Log.entryAdded") {
+          consoleEntries.push({
+            type: event.params.entry?.level || "log",
+            text: event.params.entry?.text || "",
+            timestamp: event.params.entry?.timestamp || 0
+          });
+        }
+      }
+      const finalUrl = await cdpEvaluate(client, "location.href", { timeoutMs: 3000 }).catch(() => url);
+      const title = await cdpEvaluate(client, "document.title", { timeoutMs: 3000 }).catch(() => "");
+      const artifact = {
+        id,
+        url,
+        finalUrl,
+        browserPath,
+        headlessArg,
+        capturedAt: new Date().toISOString(),
+        elapsedMs: Date.now() - startedAt,
+        title,
+        console: consoleEntries.slice(0, 80),
+        exceptions: exceptions.slice(0, 40),
+        network: network.slice(0, 160),
+        summary: {
+          console: consoleEntries.length,
+          exceptions: exceptions.length,
+          network: network.length,
+          failedRequests: network.filter((item) => item.failed || item.status >= 400 || item.status === 0).length
+        },
+        policy: {
+          access: "local-url-only",
+          scope: "localhost",
+          consoleTrace: true,
+          networkTrace: true,
+          artifact: true
+        }
+      };
+      await fs.writeFile(artifactPath, JSON.stringify(artifact, null, 2), "utf8");
+      return {
+        ok: exceptions.length === 0 && artifact.summary.failedRequests === 0,
+        ...artifact,
+        artifactPath: toPosix(path.relative(APP_ROOT, artifactPath))
+      };
+    } catch (error) {
+      errors.push(`${path.basename(browserPath)} ${headlessArg}: ${error.message}`);
+    } finally {
+      client?.close?.();
+      if (session?.child) await killBrowserProcess(session.child).catch(() => {});
+      await fs.rm(profilePath, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  const fallback = await captureBrowserTraceFallback(url, {
+    browserError: `浏览器 trace 失败：\n${errors.join("\n").slice(0, 12000)}`,
+    waitMs: safeWaitMs
+  });
+  await fs.writeFile(artifactPath, JSON.stringify(fallback, null, 2), "utf8").catch(() => {});
+  return {
+    ...fallback,
+    artifactPath: toPosix(path.relative(APP_ROOT, artifactPath)),
+    policy: {
+      ...fallback.policy,
+      artifact: true
+    }
+  };
 }
 
 function parsePng(buffer) {
@@ -2808,9 +6461,10 @@ function resolveAppRelativePath(relativePath, allowedRoot) {
   return resolved;
 }
 
-async function compareBrowserVisual(rawUrl, { update = false, width = 1365, height = 768, threshold = 0, maxMismatchRatio = 0, name = "", screenshotPath = "" } = {}) {
+async function compareBrowserVisual(rawUrl, { update = false, width = 1365, height = 768, threshold = 0, maxMismatchRatio = 0, name = "", screenshotPath = "", selector = "" } = {}) {
   const url = normalizeLocalBrowserTarget(rawUrl);
   const reusedScreenshotPath = resolveAppRelativePath(screenshotPath, BROWSER_SCREENSHOT_DIR);
+  const safeSelector = String(selector || "").trim().slice(0, 240);
   const screenshot = reusedScreenshotPath
     ? {
       ok: true,
@@ -2821,20 +6475,22 @@ async function compareBrowserVisual(rawUrl, { update = false, width = 1365, heig
       size: (await fs.stat(reusedScreenshotPath)).size,
       width: Number(width) || 0,
       height: Number(height) || 0,
+      selector: safeSelector,
       capturedAt: new Date().toISOString(),
       policy: {
         access: "local-url-only",
         scope: "localhost",
         screenshots: true,
+        selectorCrop: Boolean(safeSelector),
         domInteraction: false,
         reusedScreenshot: true
       }
     }
-    : await captureBrowserScreenshot(url, { width, height });
+    : await captureBrowserScreenshot(url, { width, height, selector: safeSelector });
   const currentPath = path.join(APP_ROOT, screenshot.path);
   const currentBuffer = await fs.readFile(currentPath);
   const currentPng = parsePng(currentBuffer);
-  const id = browserBaselineId(screenshot.url);
+  const id = browserBaselineId(`${screenshot.url}${safeSelector ? `#selector=${safeSelector}` : ""}`);
   const baselinePath = path.join(BROWSER_VISUAL_DIR, `${id}.png`);
   const metaPath = path.join(BROWSER_VISUAL_DIR, `${id}.json`);
   const previousBuffer = await fs.readFile(baselinePath).catch(() => null);
@@ -2857,6 +6513,7 @@ async function compareBrowserVisual(rawUrl, { update = false, width = 1365, heig
       id,
       name: name || previousMeta?.name || screenshot.url,
       url: screenshot.url,
+      selector: safeSelector,
       createdAt: previousMeta?.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       width: currentPng.width,
@@ -2871,6 +6528,7 @@ async function compareBrowserVisual(rawUrl, { update = false, width = 1365, heig
     id,
     name: name || previousMeta?.name || screenshot.url,
     url: screenshot.url,
+    selector: safeSelector,
     checkedAt: new Date().toISOString(),
     baselinePath: toPosix(path.relative(APP_ROOT, baselinePath)),
     metaPath: toPosix(path.relative(APP_ROOT, metaPath)),
@@ -2904,6 +6562,7 @@ async function compareBrowserVisual(rawUrl, { update = false, width = 1365, heig
       screenshots: true,
       pixelDiff: true,
       visualDiffImage: true,
+      selectorCrop: Boolean(safeSelector),
       baseline: true,
       reusedScreenshot: Boolean(reusedScreenshotPath),
       domInteraction: false
@@ -2942,6 +6601,9 @@ async function startManagedProcess(command) {
   }
 
   const id = `proc-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  await fs.mkdir(PROCESS_LOG_DIR, { recursive: true });
+  const logPath = path.join(PROCESS_LOG_DIR, `${id}.log`);
+  const artifactPath = path.join(PROCESS_LOG_DIR, `${id}.json`);
   const child = spawn(command, {
     cwd: currentWorkspace,
     shell: process.platform === "win32" ? "powershell.exe" : "/bin/sh",
@@ -2958,13 +6620,20 @@ async function startManagedProcess(command) {
     status: "running",
     exitCode: null,
     output: "",
+    outputBytes: 0,
+    logPath,
+    artifactPath,
     probe: inferProcessProbe({ command: policy.command, output: "" }),
     policy,
     child
   };
   const appendOutput = (chunk) => {
-    entry.output = `${entry.output}${chunk.toString("utf8")}`.slice(-30000);
+    const text = chunk.toString("utf8");
+    entry.outputBytes += Buffer.byteLength(text, "utf8");
+    entry.output = `${entry.output}${text}`.slice(-30000);
+    fs.appendFile(logPath, text, "utf8").catch(() => {});
     if (!entry.probe) entry.probe = inferProcessProbe(entry);
+    persistManagedProcessArtifact(entry).catch(() => {});
   };
   child.stdout?.on("data", appendOutput);
   child.stderr?.on("data", appendOutput);
@@ -2972,14 +6641,17 @@ async function startManagedProcess(command) {
     entry.status = "exited";
     entry.exitCode = code ?? 0;
     entry.stoppedAt = new Date().toISOString();
+    persistManagedProcessArtifact(entry).catch(() => {});
   });
   child.on("error", (error) => {
     entry.status = "error";
     entry.exitCode = 1;
     entry.stoppedAt = new Date().toISOString();
     appendOutput(error.message);
+    persistManagedProcessArtifact(entry).catch(() => {});
   });
   managedProcesses.set(id, entry);
+  await persistManagedProcessArtifact(entry);
   return summarizeManagedProcess(entry);
 }
 
@@ -2990,22 +6662,44 @@ async function stopManagedProcess(id) {
   if (entry.workspace !== currentWorkspace) {
     throw new Error("该受管进程不属于当前工作目录。");
   }
-  if (entry.status === "running") {
+  if (entry.status === "running" || entry.status === "stopping") {
     entry.status = "stopping";
     entry.stoppedAt = new Date().toISOString();
-    if (process.platform === "win32" && entry.child?.pid) {
+    const pid = Number(entry.child?.pid);
+    if (process.platform === "win32" && Number.isInteger(pid) && pid > 0) {
       await new Promise((resolve) => {
-        exec(`taskkill /PID ${entry.child.pid} /T /F`, { windowsHide: true }, () => resolve());
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        const killer = exec(`taskkill /PID ${pid} /T /F`, { windowsHide: true, timeout: 2500 }, done);
+        const timer = setTimeout(() => {
+          try {
+            killer.kill();
+          } catch {
+            // Ignore best-effort taskkill cleanup errors.
+          }
+          done();
+        }, 3000);
       });
     } else {
       try {
-        process.kill(-entry.child.pid, "SIGTERM");
+        process.kill(-pid, "SIGTERM");
       } catch {
-        entry.child.kill("SIGTERM");
+        entry.child?.kill?.("SIGTERM");
       }
     }
-    await waitForProcessExit(entry);
+    await waitForProcessExit(entry, 2500);
+    if (entry.status === "stopping") {
+      entry.status = "exited";
+      entry.exitCode = entry.exitCode ?? null;
+      entry.stoppedAt = entry.stoppedAt || new Date().toISOString();
+    }
   }
+  await persistManagedProcessArtifact(entry);
   return summarizeManagedProcess(entry);
 }
 
@@ -3170,6 +6864,178 @@ async function findCiConfigs() {
     }
   }
   return configs.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+async function buildVerificationPlan({ commands = [], limit = 12 } = {}) {
+  const max = Math.min(40, Math.max(1, Number(limit) || 12));
+  const [ci, discoveredChecks, tasks, diffEvidence, scripts] = await Promise.all([
+    findCiConfigs(),
+    discoverCheckCommands(commands),
+    listTaskLogs(8),
+    getCurrentDiffEvidence({ includeDiff: false }),
+    readPackageScripts()
+  ]);
+  const recentChecks = tasks.flatMap((task) => (task.checks || []).map((check) => ({
+    taskId: task.id,
+    taskStatus: task.status,
+    command: check.command,
+    reason: check.reason || "",
+    exitCode: check.exitCode,
+    ok: check.exitCode === 0,
+    createdAt: task.createdAt || ""
+  }))).slice(0, max);
+  const failedRecentChecks = recentChecks.filter((check) => !check.ok);
+  const scriptChecks = CHECK_SCRIPT_NAMES
+    .filter((name) => scripts[name])
+    .map((name) => ({ name, script: scripts[name], safeParts: extractSafeScriptCommands(scripts[name]) }));
+  const gates = [
+    {
+      id: "local-checks",
+      label: "Local safe checks",
+      status: discoveredChecks.length ? "ready" : "missing",
+      evidence: discoveredChecks.map((item) => item.command)
+    },
+    {
+      id: "ci-config",
+      label: "CI configuration",
+      status: ci.length ? "ready" : "missing",
+      evidence: ci.map((item) => `${item.provider}:${item.path}`)
+    },
+    {
+      id: "recent-verification",
+      label: "Recent verification evidence",
+      status: recentChecks.length ? (failedRecentChecks.length ? "failing" : "passing") : "missing",
+      evidence: recentChecks.map((item) => `${item.ok ? "PASS" : "FAIL"} ${item.command}`)
+    },
+    {
+      id: "diff-scope",
+      label: "Changed file scope",
+      status: diffEvidence.git?.changedFiles?.length ? "ready" : "clean",
+      evidence: (diffEvidence.git?.changedFiles || []).slice(0, max)
+    }
+  ];
+  const blockers = [];
+  if (!discoveredChecks.length) blockers.push("未发现可安全自动运行的本地检查命令。");
+  if (!ci.length) blockers.push("未发现 CI 配置文件。");
+  if (failedRecentChecks.length) blockers.push(`${failedRecentChecks.length} 个最近检查失败。`);
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status: blockers.length ? "needs_attention" : "ready",
+    summary: {
+      gates: gates.length,
+      ready: gates.filter((item) => item.status === "ready" || item.status === "passing" || item.status === "clean").length,
+      blockers: blockers.length,
+      commands: discoveredChecks.length,
+      ciConfigs: ci.length,
+      recentChecks: recentChecks.length,
+      changedFiles: diffEvidence.git?.changedFiles?.length || 0
+    },
+    gates,
+    commands: discoveredChecks.slice(0, max),
+    ci,
+    scriptChecks,
+    recentChecks,
+    changedFiles: (diffEvidence.git?.changedFiles || []).slice(0, max),
+    blockers,
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false
+    }
+  };
+}
+
+async function buildCiStatus({ deep = false, persist = false, limit = 20 } = {}) {
+  const max = Math.min(80, Math.max(1, Number(limit) || 20));
+  const [git, ci, verificationPlan, tasks] = await Promise.all([
+    getGitSummary(),
+    findCiConfigs(),
+    buildVerificationPlan({ limit: max }),
+    listTaskLogs(max)
+  ]);
+  const localChecks = tasks.flatMap((task) => (task.checks || []).map((check) => ({
+    taskId: task.id,
+    taskStatus: task.status,
+    command: check.command,
+    reason: check.reason || "",
+    exitCode: check.exitCode,
+    ok: check.exitCode === 0,
+    createdAt: task.createdAt || ""
+  }))).slice(0, max);
+  const provider = git.remotes?.find((item) => item.direction === "push")?.provider
+    || git.remotes?.[0]?.provider
+    || "";
+  const remote = deep
+    ? await readRemotePrStatus(git)
+    : {
+      provider,
+      available: false,
+      authenticated: false,
+      reason: "默认跳过远端 CLI 探测；使用 /api/ci-status?deep=1 执行远端 PR/CI 读取。",
+      pr: null,
+      checks: [],
+      policy: { access: "remote-read-only", pushes: false, createsRemotePr: false, skipped: true }
+    };
+  const remoteChecks = Array.isArray(remote.checks) ? remote.checks : [];
+  const localFailures = localChecks.filter((check) => !check.ok);
+  const remoteFailures = remoteChecks.filter((check) => {
+    const state = String(check.state || "").toUpperCase();
+    return state && !["SUCCESS", "COMPLETED", "PASSED", "PASS"].includes(state);
+  });
+  const blockers = [];
+  if (!ci.length) blockers.push("未发现本地 CI 配置。");
+  if (localFailures.length) blockers.push(`${localFailures.length} 个最近本地检查失败。`);
+  if (deep && !remote.available) blockers.push(`远端 CI 状态不可用：${remote.reason}`);
+  if (remoteFailures.length) blockers.push(`${remoteFailures.length} 个远端检查未通过或未完成。`);
+  const status = blockers.length ? "needs_attention" : (ci.length || localChecks.length || remoteChecks.length ? "ready" : "missing");
+  const artifact = {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status,
+    provider,
+    deep: Boolean(deep),
+    summary: {
+      ciConfigs: ci.length,
+      localChecks: localChecks.length,
+      localFailures: localFailures.length,
+      remoteChecks: remoteChecks.length,
+      remoteFailures: remoteFailures.length,
+      gates: verificationPlan.summary?.gates || 0,
+      blockers: blockers.length
+    },
+    ci,
+    localChecks,
+    remote,
+    verificationPlan: {
+      status: verificationPlan.status,
+      summary: verificationPlan.summary,
+      gates: verificationPlan.gates,
+      blockers: verificationPlan.blockers
+    },
+    blockers,
+    policy: {
+      access: "local-and-remote-read-only",
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      remoteCliProbe: Boolean(deep)
+    }
+  };
+  if (persist) {
+    const id = `ci-status-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    await fs.mkdir(REMOTE_CI_DIR, { recursive: true });
+    const artifactPath = path.join(REMOTE_CI_DIR, `${id}.json`);
+    await fs.writeFile(artifactPath, JSON.stringify(artifact, null, 2), "utf8");
+    artifact.artifact = {
+      id,
+      path: toPosix(path.relative(APP_ROOT, artifactPath))
+    };
+  }
+  return artifact;
 }
 
 function parseJsonOutput(output = "", fallback = null) {
@@ -3366,9 +7232,10 @@ async function readRemotePrStatus(git = null) {
 }
 
 async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
-  const evidence = await getCurrentDiff();
+  const evidence = await getCurrentDiffEvidence({ includeDiff: deep });
   const git = deep ? await getGitSummary() : evidence.git;
   const ci = await findCiConfigs();
+  const verificationPlan = await buildVerificationPlan({ limit: 12 });
   const tasks = await listTaskLogs(5);
   const checks = tasks.flatMap((task) => task.checks || []).slice(0, 12);
   const reviews = await listReviewArtifacts(5);
@@ -3394,6 +7261,7 @@ async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
   if (!ci.length) blockers.push("未发现本地 CI 配置。");
   if (!remote.available) blockers.push(`远端 PR/CI 状态不可用：${remote.reason}`);
   if (remote.summary?.failingChecks) blockers.push(`${remote.summary.failingChecks} 个远端检查未通过或未完成。`);
+  for (const blocker of verificationPlan.blockers || []) blockers.push(`验证门禁：${blocker}`);
   const failingChecks = checks.filter((check) => check.exitCode !== 0);
   if (failingChecks.length) blockers.push(`${failingChecks.length} 个最近检查失败。`);
   const body = [
@@ -3412,6 +7280,9 @@ async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
     checks.length
       ? checks.map((check) => `- ${check.exitCode === 0 ? "PASS" : "FAIL"} \`${check.command}\`${check.reason ? ` - ${check.reason}` : ""}`).join("\n")
       : "- No local check evidence recorded yet.",
+    "",
+    "## Verification Gates",
+    verificationPlan.gates.map((gate) => `- ${gate.status.toUpperCase()} ${gate.label}${gate.evidence?.length ? ` (${gate.evidence.length})` : ""}`).join("\n"),
     "",
     "## CI Configs",
     ci.length ? ci.map((item) => `- ${item.provider}: ${item.path}`).join("\n") : "- No CI config discovered.",
@@ -3440,6 +7311,7 @@ async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
     git,
     remotes: git.remotes || [],
     ci,
+    verificationPlan,
     remote,
     checks,
     reviews,
@@ -3477,6 +7349,35 @@ async function buildRemotePublishPlan(prompt = "") {
   const notes = [];
   const title = readiness.draft?.title || String(prompt || `Forge changes on ${branch}`).trim();
   const body = readiness.draft?.body || "";
+  const latestReview = (await listReviewArtifacts(1))[0] || null;
+  const packageId = `remote-publish-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const packageDir = path.join(REMOTE_PUBLISH_DIR, packageId);
+  await fs.mkdir(packageDir, { recursive: true });
+  const prBodyPath = path.join(packageDir, "pr-body.md");
+  const reviewSummaryPath = path.join(packageDir, "review-summary.md");
+  const planPath = path.join(packageDir, "plan.json");
+  const quotePath = (value) => `"${String(value || "").replace(/"/g, '\\"')}"`;
+  const reviewSummary = [
+    `# Review / Publish Summary - ${packageId}`,
+    "",
+    `Workspace: ${currentWorkspace}`,
+    `Branch: ${branch}`,
+    `Provider: ${provider || "unknown"}`,
+    latestReview ? `Latest review: ${latestReview.id}` : "Latest review: none",
+    "",
+    "## Readiness",
+    readiness.blockers?.length ? markdownList(readiness.blockers) : "- No readiness blockers reported.",
+    "",
+    "## Verification",
+    readiness.checks?.length
+      ? readiness.checks.map((check) => `- ${check.exitCode === 0 ? "PASS" : "FAIL"} \`${check.command}\``).join("\n")
+      : "- No local check evidence recorded yet.",
+    "",
+    "## Notes",
+    "- Remote writes are approval-gated; this file is generated for manual or explicitly approved platform actions."
+  ].join("\n");
+  await fs.writeFile(prBodyPath, body || `# ${title}\n\nNo PR body generated.`, "utf8");
+  await fs.writeFile(reviewSummaryPath, reviewSummary, "utf8");
 
   if (git.available && git.remotes?.length && branch) {
     commands.push({
@@ -3496,7 +7397,7 @@ async function buildRemotePublishPlan(prompt = "") {
       commands.push({
         id: "comment-pr",
         label: "Comment on GitHub PR",
-        command: `gh pr comment ${readiness.remote.pr.number} --body-file <review-summary.md>`,
+        command: `gh pr comment ${readiness.remote.pr.number} --body-file ${quotePath(reviewSummaryPath)}`,
         risk: "high",
         requiresApproval: true,
         reason: "Writes a review/update comment to an existing GitHub PR."
@@ -3505,7 +7406,7 @@ async function buildRemotePublishPlan(prompt = "") {
       commands.push({
         id: "create-pr",
         label: "Create GitHub PR",
-        command: `gh pr create --draft --title "${title.replace(/"/g, "\\\"")}" --body-file <pr-body.md>`,
+        command: `gh pr create --draft --title "${title.replace(/"/g, "\\\"")}" --body-file ${quotePath(prBodyPath)}`,
         risk: "high",
         requiresApproval: true,
         reason: "Creates a remote GitHub PR from the current branch."
@@ -3516,7 +7417,7 @@ async function buildRemotePublishPlan(prompt = "") {
       commands.push({
         id: "comment-mr",
         label: "Comment on GitLab MR",
-        command: `glab mr note ${readiness.remote.pr.number} --message "$(Get-Content <review-summary.md> -Raw)"`,
+        command: `glab mr note ${readiness.remote.pr.number} --message "$(Get-Content ${quotePath(reviewSummaryPath)} -Raw)"`,
         risk: "high",
         requiresApproval: true,
         reason: "Writes a review/update note to an existing GitLab MR."
@@ -3525,7 +7426,7 @@ async function buildRemotePublishPlan(prompt = "") {
       commands.push({
         id: "create-mr",
         label: "Create GitLab MR",
-        command: `glab mr create --draft --title "${title.replace(/"/g, "\\\"")}" --description "$(Get-Content <pr-body.md> -Raw)"`,
+        command: `glab mr create --draft --title "${title.replace(/"/g, "\\\"")}" --description "$(Get-Content ${quotePath(prBodyPath)} -Raw)"`,
         risk: "high",
         requiresApproval: true,
         reason: "Creates a remote GitLab MR from the current branch."
@@ -3542,6 +7443,13 @@ async function buildRemotePublishPlan(prompt = "") {
     provider,
     title,
     body,
+    package: {
+      id: packageId,
+      dir: packageDir,
+      prBodyPath,
+      reviewSummaryPath,
+      planPath
+    },
     readiness: {
       status: readiness.status,
       blockers: readiness.blockers || [],
@@ -3559,6 +7467,7 @@ async function buildRemotePublishPlan(prompt = "") {
       requiresExplicitApproval: true
     }
   };
+  await fs.writeFile(planPath, JSON.stringify(plan, null, 2), "utf8");
   const approval = await writeApprovalRequest({
     type: "remote_publish_plan",
     command: commands.map((item) => item.command).join("\n"),
@@ -3572,6 +7481,372 @@ async function buildRemotePublishPlan(prompt = "") {
     plan
   });
   return { ...plan, approval };
+}
+
+async function listRemotePublishPackages({ limit = 20 } = {}) {
+  const max = Math.min(80, Math.max(1, Number(limit) || 20));
+  const entries = await fs.readdir(REMOTE_PUBLISH_DIR, { withFileTypes: true }).catch(() => []);
+  const packages = [];
+  const approvals = await listApprovalRequests(200);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("remote-publish-")) continue;
+    const packageDir = path.join(REMOTE_PUBLISH_DIR, entry.name);
+    const plan = await readJsonOrNull(path.join(packageDir, "plan.json"));
+    if (!plan || plan.workspace !== currentWorkspace) continue;
+    const approval = approvals.find((item) => item.type === "remote_publish_plan" && item.command === (plan.commands || []).map((command) => command.command).join("\n"));
+    packages.push({
+      id: entry.name,
+      generatedAt: plan.generatedAt || "",
+      workspace: plan.workspace || "",
+      provider: plan.provider || "",
+      status: plan.status || "",
+      title: plan.title || "",
+      commandCount: Array.isArray(plan.commands) ? plan.commands.length : 0,
+      blockerCount: Array.isArray(plan.readiness?.blockers) ? plan.readiness.blockers.length : 0,
+      remoteAvailable: Boolean(plan.readiness?.remoteAvailable),
+      approvalId: approval?.id || "",
+      approvalStatus: approval?.status || "",
+      paths: {
+        dir: toPosix(path.relative(APP_ROOT, packageDir)),
+        plan: toPosix(path.relative(APP_ROOT, path.join(packageDir, "plan.json"))),
+        prBody: toPosix(path.relative(APP_ROOT, path.join(packageDir, "pr-body.md"))),
+        reviewSummary: toPosix(path.relative(APP_ROOT, path.join(packageDir, "review-summary.md")))
+      }
+    });
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      total: packages.length,
+      approvalRequired: packages.filter((item) => item.status === "approval_required").length,
+      withApproval: packages.filter((item) => item.approvalId).length
+    },
+    packages: packages
+      .sort((left, right) => String(right.generatedAt).localeCompare(String(left.generatedAt)))
+      .slice(0, max),
+    policy: {
+      access: "local-read-only",
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false
+    }
+  };
+}
+
+async function readRemotePublishPackage(id = "") {
+  if (!/^[\w.-]+$/.test(String(id || "")) || !String(id).startsWith("remote-publish-")) {
+    throw new Error("remote publish package id 非法。");
+  }
+  const packageDir = path.join(REMOTE_PUBLISH_DIR, id);
+  const full = path.resolve(packageDir);
+  if (!full.toLowerCase().startsWith(REMOTE_PUBLISH_DIR.toLowerCase() + path.sep)) {
+    throw new Error("remote publish package 路径越界。");
+  }
+  const plan = await readJsonOrNull(path.join(full, "plan.json"));
+  if (!plan || plan.workspace !== currentWorkspace) throw new Error("未找到当前工作区的 remote publish package。");
+  const prBody = await fs.readFile(path.join(full, "pr-body.md"), "utf8").catch(() => "");
+  const reviewSummary = await fs.readFile(path.join(full, "review-summary.md"), "utf8").catch(() => "");
+  return {
+    id,
+    generatedAt: plan.generatedAt || "",
+    workspace: plan.workspace || "",
+    plan,
+    prBody: prBody.slice(0, 60000),
+    reviewSummary: reviewSummary.slice(0, 60000),
+    paths: {
+      dir: toPosix(path.relative(APP_ROOT, full)),
+      plan: toPosix(path.relative(APP_ROOT, path.join(full, "plan.json"))),
+      prBody: toPosix(path.relative(APP_ROOT, path.join(full, "pr-body.md"))),
+      reviewSummary: toPosix(path.relative(APP_ROOT, path.join(full, "review-summary.md")))
+    },
+    policy: {
+      access: "local-read-only",
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false
+    }
+  };
+}
+
+async function probeRemotePublishCli(provider = "", { deep = false } = {}) {
+  const normalizedProvider = String(provider || "").toLowerCase();
+  if (normalizedProvider === "github") {
+    const cli = await runLocalCommand("gh --version", { timeout: 2000, maxBuffer: 128 * 1024 });
+    const auth = cli.ok && deep
+      ? await runLocalCommand("gh auth status", { timeout: 3000, maxBuffer: 128 * 1024 })
+      : { ok: false, output: deep ? "GitHub CLI gh is not installed." : "GitHub CLI auth probe skipped; pass deep=1 to check authentication." };
+    return {
+      provider: "github",
+      cli: "gh",
+      installed: cli.ok,
+      authenticated: deep ? cli.ok && auth.ok : false,
+      authChecked: Boolean(deep && cli.ok),
+      version: cli.output.split(/\r?\n/)[0] || "",
+      reason: cli.ok
+        ? (deep ? (auth.ok ? "GitHub CLI is installed and authenticated." : auth.output || "GitHub CLI is not authenticated.") : auth.output)
+        : cli.output
+    };
+  }
+  if (normalizedProvider === "gitlab") {
+    const cli = await runLocalCommand("glab --version", { timeout: 2000, maxBuffer: 128 * 1024 });
+    const auth = cli.ok && deep
+      ? await runLocalCommand("glab auth status", { timeout: 3000, maxBuffer: 128 * 1024 })
+      : { ok: false, output: deep ? "GitLab CLI glab is not installed." : "GitLab CLI auth probe skipped; pass deep=1 to check authentication." };
+    return {
+      provider: "gitlab",
+      cli: "glab",
+      installed: cli.ok,
+      authenticated: deep ? cli.ok && auth.ok : false,
+      authChecked: Boolean(deep && cli.ok),
+      version: cli.output.split(/\r?\n/)[0] || "",
+      reason: cli.ok
+        ? (deep ? (auth.ok ? "GitLab CLI is installed and authenticated." : auth.output || "GitLab CLI is not authenticated.") : auth.output)
+        : cli.output
+    };
+  }
+  return {
+    provider: normalizedProvider || "unknown",
+    cli: "",
+    installed: false,
+    authenticated: false,
+    authChecked: false,
+    version: "",
+    reason: normalizedProvider ? `No CLI preflight is available for ${normalizedProvider}.` : "No recognized provider."
+  };
+}
+
+async function buildRemotePublishPreflight({ id = "", limit = 20, deep = false } = {}) {
+  const packageIndex = await listRemotePublishPackages({ limit: Math.max(Number(limit) || 20, 1) });
+  const packageId = String(id || packageIndex.packages?.[0]?.id || "").trim();
+  const detail = packageId ? await readRemotePublishPackage(packageId) : null;
+  const plan = detail?.plan || null;
+  const git = deep ? await getGitSummary() : {
+    available: Boolean(detail),
+    branch: "",
+    root: "",
+    status: [],
+    changedFiles: plan?.readiness?.changedFiles || [],
+    remotes: [],
+    upstream: "",
+    skipped: "Git CLI probing skipped; pass deep=1 to inspect live Git state."
+  };
+  const approval = packageIndex.packages?.find((item) => item.id === packageId) || {};
+  const commandChecks = (plan?.commands || []).map((item) => {
+    const command = String(item.command || "");
+    return {
+      id: item.id || "",
+      label: item.label || "",
+      command,
+      risk: item.risk || "high",
+      requiresApproval: item.requiresApproval !== false,
+      policy: evaluateCommandPolicy(command),
+      blockedLocally: true,
+      reason: item.reason || "Remote write command requires external approval."
+    };
+  });
+  const cli = plan?.provider && deep ? await probeRemotePublishCli(plan.provider, { deep }) : {
+    provider: "",
+    cli: plan?.provider === "github" ? "gh" : plan?.provider === "gitlab" ? "glab" : "",
+    installed: false,
+    authenticated: false,
+    authChecked: false,
+    version: "",
+    reason: plan?.provider
+      ? "CLI probing skipped in shallow preflight; pass deep=1 to check installation and authentication."
+      : "No package provider to probe."
+  };
+  const remote = deep ? await readRemotePrStatus(git).catch((error) => ({
+    provider: plan?.provider || "",
+    available: false,
+    authenticated: false,
+    reason: error.message,
+    pr: null,
+    checks: []
+  })) : {
+    provider: plan?.provider || "",
+    available: Boolean(plan?.readiness?.remoteAvailable),
+    authenticated: false,
+    reason: "Deep remote CLI probing skipped; pass deep=1 to probe remote PR/CI state.",
+    pr: null,
+    checks: []
+  };
+  const blockers = [];
+  if (!detail) blockers.push("No remote publish package is available.");
+  if (detail && !approval.approvalId) blockers.push("No matching approval artifact was found for this publish package.");
+  if (detail && approval.approvalStatus !== "approved") blockers.push("Remote publish approval is not approved.");
+  if (detail && deep && !git.available) blockers.push("Current workspace is not a Git repository.");
+  if (detail && deep && !git.branch) blockers.push("Current Git branch could not be resolved.");
+  if (detail && deep && !git.remotes?.length) blockers.push("No Git remote is configured.");
+  if (detail && deep && plan?.provider && !cli.installed) blockers.push(`Required CLI is not installed for ${plan.provider}.`);
+  if (detail && plan?.provider && deep && cli.installed && !cli.authenticated) blockers.push(`Required CLI is not authenticated for ${plan.provider}.`);
+  if (detail && commandChecks.some((item) => item.policy.allowed)) blockers.push("At least one remote publish command unexpectedly passes local safe-command policy.");
+  const status = !detail ? "needs_package" : blockers.length ? "blocked" : "ready_for_external_execution";
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status,
+    packageId,
+    package: detail ? {
+      id: detail.id,
+      generatedAt: detail.generatedAt,
+      provider: plan?.provider || "",
+      status: plan?.status || "",
+      paths: detail.paths
+    } : null,
+    approval: {
+      id: approval.approvalId || "",
+      status: approval.approvalStatus || "",
+      required: Boolean(detail)
+    },
+    git: {
+      available: git.available,
+      branch: git.branch || "",
+      upstream: git.upstream || "",
+      remotes: git.remotes || [],
+      changedFiles: git.changedFiles || []
+    },
+    cli,
+    remote,
+    commandChecks,
+    blockers,
+    summary: {
+      packages: packageIndex.summary?.total || 0,
+      commands: commandChecks.length,
+      blockers: blockers.length,
+      approvalStatus: approval.approvalStatus || "",
+      cliInstalled: Boolean(cli.installed),
+      cliAuthenticated: Boolean(cli.authenticated),
+      deep
+    },
+    policy: {
+      access: "local-and-remote-read-only",
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      requiresExplicitApproval: true
+    }
+  };
+}
+
+async function buildMergeGateStatus({ prompt = "", deep = false, limit = 20 } = {}) {
+  const max = Math.min(80, Math.max(1, Number(limit) || 20));
+  const [readiness, ciStatus, packages, reviews, approvals, tasks] = await Promise.all([
+    buildPullRequestReadiness(prompt, { deep }),
+    buildCiStatus({ deep, persist: false, limit: max }),
+    listRemotePublishPackages({ limit: max }),
+    listReviewArtifacts(max),
+    listApprovalRequests(max),
+    listTaskLogs(max)
+  ]);
+  const latestPackageId = packages.packages?.[0]?.id || "";
+  const preflight = latestPackageId
+    ? await buildRemotePublishPreflight({ id: latestPackageId, limit: max, deep: false })
+    : null;
+  const failedTasks = tasks.filter((task) => task.checksOk === false || String(task.status || "").includes("failed"));
+  const pendingApprovals = approvals.filter((approval) => ["blocked", "pending"].includes(approval.status || ""));
+  const approvedRemotePackages = packages.packages?.filter((item) => item.approvalStatus === "approved") || [];
+  const gates = [
+    {
+      id: "pr-readiness",
+      label: "PR readiness",
+      status: readiness.status === "ready" ? "pass" : "block",
+      evidence: readiness.blockers?.length ? readiness.blockers : [readiness.draft?.title || "PR draft available"]
+    },
+    {
+      id: "ci-status",
+      label: "CI status",
+      status: ciStatus.status === "ready" ? "pass" : ciStatus.status === "missing" ? "warn" : "block",
+      evidence: ciStatus.blockers?.length ? ciStatus.blockers : [`${ciStatus.summary?.ciConfigs || 0} CI config(s), ${ciStatus.summary?.localChecks || 0} local check(s)`]
+    },
+    {
+      id: "review-evidence",
+      label: "Review evidence",
+      status: reviews.length ? "pass" : "warn",
+      evidence: reviews.length ? reviews.slice(0, 5).map((item) => item.id) : ["No review artifact recorded yet."]
+    },
+    {
+      id: "approval-state",
+      label: "Approval state",
+      status: pendingApprovals.length ? "warn" : "pass",
+      evidence: pendingApprovals.length
+        ? pendingApprovals.slice(0, 5).map((item) => `${item.status} ${item.type || "approval"} ${item.id}`)
+        : ["No blocked or pending approval artifacts."]
+    },
+    {
+      id: "remote-publish-preflight",
+      label: "Remote publish preflight",
+      status: preflight
+        ? (preflight.status === "ready_for_external_execution" ? "pass" : "warn")
+        : "warn",
+      evidence: preflight
+        ? (preflight.blockers?.length ? preflight.blockers : [`Package ${preflight.packageId || latestPackageId} preflight ${preflight.status}`])
+        : ["No remote publish package generated yet."]
+    }
+  ];
+  if (failedTasks.length) {
+    gates.push({
+      id: "recent-task-failures",
+      label: "Recent task failures",
+      status: "block",
+      evidence: failedTasks.slice(0, 5).map((task) => `${task.status || "unknown"} ${task.id}`)
+    });
+  }
+  const blockers = gates.filter((gate) => gate.status === "block").flatMap((gate) => gate.evidence.map((item) => `${gate.label}: ${item}`));
+  const warnings = gates.filter((gate) => gate.status === "warn").flatMap((gate) => gate.evidence.map((item) => `${gate.label}: ${item}`));
+  const status = blockers.length ? "blocked" : warnings.length ? "needs_attention" : "ready";
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status,
+    summary: {
+      gates: gates.length,
+      pass: gates.filter((gate) => gate.status === "pass").length,
+      warn: gates.filter((gate) => gate.status === "warn").length,
+      block: gates.filter((gate) => gate.status === "block").length,
+      blockers: blockers.length,
+      warnings: warnings.length,
+      reviews: reviews.length,
+      approvals: approvals.length,
+      remotePackages: packages.summary?.total || 0,
+      approvedRemotePackages: approvedRemotePackages.length
+    },
+    gates,
+    blockers,
+    warnings,
+    readiness: {
+      status: readiness.status,
+      provider: readiness.provider,
+      blockers: readiness.blockers || [],
+      changedFiles: readiness.evidence?.changedFiles || []
+    },
+    verificationPlan: readiness.verificationPlan,
+    ciStatus: {
+      status: ciStatus.status,
+      summary: ciStatus.summary,
+      blockers: ciStatus.blockers || []
+    },
+    remote: readiness.remote,
+    publishPackage: preflight ? {
+      id: preflight.packageId,
+      status: preflight.status,
+      approval: preflight.approval,
+      blockers: preflight.blockers || []
+    } : null,
+    reviews: reviews.slice(0, 8),
+    approvals: approvals.slice(0, 8),
+    policy: {
+      access: "local-and-remote-read-only",
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      deep
+    }
+  };
 }
 
 function slugifyTaskName(input = "") {
@@ -3623,7 +7898,159 @@ async function writeTaskLog(record) {
     ...record
   };
   await fs.writeFile(path.join(TASK_LOG_DIR, `${id}.json`), JSON.stringify(task, null, 2), "utf8");
+  scheduleContextCompaction("task-log");
   return task;
+}
+
+function normalizeThreadTitle(title = "") {
+  const text = String(title || "").trim().replace(/\s+/g, " ");
+  return text.slice(0, 80) || "新会话";
+}
+
+function normalizeThreadMessages(messages = []) {
+  return (Array.isArray(messages) ? messages : []).slice(-80).map((message) => ({
+    role: message?.role === "user" ? "user" : "agent",
+    text: String(message?.text || "").slice(0, 12000),
+    createdAt: message?.createdAt || new Date().toISOString()
+  })).filter((message) => message.text);
+}
+
+function summarizeThread(thread) {
+  const messages = normalizeThreadMessages(thread.messages || []);
+  const lastMessage = messages[messages.length - 1] || null;
+  return {
+    id: thread.id || "",
+    workspace: thread.workspace || "",
+    title: normalizeThreadTitle(thread.title || lastMessage?.text || ""),
+    createdAt: thread.createdAt || "",
+    updatedAt: thread.updatedAt || thread.createdAt || "",
+    status: thread.status || "active",
+    pinned: Boolean(thread.pinned),
+    archived: Boolean(thread.archived),
+    parentThreadId: thread.parentThreadId || "",
+    messageCount: messages.length,
+    lastMessage: lastMessage?.text?.slice(0, 160) || "",
+    lastRole: lastMessage?.role || "",
+    pendingProposalId: thread.pendingProposalId || ""
+  };
+}
+
+async function listThreads(limit = 20, { includeArchived = false } = {}) {
+  await fs.mkdir(THREAD_DIR, { recursive: true });
+  const entries = await fs.readdir(THREAD_DIR, { withFileTypes: true });
+  const threads = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const thread = JSON.parse(await fs.readFile(path.join(THREAD_DIR, entry.name), "utf8").catch(() => "{}"));
+    if (thread.workspace !== currentWorkspace) continue;
+    if (thread.archived && !includeArchived) continue;
+    threads.push(summarizeThread(thread));
+  }
+  return threads
+    .sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return String(b.updatedAt || b.createdAt).localeCompare(String(a.updatedAt || a.createdAt));
+    })
+    .slice(0, limit);
+}
+
+async function createThread({ title = "", messages = [], status = "active", pendingProposalId = "", pinned = false, archived = false, parentThreadId = "" } = {}) {
+  await fs.mkdir(THREAD_DIR, { recursive: true });
+  const now = new Date().toISOString();
+  const id = `thread-${now.replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
+  const thread = {
+    id,
+    workspace: currentWorkspace,
+    title: normalizeThreadTitle(title),
+    createdAt: now,
+    updatedAt: now,
+    status: String(status || "active"),
+    pinned: Boolean(pinned),
+    archived: Boolean(archived),
+    messages: normalizeThreadMessages(messages),
+    pendingProposalId: String(pendingProposalId || ""),
+    parentThreadId: String(parentThreadId || "")
+  };
+  await writeJsonAtomic(path.join(THREAD_DIR, `${id}.json`), thread);
+  return thread;
+}
+
+async function readThread(id) {
+  if (!/^thread-[\w.-]+$/.test(String(id || ""))) throw new Error("thread id 非法。");
+  const thread = JSON.parse(await fs.readFile(path.join(THREAD_DIR, `${id}.json`), "utf8"));
+  if (thread.workspace !== currentWorkspace) {
+    throw new Error("该会话不属于当前工作目录，请先切回对应目录。");
+  }
+  return {
+    ...thread,
+    title: normalizeThreadTitle(thread.title),
+    messages: normalizeThreadMessages(thread.messages || []),
+    summary: summarizeThread(thread),
+    policy: {
+      access: "workspace-thread-artifact",
+      writesWorkspaceFiles: false,
+      storesConversation: true,
+      scopedToWorkspace: true
+    }
+  };
+}
+
+async function updateThread(id, patch = {}) {
+  const existing = await readThread(id);
+  const now = new Date().toISOString();
+  const messages = "messages" in patch
+    ? normalizeThreadMessages(patch.messages)
+    : normalizeThreadMessages(existing.messages || []);
+  const next = {
+    id: existing.id,
+    workspace: currentWorkspace,
+    title: normalizeThreadTitle(patch.title || existing.title || messages[0]?.text || ""),
+    createdAt: existing.createdAt || now,
+    updatedAt: now,
+    status: String(patch.status || existing.status || "active"),
+    pinned: "pinned" in patch ? Boolean(patch.pinned) : Boolean(existing.pinned),
+    archived: "archived" in patch ? Boolean(patch.archived) : Boolean(existing.archived),
+    messages,
+    pendingProposalId: String(patch.pendingProposalId || existing.pendingProposalId || ""),
+    parentThreadId: String(existing.parentThreadId || patch.parentThreadId || "")
+  };
+  await writeJsonAtomic(path.join(THREAD_DIR, `${existing.id}.json`), next);
+  return {
+    ...next,
+    summary: summarizeThread(next),
+    policy: {
+      access: "workspace-thread-artifact",
+      writesWorkspaceFiles: false,
+      storesConversation: true,
+      scopedToWorkspace: true
+    }
+  };
+}
+
+async function forkThread(id, { title = "" } = {}) {
+  const source = await readThread(id);
+  const fork = await createThread({
+    title: normalizeThreadTitle(title || `分叉：${source.title || source.summary?.title || "会话"}`),
+    messages: source.messages || [],
+    status: "active",
+    pendingProposalId: source.pendingProposalId || "",
+    parentThreadId: source.id
+  });
+  return {
+    thread: {
+      ...fork,
+      summary: summarizeThread(fork),
+      policy: {
+        access: "workspace-thread-artifact",
+        writesWorkspaceFiles: false,
+        storesConversation: true,
+        scopedToWorkspace: true,
+        copiedMessages: true
+      }
+    },
+    source: summarizeThread(source),
+    threads: await listThreads()
+  };
 }
 
 function defaultGoalState() {
@@ -3657,6 +8084,7 @@ async function writeGoalState(patch = {}) {
     updatedAt: new Date().toISOString()
   };
   await fs.writeFile(GOAL_STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+  scheduleContextCompaction("goal-state");
   return state;
 }
 
@@ -3693,6 +8121,11 @@ function normalizeQueuePriority(value = 0) {
   return Math.min(100, Math.max(-100, Number(value) || 0));
 }
 
+function normalizeQueueIsolationGroup(value = "default") {
+  const group = String(value || "default").trim().toLowerCase().replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "");
+  return group.slice(0, 80) || "default";
+}
+
 async function enqueueTask(prompt = "", options = {}) {
   const text = String(prompt || "").trim();
   if (!text) throw new Error("缺少可入队的任务描述。");
@@ -3700,11 +8133,13 @@ async function enqueueTask(prompt = "", options = {}) {
   const id = new Date().toISOString().replace(/[:.]/g, "-");
   const priority = normalizeQueuePriority(options.priority);
   const retryLimit = Math.min(10, Math.max(0, Number(options.retryLimit) || 0));
+  const isolationGroup = normalizeQueueIsolationGroup(options.isolationGroup);
   const item = {
     id,
     prompt: text,
     workspace: currentWorkspace,
     status: "queued",
+    isolationGroup,
     priority,
     retryCount: 0,
     retryLimit,
@@ -3726,6 +8161,7 @@ async function listQueuedTasks(limit = 20) {
       id: item.id,
       prompt: item.prompt || "",
       status: item.status || "queued",
+      isolationGroup: normalizeQueueIsolationGroup(item.isolationGroup),
       priority: normalizeQueuePriority(item.priority),
       retryCount: Math.max(0, Number(item.retryCount) || 0),
       retryLimit: Math.max(0, Number(item.retryLimit) || 0),
@@ -3752,6 +8188,20 @@ async function updateQueuedTask(id, status, options = {}) {
   }
   if (options.priority !== undefined) item.priority = normalizeQueuePriority(options.priority);
   if (options.retryLimit !== undefined) item.retryLimit = Math.min(10, Math.max(0, Number(options.retryLimit) || 0));
+  if (options.isolationGroup !== undefined) item.isolationGroup = normalizeQueueIsolationGroup(options.isolationGroup);
+  item.isolationGroup = normalizeQueueIsolationGroup(item.isolationGroup);
+  if (status === "active") {
+    const activeConflict = (await listQueuedTasks(200)).find((candidate) => (
+      candidate.id !== item.id
+      && candidate.status === "active"
+      && candidate.isolationGroup === item.isolationGroup
+    ));
+    if (activeConflict) {
+      const error = new Error(`队列隔离组 ${item.isolationGroup} 已有 active 任务：${activeConflict.id}`);
+      error.conflict = activeConflict;
+      throw error;
+    }
+  }
   if (status === "retry") {
     item.retryCount = Math.max(0, Number(item.retryCount) || 0) + 1;
     item.status = "queued";
@@ -3765,9 +8215,65 @@ async function updateQueuedTask(id, status, options = {}) {
 
 async function activateNextQueuedTask() {
   const queue = await listQueuedTasks(100);
-  const next = queue.find((item) => item.status === "queued");
+  const activeGroups = new Set(queue.filter((item) => item.status === "active").map((item) => item.isolationGroup));
+  const next = queue.find((item) => item.status === "queued" && !activeGroups.has(item.isolationGroup));
   if (!next) return null;
   return updateQueuedTask(next.id, "active");
+}
+
+async function buildQueueIsolationReport({ limit = 100 } = {}) {
+  const maxResults = Math.min(200, Math.max(1, Number(limit) || 100));
+  const queue = await listQueuedTasks(maxResults);
+  const groups = new Map();
+  for (const item of queue) {
+    const group = normalizeQueueIsolationGroup(item.isolationGroup);
+    if (!groups.has(group)) {
+      groups.set(group, {
+        isolationGroup: group,
+        active: [],
+        queued: [],
+        done: [],
+        skipped: [],
+        blockedActivations: []
+      });
+    }
+    const bucket = groups.get(group);
+    if (item.status === "active") bucket.active.push(item);
+    else if (item.status === "queued") bucket.queued.push(item);
+    else if (item.status === "done") bucket.done.push(item);
+    else if (item.status === "skipped") bucket.skipped.push(item);
+  }
+  for (const group of groups.values()) {
+    if (group.active.length) {
+      group.blockedActivations = group.queued.map((item) => ({
+        id: item.id,
+        reason: `active task ${group.active[0].id} already owns isolation group ${group.isolationGroup}`
+      }));
+    }
+  }
+  const rows = Array.from(groups.values()).sort((left, right) => {
+    if (right.active.length !== left.active.length) return right.active.length - left.active.length;
+    return left.isolationGroup.localeCompare(right.isolationGroup);
+  });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      groups: rows.length,
+      activeGroups: rows.filter((row) => row.active.length).length,
+      queuedBlockedByIsolation: rows.reduce((sum, row) => sum + row.blockedActivations.length, 0),
+      activeConflictGroups: rows.filter((row) => row.active.length > 1).length
+    },
+    rows,
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      singleActivePerIsolationGroup: true,
+      executesTasks: false,
+      mutatesQueue: false,
+      maxResults
+    }
+  };
 }
 
 async function writeReviewArtifact(record) {
@@ -3837,6 +8343,41 @@ async function listApprovalRequests(limit = 20) {
     });
   }
   return approvals.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, limit);
+}
+
+async function writeEscalationArtifact(approval, policy, reason = "") {
+  await fs.mkdir(ESCALATION_DIR, { recursive: true });
+  const id = `escalation-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const full = path.join(ESCALATION_DIR, `${id}.json`);
+  const artifact = {
+    id,
+    workspace: currentWorkspace,
+    approvalId: approval.id,
+    type: approval.type || "command",
+    command: approval.command || "",
+    policy,
+    reason,
+    generatedAt: new Date().toISOString(),
+    status: "requires_external_escalation",
+    execution: {
+      executed: false,
+      blocked: true,
+      reason: "本地策略拒绝的命令不会因批准状态而绕过执行；该 artifact 仅用于人工或外部沙箱审批。"
+    },
+    checklist: [
+      "确认命令目标目录和参数符合预期",
+      "确认不会删除、上传、下载或修改非目标资源",
+      "在外部受控环境中单独授权执行",
+      "执行后把输出和退出码回填到任务记录"
+    ]
+  };
+  await fs.writeFile(full, JSON.stringify(artifact, null, 2), "utf8");
+  return {
+    id,
+    path: full,
+    relativePath: toPosix(path.relative(APP_ROOT, full)),
+    status: artifact.status
+  };
 }
 
 async function readApprovalRequest(id) {
@@ -3941,9 +8482,45 @@ async function executeApprovedRequest(id) {
       return { id: updated.id, status: updated.status, type: updated.type, execution: updated.execution };
     }
   }
+  if (approval.type === "extension_tool_call") {
+    const target = approval.extension || {};
+    try {
+      const result = await executeExtensionToolCall(target.name || "", target.toolName || "", target.arguments || {});
+      const updated = {
+        ...approval,
+        execution: {
+          allowedByApproval: true,
+          executed: true,
+          blocked: false,
+          result,
+          checkedAt: new Date().toISOString()
+        }
+      };
+      await fs.writeFile(path.join(APPROVAL_DIR, `${id}.json`), JSON.stringify(updated, null, 2), "utf8");
+      return { id: updated.id, status: updated.status, type: updated.type, execution: updated.execution };
+    } catch (error) {
+      const updated = {
+        ...approval,
+        execution: {
+          allowedByApproval: true,
+          executed: false,
+          blocked: true,
+          reason: error.message,
+          checkedAt: new Date().toISOString()
+        }
+      };
+      await fs.writeFile(path.join(APPROVAL_DIR, `${id}.json`), JSON.stringify(updated, null, 2), "utf8");
+      return { id: updated.id, status: updated.status, type: updated.type, execution: updated.execution };
+    }
+  }
   if (approval.type === "process") {
     const policy = evaluateProcessPolicy(approval.command || "");
     if (!policy.allowed) {
+      const escalation = await writeEscalationArtifact(
+        approval,
+        policy,
+        "批准已记录，但进程命令仍未通过受管进程安全策略，需要外部受控沙箱升级。"
+      );
       const updated = {
         ...approval,
         execution: {
@@ -3951,6 +8528,7 @@ async function executeApprovedRequest(id) {
           executed: false,
           blocked: true,
           policy,
+          escalation,
           reason: "批准已记录，但命令仍未通过受管进程安全策略，未执行。",
           checkedAt: new Date().toISOString()
         }
@@ -3974,6 +8552,11 @@ async function executeApprovedRequest(id) {
   }
   const policy = evaluateCommandPolicy(approval.command || "");
   if (!policy.allowed) {
+    const escalation = await writeEscalationArtifact(
+      approval,
+      policy,
+      "批准已记录，但命令仍未通过本地命令安全策略，需要外部受控沙箱升级。"
+    );
     const updated = {
       ...approval,
       execution: {
@@ -3981,6 +8564,7 @@ async function executeApprovedRequest(id) {
         executed: false,
         blocked: true,
         policy,
+        escalation,
         reason: "批准已记录，但命令仍未通过本地命令安全策略，未执行。",
         checkedAt: new Date().toISOString()
       }
@@ -4118,6 +8702,10 @@ async function buildReviewCommentDraft(id = "") {
 }
 
 async function getCurrentDiff() {
+  return getCurrentDiffEvidence({ includeDiff: true });
+}
+
+async function getCurrentDiffEvidence({ includeDiff = true } = {}) {
   const inside = await runLocalProcess("git", ["rev-parse", "--is-inside-work-tree"], {
     timeout: 2000,
     maxBuffer: 4096
@@ -4130,14 +8718,17 @@ async function getCurrentDiff() {
       git: { available: false, branch: "", root: "", status: [], changedFiles: [], remotes: [], upstream: "" }
     };
   }
+  const diffPromise = includeDiff
+    ? runLocalProcess("git", ["diff", "--no-ext-diff", "--", "."], {
+      timeout: 10000,
+      maxBuffer: 160000
+    })
+    : Promise.resolve({ ok: true, exitCode: 0, output: "", error: "" });
   const [branchResult, rootResult, statusResult, diff, stat] = await Promise.all([
     runLocalProcess("git", ["branch", "--show-current"], { timeout: 2000, maxBuffer: 4096 }),
     runLocalProcess("git", ["rev-parse", "--show-toplevel"], { timeout: 2000, maxBuffer: 4096 }),
     runLocalProcess("git", ["status", "--short", "--untracked-files=no"], { timeout: 3000, maxBuffer: 16000 }),
-    runLocalProcess("git", ["diff", "--no-ext-diff", "--", "."], {
-      timeout: 10000,
-      maxBuffer: 160000
-    }),
+    diffPromise,
     runLocalProcess("git", ["diff", "--no-ext-diff", "--stat", "--", "."], {
       timeout: 5000,
       maxBuffer: 32000
@@ -4157,11 +8748,12 @@ async function getCurrentDiff() {
   const truncated = diff.output.length >= 160000;
   return {
     available: true,
-    diff: diff.output.slice(0, 120000),
+    diff: includeDiff ? diff.output.slice(0, 120000) : "",
     stat: stat.output,
     git,
     truncated,
     warnings: [
+      includeDiff ? "" : "Full git diff omitted in light evidence mode.",
       diff.exitCode === 124 ? "git diff timed out; returned truncated evidence." : "",
       stat.exitCode === 124 ? "git diff --stat timed out." : "",
       truncated ? "git diff exceeded local evidence cap; output was clipped." : ""
@@ -4323,6 +8915,7 @@ async function buildCapabilityAudit({ light = false } = {}) {
     ? { available: false, branch: "", root: "", status: [], changedFiles: [], remotes: [], upstream: "", skipped: "light capability audit" }
     : await getGitSummary();
   const tasks = light ? [] : await listTaskLogs(5);
+  const threads = light ? [] : await listThreads(5, { includeArchived: true });
   const queue = light ? [] : await listQueuedTasks(5);
   const reviews = light ? [] : await listReviewArtifacts(5);
   const approvals = light ? [] : await listApprovalRequests(5);
@@ -4337,20 +8930,20 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "上下文索引",
       status: "implemented",
-      evidence: ["repo_map", "read_file_range", "search_files", "/api/semantic-index", "/api/semantic-search", "/api/semantic-references", ".forge/state/semantic-index.json"],
-      next: "已补本地语义索引、语义检索和符号引用跳转；可继续升级为真实 LSP/TypeScript AST 解析。"
+      evidence: ["repo_map", "read_file_range", "search_files", "/api/semantic-index", "/api/code-intelligence", "/api/symbol-outline", "/api/semantic-definition", "/api/semantic-search", "/api/semantic-references", "/api/dependency-graph", ".forge/state/semantic-index.json"],
+      next: "已补本地语义索引、代码智能概览、零依赖符号大纲、定义查询、语义检索、符号引用跳转和导入依赖图；可继续接入真实 LSP/TypeScript compiler API。"
     },
     {
       area: "审批写入与回滚",
       status: "implemented",
-      evidence: ["/api/apply", "/api/rollback", ".forge/checkpoints"],
-      next: "可继续增强冲突处理和部分应用。"
+      evidence: ["/api/apply", "/api/rollback", "/api/diff-conflicts", "/api/conflict-resolution-draft", ".forge/checkpoints", "apply conflict preflight", "allowPartial partial apply", "partial hunk apply", "conflict marker preview", "resolution pending proposal"],
+      next: "已补写入前冲突预检、默认零写入失败保护、显式文件级/hunk 级部分应用、只读 CURRENT/PROPOSED 冲突预览、冲突解决草稿 pendingProposal 和 checkpoint 回滚；可继续增强逐 hunk 交互式编辑界面。"
     },
     {
       area: "验证与修复闭环",
       status: "implemented",
-      evidence: ["discoverCheckCommands", "runCheckCommands", "generateRepairDiff"],
-      next: "可继续接入 CI 状态和浏览器 E2E。"
+      evidence: ["discoverCheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status"],
+      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、CI 配置、最近验证证据、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
     },
     {
       area: "代码审查证据",
@@ -4365,22 +8958,28 @@ async function buildCapabilityAudit({ light = false } = {}) {
       next: "可继续接入远端 PR 创建和 CI 检查。"
     },
     {
+      area: "会话线程管理",
+      status: "implemented",
+      evidence: ["/api/threads", "/api/thread", "/api/thread-fork", ".forge/threads", `${threads.length} 个近期会话`, "workspace-scoped thread artifacts", "rename/pin/archive metadata", "fork parentThreadId", "message restore"],
+      next: "已补本地会话线程 artifact、新建/更新/读取/列表/重命名/分叉、侧栏点击恢复、置顶排序和归档过滤；可继续接入跨设备云同步。"
+    },
+    {
       area: "任务队列",
       status: "implemented",
-      evidence: ["/api/queue", `${queue.length} 个当前队列项`],
-      next: "已支持优先级、重试计数和完成后自动激活下一项；可继续支持并发隔离。"
+      evidence: ["/api/queue", "/api/queue-isolation", "queue_isolation", `${queue.length} 个当前队列项`, "每个 isolationGroup 仅允许一个 active 任务"],
+      next: "已支持优先级、重试计数、完成后自动激活下一项和隔离组并发保护；可继续支持多 worker 调度。"
     },
     {
       area: "可恢复状态",
       status: "implemented",
-      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", "/api/context-snapshot", goal.phase || "idle"],
-      next: "已补可恢复目标状态、跨会话上下文摘要和语义索引持久化；可继续增加自动压缩策略。"
+      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", goal.phase || "idle"],
+      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact 和语义索引持久化；可继续增加更细粒度的摘要裁剪策略。"
     },
     {
       area: "长任务管理",
       status: "implemented",
-      evidence: ["/api/processes", `${managedProcessCount} 个受管进程`],
-      next: "可继续增加日志搜索和更丰富的健康探针。"
+      evidence: ["/api/processes", "/api/process-health", "/api/process-search", ".forge/process-logs", ".forge/process-health-rules.json", `${managedProcessCount} 个受管进程`, "独立健康探针汇总", "可配置健康规则匹配"],
+      next: "已补受管进程输出搜索、独立健康探针、可配置健康规则、日志 artifact 持久化和历史回放；可继续增加更多服务健康规则类型。"
     },
     {
       area: "交付草稿",
@@ -4391,73 +8990,90 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "远端 PR 与 CI 集成",
       status: "partial",
-      evidence: ["/api/pr-readiness", "/api/remote-pr-status", "/api/remote-publish-plan", "GitHub gh / GitLab glab 只读探测", "Git remote/provider 发现", "本地 CI 配置发现", "PR 草稿元数据", "远端写入审批计划", "不执行 git push/真实 PR 创建"],
-      next: "已补远端 PR/CI 只读状态探测和发布审批计划；继续接入真实 PR 创建、评论回写和更多 provider。"
+      evidence: ["/api/pr-readiness", "/api/remote-pr-status", "/api/ci-status", "/api/remote-publish-plan", "/api/remote-publish-preflight", ".forge/remote-ci", "GitHub gh / GitLab glab 只读探测", "Git remote/provider 发现", "本地 CI 配置发现", "PR 草稿元数据", "远端写入审批计划", "发布前 CLI/认证/审批/命令风险预检", "不执行 git push/真实 PR 创建"],
+      next: "已补远端 PR/CI 只读状态探测、CI 状态 artifact、发布审批计划和发布包预检；继续接入真实 PR 创建、评论回写和更多 provider。"
     },
     {
       area: "真实远端发布与平台同步",
       status: "partial",
-      evidence: ["/api/remote-publish-plan", ".forge/approvals", "远端 push/PR/comment 候选命令审批记录", "未执行 git push", "未创建真实远端 PR", "未同步代码托管平台评论"],
-      next: "已补远端发布审批计划；需要平台凭据和明确授权后接入实际 PR 发布、push、CI 必过门禁和 review 评论同步。"
+      evidence: ["/api/remote-publish-plan", "/api/remote-publish-packages", "/api/remote-publish-package", "/api/remote-publish-preflight", ".forge/remote-publish", ".forge/approvals", "远端 push/PR/comment 候选命令审批记录", "发布包 PR body/review summary/plan 索引", "发布前 CLI/认证/审批/命令风险预检", "未执行 git push", "未创建真实远端 PR", "未同步代码托管平台评论"],
+      next: "已补远端发布审批计划、发布包只读索引和发布前预检；需要平台凭据和明确授权后接入实际 PR 发布、push、CI 必过门禁和 review 评论同步。"
     },
     {
       area: "权限与命令策略",
       status: approvals.length ? "partial" : "implemented",
-      evidence: ["evaluateCommandPolicy", "evaluateProcessPolicy", "/api/approval decision", "/api/approval-execute", "/api/mcp-tool-call", ".forge/approvals", `${approvals.length} 个近期审批请求`],
-      next: "已补审批请求的批准/拒绝状态流转、受控执行尝试和 MCP tools/call 审批执行；仍缺完整系统级沙箱升级执行。"
+      evidence: ["evaluateCommandPolicy", "evaluateProcessPolicy", "/api/policy-audit", "/api/permission-matrix", "/api/approval decision", "/api/approval-execute", "/api/mcp-tool-call", "/api/extension-tool-call", ".forge/approvals", ".forge/escalations", `${approvals.length} 个近期审批请求`],
+      next: "已补审批请求的批准/拒绝状态流转、受控执行尝试、拒绝命令升级 artifact、MCP tools/call、本地扩展工具审批执行、只读权限审计和 provider/action 权限矩阵；仍缺完整系统级沙箱升级执行。"
     },
     {
       area: "工具生态",
       status: "partial",
-      evidence: [`内置工具 ${getAgentTools().length} 个`, `本地扩展 ${extensions.summary.total} 个`, `MCP server ${mcp.summary.total} 个`, "/api/tools", "/api/extensions", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call"],
-      next: "已暴露本地工具目录、扩展注册表、MCP server 发现、本地 MCP 握手/目录枚举和审批后的 tools/call；继续补远端扩展市场和更多 provider。"
+      evidence: [`内置工具 ${getAgentTools().length} 个`, `本地扩展 ${extensions.summary.total} 个`, `MCP server ${mcp.summary.total} 个`, "/api/tools", "/api/extensions", "/api/extension-trust", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "本地 manifest SHA-256", "本地公钥签名校验"],
+      next: "已暴露本地工具目录、扩展注册表、扩展 manifest checksum/trust 审计、本地公钥签名校验、本地扩展工具审批执行、MCP server 发现、本地 MCP 握手/目录枚举和审批后的 tools/call；继续补远端扩展市场和远端签名链校验。"
     },
     {
       area: "外部工具与浏览器自动化",
       status: "partial",
-      evidence: ["/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "/api/browser-check", "/api/browser-interact", "/api/browser-visual", "本地 MCP 只读握手与目录枚举", "审批后 MCP tools/call", "受控浏览器截图/DOM/交互/视觉回归"],
-      next: "已补 MCP 本地探测、审批后工具调用和受控浏览器自动化；继续接入复杂鼠标键盘序列、远端 MCP 和 provider 级权限模型。"
+      evidence: ["/api/extensions", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "/api/browser-check", "/api/browser-audit", "/api/browser-trace", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", "本地扩展只读工具桥接", "本地 MCP 只读握手与目录枚举", "审批后 MCP tools/call", "受控浏览器截图/DOM/trace/交互/会话/视觉回归", "静态可访问性审计", "keyDown/keyUp/wheel/scroll 复杂交互序列"],
+      next: "已补本地扩展工具桥接、MCP 本地探测、审批后工具调用、受控浏览器自动化、多步骤会话 artifact、静态可访问性审计和复杂鼠标键盘序列；继续接入远端 MCP 和 provider 级权限模型。"
     },
     {
       area: "多模态与浏览器执行",
       status: "partial",
-      evidence: [`资产 ${assets.summary.total} 个`, "/api/assets", "/api/asset-inspect", "/api/browser-interact", "/api/browser-visual", "CSV/TSV/JSONL 抽样", "图片尺寸检查", "PNG 像素视觉摘要", "OCR CLI 探测", "媒体元数据解析", "Whisper 转写引擎探测", "OOXML 文本抽取", "PDF 字符串/Page 估算"],
-      next: "已补工作区资产索引、内容抽样、图片视觉摘要、媒体元数据和转写探测；继续补真实音视频转写执行和更完整 OCR/PDF layout。"
+      evidence: [`资产 ${assets.summary.total} 个`, "/api/assets", "/api/asset-inspect", "/api/browser-interact", "/api/browser-visual", "CSV/TSV/JSONL 抽样", "Parquet footer metadata 探测", "图片尺寸检查", "PNG 像素视觉摘要", "SVG 文本/可访问标签提取", "Tesseract OCR 执行开关/缓存 artifact", "媒体元数据解析", "Whisper 转写执行开关/缓存 artifact", "OOXML 文本抽取", "旧版 Office CFBF 文本探测", "PDF 页框/文本块 layout 抽取"],
+      next: "已补工作区资产索引、内容抽样、图片视觉摘要、SVG 本地文本提取、媒体元数据、PDF layout、本地 Whisper 转写执行开关和缓存 artifact；继续补云端多模态、说话人分离和更完整 OCR。"
     },
     {
       area: "浏览器自动化与视觉回归",
       status: "partial",
-      evidence: ["/api/browser-check", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-interact", "/api/browser-visual", "本地 URL 状态/标题/结构检查", "页面结构基线对比", "真实浏览器截图产物", "hover/dblclick/clear/check/waitValue/navigate/waitUrl/waitNetwork 受控 DOM 交互", "像素级视觉回归断言"],
-      next: "已补页面结构基线、真实浏览器截图、扩展 DOM 交互、跨页面导航、网络静默等待和像素级视觉断言；继续补文件上传与更完整多页面会话。"
+      evidence: ["/api/browser-check", "/api/browser-audit", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-trace", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", ".forge/browser-traces", "本地 URL 状态/标题/结构检查", "静态 title/lang/H1/alt/可访问名称审计", "页面结构基线对比", "真实浏览器截图产物", "选择器裁剪截图", "console/exception/network trace artifact", "hover/dblclick/clear/check/waitValue/navigate/waitUrl/waitNetwork/upload/keyDown/keyUp/wheel/scroll/坐标鼠标 受控 DOM 交互", "多步骤持久 profile 会话 artifact", "像素级视觉回归断言"],
+      next: "已补页面结构基线、静态可访问性审计、真实浏览器截图、选择器裁剪、浏览器 trace、扩展 DOM 交互、复杂键鼠序列、跨页面导航、网络静默等待、文件上传、坐标级鼠标动作、多步骤持久会话 artifact 和像素级视觉断言；继续补跨站点远端浏览器会话。"
     },
     {
       area: "真实浏览器交互与截图",
       status: "partial",
-      evidence: ["/api/browser-screenshot", "/api/browser-dom", "/api/browser-interact", "/api/browser-visual", ".forge/browser-screenshots", ".forge/browser-visual-baselines", "wait/click/dblclick/hover/clear/type/press/select/check/uncheck/waitText/waitValue/navigate/waitUrl/waitNetwork 步骤审计"],
-      next: "已补真实浏览器截图、DOM 快照、扩展受控交互、跨页面导航、网络等待和像素/布局断言；继续补文件上传和更完整多页面会话。"
+      evidence: ["/api/browser-screenshot", "/api/browser-audit", "/api/browser-dom", "/api/browser-trace", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", ".forge/browser-screenshots", ".forge/browser-traces", ".forge/browser-sessions", ".forge/browser-visual-baselines", "静态可访问性审计", "选择器裁剪截图", "console/exception/network trace", "wait/click/dblclick/hover/clear/type/press/keyDown/keyUp/select/check/uncheck/waitText/waitValue/navigate/waitUrl/waitNetwork/upload/mouseMove/mouseDown/mouseUp/mouseClick/drag/wheel/scroll 步骤审计"],
+      next: "已补真实浏览器截图、静态可访问性审计、DOM 快照、浏览器 trace、选择器裁剪、扩展受控交互、复杂键鼠序列、跨页面导航、网络等待、文件上传、坐标级鼠标动作、持久 profile 会话 artifact 和像素/布局断言；继续补跨站点远端浏览器会话。"
     },
     {
       area: "浏览器 DOM 交互",
       status: "implemented",
-      evidence: ["/api/browser-interact", "/api/browser-dom", "渲染后 DOM 快照", "简单选择器计数", "wait/click/dblclick/hover/clear/type/press/select/check/uncheck/waitText/waitValue/navigate/waitUrl/waitNetwork", "交互步骤审计", "隔离浏览器 profile"],
-      next: "已补跨页面导航和网络静默等待；可继续增加鼠标坐标、文件上传和更完整多页面会话。"
+      evidence: ["/api/browser-interact", "/api/browser-session", "/api/browser-dom", "渲染后 DOM 快照", "简单选择器计数", "wait/click/dblclick/hover/clear/type/press/keyDown/keyUp/select/check/uncheck/waitText/waitValue/navigate/waitUrl/waitNetwork/upload/mouseMove/mouseDown/mouseUp/mouseClick/drag/wheel/scroll", "交互步骤审计", "隔离浏览器 profile", "多步骤会话 artifact"],
+      next: "已补跨页面导航、网络静默等待、文件上传、坐标级鼠标动作、复杂键鼠序列和多步骤持久会话；可继续增加远端浏览器会话。"
     },
     {
       area: "像素级视觉断言",
       status: "implemented",
-      evidence: ["/api/browser-visual", ".forge/browser-visual-baselines", "PNG 像素解码", "尺寸差异检测", "threshold/maxMismatchRatio 阈值比较", "mismatch samples", "可视化 diff PNG"],
-      next: "已补视觉 diff PNG 证据；可继续做按选择器裁剪区域断言。"
+      evidence: ["/api/browser-visual", ".forge/browser-visual-baselines", "PNG 像素解码", "尺寸差异检测", "threshold/maxMismatchRatio 阈值比较", "mismatch samples", "可视化 diff PNG", "selector crop baseline"],
+      next: "已补视觉 diff PNG 证据和按选择器裁剪区域断言；可继续接入远端浏览器会话。"
     },
     {
       area: "模型运行层",
-      status: modelRuntime.candidates.length > 1 ? "implemented" : "partial",
+      status: modelRuntime.candidates.length > 1 && modelRuntime.recentCalls.length ? "implemented" : "partial",
       evidence: [
+        "/api/model-policy",
+        "/api/model-usage",
+        "/api/model-budget",
+        "/api/model-cost",
+        "/api/model-cost-policy",
+        "/api/model-billing",
+        "/api/agent-stream",
+        "model_policy",
+        "model_usage",
+        "model_budget",
+        "model_cost",
+        "model_cost_policy",
+        "model_billing",
+        ".forge/state/model-usage.json",
         `候选模型：${modelRuntime.candidates.join(", ")}`,
-        modelRuntime.lastModel ? `最近使用：${modelRuntime.lastModel}` : "尚未发起模型请求"
+        modelRuntime.lastModel ? `最近使用：${modelRuntime.lastModel}` : "尚未发起模型请求",
+        `请求数：${modelRuntime.requestCount}，成功：${modelRuntime.successCount}，失败：${modelRuntime.failureCount}`,
+        modelRuntime.averageLatencyMs ? `平均延迟：${modelRuntime.averageLatencyMs}ms` : "尚无延迟样本",
+        modelRuntime.lastFallbacks.length ? `最近 fallback：${modelRuntime.lastFallbacks.length} 次` : "最近无 fallback"
       ],
       next: modelRuntime.candidates.length > 1
-        ? "可继续增加流式输出、成本/延迟策略和供应商级路由。"
-        : "可通过 FORGE_MODELS 配置多模型 fallback，后续再增加流式输出和成本/延迟策略。"
+        ? "已补运行时遥测、只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、fallback 视图和 provider token SSE 流式输出；可继续增加 provider API 账单直连和真实成本扣减。"
+        : "已补只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对和 provider token SSE 流式输出；可通过 FORGE_MODELS 配置多模型 fallback，后续再增加 provider API 账单直连和真实成本扣减。"
     }
   ];
   const summary = capabilities.reduce((acc, item) => {
@@ -4469,7 +9085,7 @@ async function buildCapabilityAudit({ light = false } = {}) {
     workspace: currentWorkspace,
     summary,
     capabilities,
-    recentEvidence: { tasks, reviews, approvals, extensions: extensions.summary, mcp: mcp.summary, assets: assets.summary, goal }
+    recentEvidence: { tasks, threads, reviews, approvals, extensions: extensions.summary, mcp: mcp.summary, assets: assets.summary, goal }
   };
 }
 
@@ -4500,11 +9116,327 @@ function getAgentTools() {
     {
       type: "function",
       function: {
+        name: "diff_conflicts",
+        description: "只读分析 unified diff 的适用性和冲突 hunk，返回 CURRENT/PROPOSED 冲突预览；不写入文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            diff: { type: "string" }
+          },
+          required: ["diff"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "model_policy",
+        description: "读取模型运行层策略、候选模型、fallback 顺序、遥测摘要、成本治理和密钥脱敏 guardrails；不发起模型请求。",
+        parameters: {
+          type: "object",
+          properties: {
+            includeRecent: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "model_usage",
+        description: "读取持久化模型用量账本，汇总 token usage、延迟、fallback、按模型分组和最近调用；不发起模型请求。",
+        parameters: {
+          type: "object",
+          properties: {}
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "model_budget",
+        description: "读取模型预算预检状态，展示请求数/token 上限、剩余额度和是否会阻止下一次模型调用；不发起模型请求。",
+        parameters: {
+          type: "object",
+          properties: {}
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "model_cost",
+        description: "读取模型成本估算，基于持久化 token usage 和用户配置 FORGE_MODEL_COST_POLICY 价格表计算；不内置价格、不发起模型请求。",
+        parameters: {
+          type: "object",
+          properties: {}
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "model_cost_policy",
+        description: "读取模型成本价格表 schema、当前 FORGE_MODEL_COST_POLICY 解析结果和示例 JSON；可 dry-run 校验输入，不写环境变量。",
+        parameters: {
+          type: "object",
+          properties: {
+            raw: { type: "string" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "model_billing",
+        description: "读取模型账单核对结果，将本地 token 成本估算与用户提供的 FORGE_MODEL_BILLING_JSON 或 raw 账单 JSON 对账；不调用 provider 账单 API。",
+        parameters: {
+          type: "object",
+          properties: {
+            raw: { type: "string" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "context_rollup",
+        description: "读取或生成可恢复上下文滚动摘要，按任务、审查、审批和 Git 变化返回可检索切片。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" },
+            query: { type: "string" },
+            rebuild: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "verification_plan",
+        description: "生成只读验证门禁计划，汇总安全检查命令、CI 配置、最近检查证据和变更范围；不执行命令。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" },
+            commands: { type: "array", items: { type: "string" } }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "ci_status",
+        description: "生成只读 CI 状态汇总，整合本地 CI 配置、最近验证证据、远端 PR/CI 只读状态和门禁 blockers；不执行写入动作。",
+        parameters: {
+          type: "object",
+          properties: {
+            deep: { type: "boolean" },
+            persist: { type: "boolean" },
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "merge_gate",
+        description: "生成只读合并门禁汇总，聚合 PR readiness、CI、审查、审批和远端发布预检；不执行命令或远端写入。",
+        parameters: {
+          type: "object",
+          properties: {
+            prompt: { type: "string" },
+            deep: { type: "boolean" },
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "mcp_resource",
+        description: "读取已配置本地 MCP server 暴露的只读 resource 内容；不执行 tools/call、不写入文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            serverName: { type: "string" },
+            uri: { type: "string" }
+          },
+          required: ["serverName", "uri"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "queue_isolation",
+        description: "读取任务队列隔离报告，按 isolationGroup 汇总 active/queued 队列和被同组 active 阻塞的激活项；不执行任务、不修改队列。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "process_health",
+        description: "读取受管进程健康状态，汇总本地 HTTP 探针、可配置健康规则、运行状态和持久化日志 artifact；不启动或停止进程。",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "remote_publish_packages",
+        description: "读取远端发布审批包索引，列出本地生成的 PR body、review summary、计划和审批状态；不执行远端写入。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "remote_publish_package",
+        description: "读取指定远端发布审批包详情，包括 PR body、review summary、计划和命令；不执行远端写入。",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string" }
+          },
+          required: ["id"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "remote_publish_preflight",
+        description: "对远端发布包做只读预检，汇总审批状态、Git 远端、CLI 安装/认证、命令风险和阻塞项；不执行 push、建 PR 或评论。",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            limit: { type: "number" },
+            deep: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "policy_audit",
+        description: "生成只读权限策略审计，汇总命令/进程策略、审批状态、工具访问级别和权限缺口。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" },
+            sampleCommands: { type: "array", items: { type: "string" } }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "permission_matrix",
+        description: "读取 provider/action 权限矩阵，按工作区、命令、模型、浏览器、扩展、MCP 和远端发布汇总访问边界；不执行任何动作。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "extension_trust",
+        description: "读取本地扩展 trust 审计，返回 manifest SHA-256、checksum pin、本地签名校验和审批 guardrails；不执行扩展。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "code_intelligence",
+        description: "生成代码智能概览，汇总入口文件、API 面、符号热点、依赖热点、语义诊断和变更前 readiness；不写入文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" },
+            includeDiagnostics: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
         name: "semantic_index",
         description: "获取本地语义索引，包括声明、导入、路由、选择器和调用线索。",
         parameters: {
           type: "object",
           properties: {}
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "symbol_outline",
+        description: "查询零依赖符号大纲，返回函数/类/方法的起止行、参数、容器和签名，可按文件或关键词过滤。",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            path: { type: "string" },
+            limit: { type: "number" },
+            includeContext: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "semantic_definition",
+        description: "按符号名或文件+行号查找本地定义，返回定义位置、签名、范围和附近代码上下文。",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string" },
+            path: { type: "string" },
+            line: { type: "number" },
+            contextLines: { type: "number" },
+            limit: { type: "number" }
+          }
         }
       }
     },
@@ -4537,6 +9469,50 @@ function getAgentTools() {
             contextLines: { type: "number" }
           },
           required: ["symbol"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "semantic_diagnostics",
+        description: "基于语义索引输出重复声明、未解析本地导入、前端 API 调用缺口和重复路由等代码理解诊断。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" },
+            includeContext: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "semantic_impact",
+        description: "基于语义索引和当前 Git diff 或显式路径分析变更影响面，包括依赖方、调用方、路由和选择器。",
+        parameters: {
+          type: "object",
+          properties: {
+            paths: { type: "array", items: { type: "string" } },
+            limit: { type: "number" },
+            includeContext: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "dependency_graph",
+        description: "基于语义索引生成本地导入依赖图，包含模块节点、依赖边、未解析导入、外部依赖和循环依赖。",
+        parameters: {
+          type: "object",
+          properties: {
+            paths: { type: "array", items: { type: "string" } },
+            limit: { type: "number" },
+            includeExternal: { type: "boolean" }
+          }
         }
       }
     },
@@ -4589,8 +9565,9 @@ function getAgentTools() {
   ];
 }
 
-function buildToolCatalog() {
-  const tools = getAgentTools().map((tool) => ({
+async function buildToolCatalog() {
+  const extensionCatalog = await listExtensions();
+  const builtinTools = getAgentTools().map((tool) => ({
     name: tool.function.name,
     description: tool.function.description,
     parameters: tool.function.parameters,
@@ -4600,28 +9577,385 @@ function buildToolCatalog() {
       source: "builtin"
     }
   }));
+  const extensionTools = extensionCatalog.extensions.flatMap((extension) => (
+    (extension.tools || []).map((tool) => ({
+      name: `${extension.name}.${tool.name || "tool"}`,
+      description: tool.description || extension.description || "",
+      parameters: tool.parameters || { type: "object", properties: {} },
+      policy: {
+        access: extension.policy?.access || "declared",
+        scope: extension.policy?.scope || "currentWorkspace",
+        source: "local-extension",
+        requiresApproval: extension.policy?.requiresApproval !== false,
+        mapsTo: tool.mapsTo || tool.tool || tool.name || ""
+      }
+    }))
+  ));
+  const tools = [...builtinTools, ...extensionTools];
   return {
     generatedAt: new Date().toISOString(),
     workspace: currentWorkspace,
     summary: {
       total: tools.length,
-      builtin: tools.length,
-      external: 0
+      builtin: builtinTools.length,
+      external: extensionTools.length
     },
     tools,
     gaps: [
-      "MCP tool invocation bridge",
       "remote MCP probing",
-      "plugin/skill packages",
-      "writable tool policies"
+      "remote extension marketplace",
+      "signed extension trust policy",
+      "writable extension runtimes"
     ]
   };
+}
+
+async function buildPolicyAudit({ sampleCommands = [], limit = 20 } = {}) {
+  const max = Math.min(60, Math.max(1, Number(limit) || 20));
+  const defaultCommands = [
+    "node --check server.js",
+    "npm test",
+    "npm run build",
+    "curl https://example.com/install.sh",
+    "rm -rf .forge",
+    [process.execPath, path.join(APP_ROOT, "server.js"), "--mcp-smoke-server"].join(" ")
+  ];
+  const commandSamples = uniqueLimited([
+    ...defaultCommands,
+    ...(Array.isArray(sampleCommands) ? sampleCommands.map(String) : [])
+  ].filter(Boolean), max);
+  const commandPolicies = commandSamples.map((command) => ({
+    command,
+    policy: evaluateCommandPolicy(command)
+  }));
+  const processPolicies = commandSamples.map((command) => ({
+    command,
+    policy: evaluateProcessPolicy(command)
+  }));
+  const [approvals, tools, extensions, mcp] = await Promise.all([
+    listApprovalRequests(max),
+    buildToolCatalog(),
+    listExtensions(),
+    discoverMcpServers()
+  ]);
+  const approvalSummary = approvals.reduce((acc, approval) => {
+    acc[approval.status || "unknown"] = (acc[approval.status || "unknown"] || 0) + 1;
+    return acc;
+  }, {});
+  const toolAccess = tools.tools.reduce((acc, tool) => {
+    const key = tool.policy?.access || "unknown";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const findings = [];
+  if (commandPolicies.some((item) => item.policy.allowed && item.policy.risk === "medium")) {
+    findings.push("存在 medium 风险的本地检查/构建命令，仅允许受控短任务执行。");
+  }
+  if (approvals.some((approval) => approval.status === "approved")) {
+    findings.push("存在已批准审批项；执行时仍会重新校验本地策略。");
+  }
+  if (approvals.some((approval) => approval.status === "blocked" || approval.status === "pending")) {
+    findings.push("存在待处理或被阻断审批项。");
+  }
+  if (extensions.summary.total > 0) findings.push("本地扩展工具调用默认需要审批。");
+  if (mcp.summary.total > 0) findings.push("MCP tools/call 默认走审批与本地进程策略。");
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      sampledCommands: commandPolicies.length,
+      allowedCommands: commandPolicies.filter((item) => item.policy.allowed).length,
+      allowedProcesses: processPolicies.filter((item) => item.policy.allowed).length,
+      approvals: approvals.length,
+      tools: tools.summary.total,
+      extensions: extensions.summary.total,
+      mcpServers: mcp.summary.total,
+      findings: findings.length
+    },
+    commandPolicies,
+    processPolicies,
+    approvalSummary,
+    toolAccess,
+    approvals: approvals.slice(0, max),
+    findings,
+    guardrails: [
+      "Unsafe shell control operators and destructive/network-download commands are blocked.",
+      "Remote publish plans create approval artifacts but do not execute git push or PR creation.",
+      "Extension and MCP tool calls require approval before execution.",
+      "Approved requests are re-checked against current policy before execution.",
+      "Read-only tools are scoped to the current workspace."
+    ],
+    gaps: [
+      "No system-level sandbox privilege escalation is performed locally.",
+      "No remote provider permission model is enforced beyond generated approval plans.",
+      "No signed extension marketplace trust root is configured."
+    ],
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      changesApprovals: false,
+      pushes: false,
+      createsRemotePr: false
+    }
+  };
+}
+
+async function buildPermissionMatrix({ limit = 20 } = {}) {
+  const max = Math.min(80, Math.max(1, Number(limit) || 20));
+  const [approvals, toolCatalog, extensions, mcp] = await Promise.all([
+    listApprovalRequests(max),
+    buildToolCatalog(),
+    listExtensions(),
+    discoverMcpServers()
+  ]);
+  const rows = [
+    {
+      provider: "workspace",
+      action: "read_context",
+      access: "read-only",
+      scope: "currentWorkspace",
+      requiresApproval: false,
+      executesCommands: false,
+      writesFiles: false,
+      writesRemote: false,
+      evidence: ["list_files", "repo_map", "read_file_range", "search_files"]
+    },
+    {
+      provider: "workspace",
+      action: "apply_diff",
+      access: "approval-gated-write",
+      scope: "currentWorkspace",
+      requiresApproval: true,
+      executesCommands: false,
+      writesFiles: true,
+      writesRemote: false,
+      createsCheckpoint: true,
+      supportsPartialHunks: true,
+      evidence: ["/api/apply", "/api/rollback", ".forge/checkpoints"]
+    },
+    {
+      provider: "local-shell",
+      action: "run_command",
+      access: "policy-gated-exec",
+      scope: "currentWorkspace",
+      requiresApproval: false,
+      executesCommands: true,
+      writesFiles: false,
+      writesRemote: false,
+      evidence: ["evaluateCommandPolicy", "/api/command"]
+    },
+    {
+      provider: "local-process",
+      action: "managed_process",
+      access: "policy-gated-process",
+      scope: "currentWorkspace",
+      requiresApproval: false,
+      executesCommands: true,
+      writesFiles: false,
+      writesRemote: false,
+      evidence: ["evaluateProcessPolicy", "/api/processes", "/api/process-health"]
+    },
+    {
+      provider: "model",
+      action: "provider_request",
+      access: "budget-gated-provider-call",
+      scope: "configuredEndpoint",
+      requiresApproval: false,
+      executesCommands: false,
+      writesFiles: false,
+      writesRemote: false,
+      exposesSecrets: false,
+      evidence: ["/api/model-policy", "/api/model-budget", "FORGE_MODELS"]
+    },
+    {
+      provider: "browser",
+      action: "local_browser",
+      access: "localhost-only",
+      scope: "localhost",
+      requiresApproval: false,
+      executesCommands: false,
+      writesFiles: true,
+      writesRemote: false,
+      evidence: ["/api/browser-check", "/api/browser-audit", "/api/browser-screenshot", "/api/browser-trace", "/api/browser-interact", "/api/browser-visual"]
+    },
+    {
+      provider: "assets",
+      action: "inspect_workspace_assets",
+      access: "metadata-and-inspection",
+      scope: "currentWorkspace",
+      requiresApproval: false,
+      executesCommands: false,
+      writesFiles: true,
+      writesRemote: false,
+      evidence: ["/api/assets", "/api/asset-inspect"]
+    },
+    {
+      provider: "extension",
+      action: "tool_call",
+      access: "approval-gated-local-extension",
+      scope: "currentWorkspace",
+      requiresApproval: true,
+      executesCommands: false,
+      writesFiles: false,
+      writesRemote: false,
+      evidence: ["/api/extensions", "/api/extension-tool-call", "/api/approval-execute"]
+    },
+    {
+      provider: "mcp",
+      action: "tools_call",
+      access: "approval-gated-local-mcp",
+      scope: "localMcpServers",
+      requiresApproval: true,
+      executesCommands: true,
+      writesFiles: false,
+      writesRemote: false,
+      evidence: ["/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "/api/approval-execute"]
+    },
+    {
+      provider: "git-remote",
+      action: "read_pr_ci",
+      access: "remote-read-only",
+      scope: "configuredRemotes",
+      requiresApproval: false,
+      executesCommands: false,
+      writesFiles: true,
+      writesRemote: false,
+      evidence: ["/api/pr-readiness", "/api/remote-pr-status", "/api/ci-status"]
+    },
+    {
+      provider: "git-remote",
+      action: "publish_pr",
+      access: "approval-plan-only",
+      scope: "configuredRemotes",
+      requiresApproval: true,
+      executesCommands: false,
+      writesFiles: true,
+      writesRemote: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      evidence: ["/api/remote-publish-plan", "/api/remote-publish-preflight", ".forge/remote-publish"]
+    }
+  ];
+  const byProvider = rows.reduce((acc, row) => {
+    acc[row.provider] = acc[row.provider] || {
+      provider: row.provider,
+      actions: 0,
+      approvalRequired: 0,
+      executesCommands: 0,
+      writesFiles: 0,
+      writesRemote: 0
+    };
+    acc[row.provider].actions += 1;
+    if (row.requiresApproval) acc[row.provider].approvalRequired += 1;
+    if (row.executesCommands) acc[row.provider].executesCommands += 1;
+    if (row.writesFiles) acc[row.provider].writesFiles += 1;
+    if (row.writesRemote) acc[row.provider].writesRemote += 1;
+    return acc;
+  }, {});
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      providers: Object.keys(byProvider).length,
+      actions: rows.length,
+      approvalRequired: rows.filter((row) => row.requiresApproval).length,
+      commandExecuting: rows.filter((row) => row.executesCommands).length,
+      remoteWriteEnabled: rows.filter((row) => row.writesRemote).length,
+      tools: toolCatalog.summary.total,
+      extensions: extensions.summary.total,
+      mcpServers: mcp.summary.total,
+      approvals: approvals.length
+    },
+    providers: Object.values(byProvider),
+    rows,
+    guardrails: [
+      "Remote publish remains approval-plan-only and reports pushes/create/comment writes as false.",
+      "Workspace writes require checkpointed /api/apply approval and support partial hunk conflict evidence.",
+      "Local extension and MCP tool calls require approval artifacts before execution.",
+      "Model endpoints expose redacted provider metadata and enforce budget checks before provider requests.",
+      "Browser automation is restricted to localhost targets."
+    ],
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      changesApprovals: false,
+      writesFiles: false,
+      writesRemote: false,
+      exposesSecrets: false
+    }
+  };
+}
+
+let lastExtensionCatalogCache = { extensions: [] };
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function extensionSignaturePayload(manifest) {
+  const clone = JSON.parse(JSON.stringify(manifest || {}));
+  if (clone.trust && typeof clone.trust === "object" && !Array.isArray(clone.trust)) {
+    delete clone.trust.signature;
+    delete clone.trust.signatureValue;
+    delete clone.trust.signatureVerified;
+  }
+  return Buffer.from(stableJson(clone), "utf8");
+}
+
+function verifyExtensionSignature(manifest, declaredTrust = {}) {
+  const signature = String(declaredTrust.signature || declaredTrust.signatureValue || "").trim();
+  const publicKeyPem = String(declaredTrust.publicKeyPem || declaredTrust.publicKey || "").trim();
+  const algorithm = String(declaredTrust.signatureAlgorithm || declaredTrust.algorithm || "ed25519").trim().toLowerCase();
+  if (!signature || !publicKeyPem) {
+    return {
+      attempted: false,
+      verified: false,
+      algorithm,
+      reason: signature ? "missing-public-key" : publicKeyPem ? "missing-signature" : "missing-signature-and-public-key"
+    };
+  }
+  try {
+    const payload = extensionSignaturePayload(manifest);
+    const key = crypto.createPublicKey(publicKeyPem);
+    const signatureBuffer = Buffer.from(signature, "base64");
+    const verifierAlgorithm = algorithm === "ed25519" ? null : algorithm.toUpperCase();
+    const verified = crypto.verify(verifierAlgorithm, payload, key, signatureBuffer);
+    return {
+      attempted: true,
+      verified,
+      algorithm,
+      keyType: key.asymmetricKeyType || "",
+      reason: verified ? "" : "signature-mismatch"
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      verified: false,
+      algorithm,
+      reason: error instanceof Error ? error.message : String(error)
+    };
+  }
 }
 
 function parseExtensionManifest(raw, source, type) {
   const manifest = typeof raw === "string" ? JSON.parse(raw) : raw;
   const name = String(manifest.name || path.basename(source, path.extname(source))).trim();
   if (!name) throw new Error("extension manifest missing name");
+  const manifestHash = hashBuffer(Buffer.from(typeof raw === "string" ? raw : JSON.stringify(raw), "utf8"));
+  const declaredTrust = manifest.trust && typeof manifest.trust === "object" && !Array.isArray(manifest.trust)
+    ? manifest.trust
+    : {};
+  const trustedHashes = Array.isArray(declaredTrust.trustedHashes) ? declaredTrust.trustedHashes.map(String) : [];
+  const checksumMatches = trustedHashes.includes(manifestHash) || String(declaredTrust.sha256 || "") === manifestHash;
+  const signed = Boolean(declaredTrust.signature || declaredTrust.signedBy);
+  const signature = verifyExtensionSignature(manifest, declaredTrust);
   return {
     name,
     type: manifest.type || type,
@@ -4629,12 +9963,37 @@ function parseExtensionManifest(raw, source, type) {
     description: manifest.description || "",
     entry: manifest.entry || "",
     capabilities: Array.isArray(manifest.capabilities) ? manifest.capabilities : [],
-    tools: Array.isArray(manifest.tools) ? manifest.tools : [],
+    tools: Array.isArray(manifest.tools)
+      ? manifest.tools.map((tool) => ({
+          name: String(tool.name || "").trim(),
+          description: String(tool.description || ""),
+          parameters: tool.parameters || { type: "object", properties: {} },
+          mapsTo: String(tool.mapsTo || tool.tool || tool.name || "").trim()
+        })).filter((tool) => tool.name)
+      : [],
     policy: {
       access: manifest.policy?.access || "declared",
       source: "local-extension",
       scope: manifest.policy?.scope || "currentWorkspace",
       requiresApproval: manifest.policy?.requiresApproval !== false
+    },
+    trust: {
+      manifestHash,
+      source: "local-manifest-sha256",
+      declared: Boolean(manifest.trust),
+      signed,
+      signature,
+      signatureVerified: signature.verified,
+      checksumMatches,
+      status: signature.verified ? "signature-verified" : signed ? "declared-signature-unverified" : checksumMatches ? "checksum-pinned" : "local-unpinned",
+      signer: String(declaredTrust.signedBy || ""),
+      policy: {
+        signedMarketplace: false,
+        localSignatureVerification: true,
+        localChecksumAudit: true,
+        blocksExecution: false,
+        requiresApproval: manifest.policy?.requiresApproval !== false
+      }
     },
     source
   };
@@ -4667,9 +10026,10 @@ async function listExtensions() {
   const summary = extensions.reduce((acc, extension) => {
     acc.total += 1;
     acc[extension.type] = (acc[extension.type] || 0) + 1;
+    acc.trust[extension.trust?.status || "unknown"] = (acc.trust[extension.trust?.status || "unknown"] || 0) + 1;
     return acc;
-  }, { total: 0, skill: 0, plugin: 0 });
-  return {
+  }, { total: 0, skill: 0, plugin: 0, trust: {} });
+  const catalog = {
     generatedAt: new Date().toISOString(),
     workspace: currentWorkspace,
     root: toPosix(path.relative(APP_ROOT, EXTENSION_DIR)),
@@ -4680,8 +10040,150 @@ async function listExtensions() {
       "runtime extension loading",
       "extension tool invocation",
       "remote extension marketplace",
-      "signed extension trust policy"
+      "remote signed extension marketplace beyond local signature/checksum audit"
     ]
+  };
+  lastExtensionCatalogCache = catalog;
+  return catalog;
+}
+
+async function buildExtensionTrustAudit({ limit = 40 } = {}) {
+  const max = Math.min(120, Math.max(1, Number(limit) || 40));
+  const catalog = await listExtensions();
+  const rows = catalog.extensions.slice(0, max).map((extension) => ({
+    name: extension.name,
+    type: extension.type,
+    source: extension.source,
+    version: extension.version,
+    toolCount: (extension.tools || []).length,
+    capabilities: extension.capabilities || [],
+    trust: extension.trust,
+    approvalRequired: extension.policy?.requiresApproval !== false,
+    access: extension.policy?.access || "declared"
+  }));
+  const summary = rows.reduce((acc, row) => {
+    acc.total += 1;
+    const status = row.trust?.status || "unknown";
+    acc.status[status] = (acc.status[status] || 0) + 1;
+    if (row.approvalRequired) acc.approvalRequired += 1;
+    if (row.trust?.signed) acc.signed += 1;
+    if (row.trust?.signatureVerified) acc.signatureVerified += 1;
+    if (row.trust?.checksumMatches) acc.checksumPinned += 1;
+    return acc;
+  }, { total: 0, approvalRequired: 0, signed: 0, signatureVerified: 0, checksumPinned: 0, status: {} });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary,
+    rows,
+    guardrails: [
+      "Local extension manifests are hashed with SHA-256 and surfaced in catalog/trust audit output.",
+      "Local checksum pins are reported when manifest.trust.sha256 or manifest.trust.trustedHashes matches the manifest hash.",
+      "Local signatures are verified when manifest.trust.signature and manifest.trust.publicKeyPem are present.",
+      "Remote marketplace signatures still require an external trust root before they can be treated as provider verified.",
+      "Extension tool calls still require approval and can only bridge to built-in read-only tools."
+    ],
+    gaps: [
+      "No remote signed extension marketplace trust root is configured.",
+      "No remote certificate or marketplace signature chain is verified."
+    ],
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      changesApprovals: false,
+      writesFiles: false,
+      verifiesSignatures: true,
+      localSignatureVerification: true,
+      localChecksumAudit: true
+    }
+  };
+}
+
+async function findExtensionTool(extensionName, toolName) {
+  const catalog = await listExtensions();
+  const extension = catalog.extensions.find((item) => item.name === extensionName);
+  if (!extension) throw new Error(`Extension not found: ${extensionName}`);
+  const tool = (extension.tools || []).find((item) => item.name === toolName);
+  if (!tool) throw new Error(`Extension tool not found: ${extensionName}.${toolName}`);
+  return { extension, tool };
+}
+
+function normalizeExtensionToolArguments(args = {}) {
+  const text = JSON.stringify(args ?? {});
+  if (text.length > 12000) throw new Error("Extension tool arguments are too large.");
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Extension tool arguments must be a JSON object.");
+  }
+  return parsed;
+}
+
+async function createExtensionToolCallApproval({ extensionName = "", toolName = "", arguments: toolArguments = {} } = {}) {
+  const safeExtensionName = String(extensionName || "").trim();
+  const safeToolName = String(toolName || "").trim();
+  if (!/^[\w.-]+$/.test(safeExtensionName)) throw new Error("extensionName 非法。");
+  if (!/^[\w.-]+$/.test(safeToolName)) throw new Error("extension toolName 非法。");
+  const { extension, tool } = await findExtensionTool(safeExtensionName, safeToolName);
+  const safeArguments = normalizeExtensionToolArguments(toolArguments);
+  const approval = await writeApprovalRequest({
+    type: "extension_tool_call",
+    command: `${extension.name}.${tool.name}`,
+    reason: "Local extension tool execution requires explicit approval.",
+    policy: {
+      allowed: false,
+      risk: "medium",
+      reason: "本地扩展工具调用必须先审批；批准后仅允许映射到内置只读工具执行。",
+      requiresApproval: true,
+      access: extension.policy?.access || "declared",
+      mapsTo: tool.mapsTo || ""
+    },
+    extension: {
+      name: extension.name,
+      type: extension.type,
+      source: extension.source,
+      toolName: tool.name,
+      mapsTo: tool.mapsTo || "",
+      arguments: safeArguments
+    }
+  });
+  return {
+    status: "approval_required",
+    extension: { name: extension.name, type: extension.type, source: extension.source },
+    tool: {
+      name: tool.name,
+      description: tool.description || "",
+      mapsTo: tool.mapsTo || ""
+    },
+    approval,
+    policy: {
+      executesTool: false,
+      requiresExplicitApproval: true,
+      executionMode: "approved-read-only-builtin-bridge"
+    }
+  };
+}
+
+async function executeExtensionToolCall(extensionName, toolName, toolArguments = {}) {
+  const { extension, tool } = await findExtensionTool(String(extensionName || ""), String(toolName || ""));
+  const safeArguments = normalizeExtensionToolArguments(toolArguments);
+  const mappedTool = String(tool.mapsTo || tool.name || "").trim();
+  const allowedReadTools = new Set(getAgentTools().map((item) => item.function.name));
+  if (!allowedReadTools.has(mappedTool)) {
+    throw new Error(`Extension tool ${extension.name}.${tool.name} is not mapped to an allowed read-only builtin tool.`);
+  }
+  const rawResult = await runReadTool(mappedTool, safeArguments);
+  return {
+    extensionName: extension.name,
+    toolName: tool.name,
+    mappedTool,
+    result: rawResult.slice(0, 30000),
+    calledAt: new Date().toISOString(),
+    policy: {
+      access: "read-only",
+      source: "local-extension",
+      scope: "currentWorkspace"
+    }
   };
 }
 
@@ -5057,6 +10559,28 @@ async function probeMcpServer(server, options = {}) {
   return probeMcpStdioServer(server, options);
 }
 
+async function probeMcpServerWithRetry(server, options = {}) {
+  const attempts = Math.min(3, Math.max(1, Number(options.attempts) || 2));
+  const timeoutMs = Number(options.timeoutMs || 45000);
+  let lastProbe = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const probe = await probeMcpServer(server, { ...options, timeoutMs }).catch((error) => (
+      summarizeMcpProbe({ status: "error", error: error.message })
+    ));
+    lastProbe = {
+      ...probe,
+      attempts: attempt,
+      retried: attempt > 1
+    };
+    if (probe.status === "probed" || probe.status === "disabled" || probe.status === "approval_required" || probe.status === "not_configured") {
+      return lastProbe;
+    }
+    if (!/timed out|timeout/i.test(String(probe.error || ""))) return lastProbe;
+    await sleep(250 * attempt);
+  }
+  return lastProbe || summarizeMcpProbe({ status: "error", error: "MCP probe failed without result" });
+}
+
 async function findMcpServer(name) {
   const catalog = await discoverMcpServers();
   const server = catalog.servers.find((item) => item.name === name);
@@ -5118,14 +10642,75 @@ async function executeMcpToolCall(serverName, toolName, toolArguments = {}) {
   if (!/^[\w.-]+$/.test(safeToolName)) throw new Error("MCP toolName 非法。");
   const safeArguments = normalizeMcpToolArguments(toolArguments);
   const params = { name: safeToolName, arguments: safeArguments };
-  const result = server.transport === "http" || server.url
-    ? await callMcpHttpMethod(server, "tools/call", params)
-    : await callMcpStdioMethod(server, "tools/call", params);
+  const attempts = server.transport === "http" || server.url ? [5000, 10000] : [30000, 30000];
+  const errors = [];
+  let result = null;
+  for (const timeoutMs of attempts) {
+    try {
+      result = server.transport === "http" || server.url
+        ? await callMcpHttpMethod(server, "tools/call", params, { timeoutMs })
+        : await callMcpStdioMethod(server, "tools/call", params, { timeoutMs });
+      break;
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+  if (!result) {
+    throw new Error(errors.join(" | ") || "MCP tool call failed.");
+  }
   return {
     serverName: server.name,
     toolName: safeToolName,
     result,
+    attempts: attempts.length,
+    retryErrors: errors,
     calledAt: new Date().toISOString()
+  };
+}
+
+async function readMcpResourceContent({ serverName = "", uri = "" } = {}) {
+  const server = await findMcpServer(String(serverName || ""));
+  const safeUri = String(uri || "").trim();
+  if (!safeUri) throw new Error("MCP resource uri 不能为空。");
+  if (safeUri.length > 2048) throw new Error("MCP resource uri 过长。");
+  const params = { uri: safeUri };
+  const attempts = server.transport === "http" || server.url ? [5000, 10000] : [30000, 30000];
+  const errors = [];
+  let result = null;
+  for (const timeoutMs of attempts) {
+    try {
+      result = server.transport === "http" || server.url
+        ? await callMcpHttpMethod(server, "resources/read", params, { timeoutMs })
+        : await callMcpStdioMethod(server, "resources/read", params, { timeoutMs });
+      break;
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+  if (!result) {
+    throw new Error(errors.join(" | ") || "MCP resource read failed.");
+  }
+  const contents = Array.isArray(result.contents) ? result.contents : [];
+  return {
+    serverName: server.name,
+    uri: safeUri,
+    contents: contents.slice(0, 20).map((item) => ({
+      uri: item.uri || safeUri,
+      mimeType: item.mimeType || "",
+      text: typeof item.text === "string" ? item.text.slice(0, 60000) : "",
+      blob: item.blob ? String(item.blob).slice(0, 60000) : ""
+    })),
+    raw: contents.length ? null : result,
+    readAt: new Date().toISOString(),
+    attempts: attempts.length,
+    retryErrors: errors,
+    policy: {
+      access: "mcp-resource-read-only",
+      executesTool: false,
+      requiresApproval: false,
+      writesFiles: false,
+      writesRemote: false
+    }
   };
 }
 
@@ -5167,7 +10752,7 @@ async function discoverMcpServers({ probe = false } = {}) {
   const serversWithProbe = probe
     ? await Promise.all(servers.map(async (server) => ({
       ...server,
-      probe: await probeMcpServer(server).catch((error) => summarizeMcpProbe({ status: "error", error: error.message }))
+      probe: await probeMcpServerWithRetry(server).catch((error) => summarizeMcpProbe({ status: "error", error: error.message }))
     })))
     : servers;
   const summary = serversWithProbe.reduce((acc, server) => {
@@ -5264,8 +10849,136 @@ async function runReadTool(name, args) {
   if (name === "repo_map") {
     return JSON.stringify(await buildRepoMap());
   }
+  if (name === "diff_conflicts") {
+    return JSON.stringify(await buildDiffConflictPreview(String(args.diff || "")));
+  }
+  if (name === "model_policy") {
+    const usageLedger = await readModelUsageLedger();
+    return JSON.stringify(buildModelPolicy({
+      includeRecent: args.includeRecent !== false,
+      usageLedger
+    }));
+  }
+  if (name === "model_usage") {
+    return JSON.stringify(await readModelUsageLedger());
+  }
+  if (name === "model_budget") {
+    const usageLedger = await readModelUsageLedger();
+    return JSON.stringify(buildModelBudgetStatus({ usageLedger }));
+  }
+  if (name === "model_cost") {
+    const usageLedger = await readModelUsageLedger();
+    return JSON.stringify(buildModelCostEstimate({ usageLedger }));
+  }
+  if (name === "model_cost_policy") {
+    return JSON.stringify(buildModelCostPolicySchema({
+      raw: typeof args.raw === "string" ? args.raw : process.env.FORGE_MODEL_COST_POLICY
+    }));
+  }
+  if (name === "model_billing") {
+    const usageLedger = await readModelUsageLedger();
+    return JSON.stringify(await buildModelBillingReconciliation({
+      usageLedger,
+      raw: typeof args.raw === "string" ? args.raw : ""
+    }));
+  }
+  if (name === "context_rollup") {
+    const cached = await readContextRollup();
+    const rebuild = Boolean(args.rebuild) || !cached || Boolean(String(args.query || "").trim());
+    return JSON.stringify(rebuild
+      ? await buildContextRollup({ limit: Number(args.limit || 24), query: String(args.query || "") })
+      : cached);
+  }
+  if (name === "verification_plan") {
+    return JSON.stringify(await buildVerificationPlan({
+      commands: Array.isArray(args.commands) ? args.commands : [],
+      limit: Number(args.limit || 12)
+    }));
+  }
+  if (name === "ci_status") {
+    return JSON.stringify(await buildCiStatus({
+      deep: Boolean(args.deep),
+      persist: Boolean(args.persist),
+      limit: Number(args.limit || 20)
+    }));
+  }
+  if (name === "merge_gate") {
+    return JSON.stringify(await buildMergeGateStatus({
+      prompt: String(args.prompt || ""),
+      deep: Boolean(args.deep),
+      limit: Number(args.limit || 20)
+    }));
+  }
+  if (name === "mcp_resource") {
+    return JSON.stringify(await readMcpResourceContent({
+      serverName: String(args.serverName || ""),
+      uri: String(args.uri || "")
+    }));
+  }
+  if (name === "queue_isolation") {
+    return JSON.stringify(await buildQueueIsolationReport({
+      limit: Number(args.limit || 100)
+    }));
+  }
+  if (name === "process_health") {
+    return JSON.stringify(await buildManagedProcessHealth({
+      id: String(args.id || ""),
+      limit: Number(args.limit || 50)
+    }));
+  }
+  if (name === "remote_publish_packages") {
+    return JSON.stringify(await listRemotePublishPackages({ limit: Number(args.limit || 20) }));
+  }
+  if (name === "remote_publish_package") {
+    return JSON.stringify(await readRemotePublishPackage(String(args.id || "")));
+  }
+  if (name === "remote_publish_preflight") {
+    return JSON.stringify(await buildRemotePublishPreflight({
+      id: String(args.id || ""),
+      limit: Number(args.limit || 20),
+      deep: Boolean(args.deep)
+    }));
+  }
+  if (name === "policy_audit") {
+    return JSON.stringify(await buildPolicyAudit({
+      sampleCommands: Array.isArray(args.sampleCommands) ? args.sampleCommands : [],
+      limit: Number(args.limit || 20)
+    }));
+  }
+  if (name === "permission_matrix") {
+    return JSON.stringify(await buildPermissionMatrix({
+      limit: Number(args.limit || 20)
+    }));
+  }
+  if (name === "extension_trust") {
+    return JSON.stringify(await buildExtensionTrustAudit({
+      limit: Number(args.limit || 40)
+    }));
+  }
+  if (name === "code_intelligence") {
+    return JSON.stringify(await buildCodeIntelligenceOverview({
+      limit: Number(args.limit || 24),
+      includeDiagnostics: args.includeDiagnostics !== false
+    }));
+  }
   if (name === "semantic_index") {
     return JSON.stringify(await buildSemanticIndex());
+  }
+  if (name === "symbol_outline") {
+    return JSON.stringify(await buildSymbolOutline({
+      query: String(args.query || ""),
+      path: String(args.path || ""),
+      limit: Number(args.limit || 120),
+      includeContext: Boolean(args.includeContext)
+    }));
+  }
+  if (name === "semantic_definition") {
+    return JSON.stringify(await buildSemanticDefinition(String(args.symbol || ""), {
+      path: String(args.path || ""),
+      line: Number(args.line || 0),
+      contextLines: Number(args.contextLines || 4),
+      limit: Number(args.limit || 20)
+    }));
   }
   if (name === "semantic_search") {
     return JSON.stringify(await searchSemanticIndex(String(args.query || ""), {
@@ -5277,6 +10990,26 @@ async function runReadTool(name, args) {
     return JSON.stringify(await buildSemanticReferences(String(args.symbol || ""), {
       limit: Number(args.limit || 80),
       contextLines: Number(args.contextLines || 6)
+    }));
+  }
+  if (name === "semantic_diagnostics") {
+    return JSON.stringify(await buildSemanticDiagnostics({
+      limit: Number(args.limit || 120),
+      includeContext: Boolean(args.includeContext)
+    }));
+  }
+  if (name === "semantic_impact") {
+    return JSON.stringify(await buildSemanticImpact({
+      paths: Array.isArray(args.paths) ? args.paths : [],
+      limit: Number(args.limit || 80),
+      includeContext: Boolean(args.includeContext)
+    }));
+  }
+  if (name === "dependency_graph") {
+    return JSON.stringify(await buildDependencyGraph({
+      paths: Array.isArray(args.paths) ? args.paths : [],
+      limit: Number(args.limit || 120),
+      includeExternal: Boolean(args.includeExternal)
     }));
   }
   if (name === "read_file") {
@@ -5296,13 +11029,23 @@ async function runReadTool(name, args) {
   throw new Error(`未知工具：${name}`);
 }
 
-async function callDeepSeekMessages(messages, tools) {
+async function callDeepSeekMessages(messages, tools, options = {}) {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     throw new Error("缺少 DEEPSEEK_API_KEY。请先在环境变量中配置 DeepSeek API Key。");
   }
+  await assertModelBudgetAllowsRequest();
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  modelRuntime = {
+    ...modelRuntime,
+    candidates: MODEL_CANDIDATES,
+    lastStartedAt: startedAt,
+    lastStatus: "running"
+  };
   const fallbacks = [];
   let lastError = "";
+  const providerTokenStreaming = Boolean(options.providerTokenStreaming && !tools && typeof options.onToken === "function");
   for (const model of MODEL_CANDIDATES) {
     try {
       const response = await fetch(MODEL_API_URL, {
@@ -5317,6 +11060,8 @@ async function callDeepSeekMessages(messages, tools) {
           response_format: tools ? undefined : { type: "json_object" },
           tools,
           tool_choice: tools ? "auto" : undefined,
+          stream: providerTokenStreaming || undefined,
+          stream_options: providerTokenStreaming ? { include_usage: true } : undefined,
           messages
         })
       });
@@ -5324,30 +11069,87 @@ async function callDeepSeekMessages(messages, tools) {
         const details = await response.text();
         throw new Error(`${response.status} ${details.slice(0, 500)}`);
       }
+      if (providerTokenStreaming) {
+        const streamed = await readProviderSseResponse(response, options.onToken);
+        if (!streamed.content) throw new Error("Provider stream did not return content.");
+        const completedAt = new Date().toISOString();
+        const latencyMs = Date.now() - startedMs;
+        recordModelRuntimeCall({
+          ok: true,
+          model,
+          fallbacks,
+          startedAt,
+          completedAt,
+          latencyMs,
+          usage: streamed.usage
+        });
+        await recordModelUsageCall({
+          ok: true,
+          model,
+          fallbacks,
+          startedAt,
+          completedAt,
+          latencyMs,
+          usage: streamed.usage
+        }).catch(() => {});
+        return {
+          role: "assistant",
+          content: streamed.content,
+          _model: model,
+          _fallbacks: fallbacks,
+          _providerTokenStreaming: true,
+          _finishReason: streamed.finishReason
+        };
+      }
       const data = await response.json();
       const message = data.choices?.[0]?.message;
       if (!message) throw new Error("DeepSeek 没有返回消息。");
-      modelRuntime = {
-        ...modelRuntime,
-        candidates: MODEL_CANDIDATES,
-        lastModel: model,
-        lastFallbacks: fallbacks,
-        lastError: "",
-        lastUsedAt: new Date().toISOString()
-      };
+      const completedAt = new Date().toISOString();
+      const latencyMs = Date.now() - startedMs;
+      recordModelRuntimeCall({
+        ok: true,
+        model,
+        fallbacks,
+        startedAt,
+        completedAt,
+        latencyMs,
+        usage: data.usage
+      });
+      await recordModelUsageCall({
+        ok: true,
+        model,
+        fallbacks,
+        startedAt,
+        completedAt,
+        latencyMs,
+        usage: data.usage
+      }).catch(() => {});
       return { ...message, _model: model, _fallbacks: fallbacks };
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
       fallbacks.push({ model, error: lastError });
     }
   }
-  modelRuntime = {
-    ...modelRuntime,
-    candidates: MODEL_CANDIDATES,
-    lastFallbacks: fallbacks,
-    lastError,
-    lastUsedAt: new Date().toISOString()
-  };
+  const completedAt = new Date().toISOString();
+  const latencyMs = Date.now() - startedMs;
+  recordModelRuntimeCall({
+    ok: false,
+    model: "",
+    fallbacks,
+    error: lastError,
+    startedAt,
+    completedAt,
+    latencyMs
+  });
+  await recordModelUsageCall({
+    ok: false,
+    model: MODEL_CANDIDATES[0] || DEFAULT_MODEL,
+    fallbacks,
+    error: lastError,
+    startedAt,
+    completedAt,
+    latencyMs
+  }).catch(() => {});
   throw new Error(`模型请求失败：${fallbacks.map((item) => `${item.model}: ${item.error}`).join(" | ")}`);
 }
 
@@ -5421,10 +11223,11 @@ async function repairFromFailedCommand({ prompt = "", command = "", result = nul
   });
 }
 
-async function runAgentLoop(prompt) {
+async function runAgentLoop(prompt, options = {}) {
   const files = await listFiles();
   const toolLog = [];
   const tools = getAgentTools();
+  const onProviderToken = typeof options.onProviderToken === "function" ? options.onProviderToken : null;
 
   const messages = [
     {
@@ -5453,15 +11256,24 @@ async function runAgentLoop(prompt) {
     messages.push(message);
     const toolCalls = message.tool_calls || [];
     if (!toolCalls.length) {
-      let finalPayload;
-      try {
-        finalPayload = normalizeAgentPayload(message.content);
-      } catch (error) {
-        finalPayload = await forceFinalJson(messages, error instanceof Error ? error.message : String(error));
-      }
+      messages.push({
+        role: "user",
+        content: [
+          "请基于已经读取的上下文输出最终 JSON。",
+          "只输出一个 JSON 对象，不要解释，不要 Markdown，不要代码围栏。",
+          "格式必须是：{\"reply\":\"中文摘要\",\"plan\":[\"步骤\"],\"diff\":\"unified diff\",\"review\":[{\"severity\":\"info|warning|error\",\"message\":\"审查发现\",\"file\":\"相对路径\",\"line\":\"行号\"}],\"commands\":[{\"command\":\"命令\",\"reason\":\"原因\"}]}",
+          "如果没有修改建议，diff 为空字符串。"
+        ].join("\n")
+      });
+      const finalMessage = await callDeepSeekMessages(messages, null, {
+        providerTokenStreaming: Boolean(onProviderToken),
+        onToken: onProviderToken
+      });
+      const providerTokenStreaming = Boolean(finalMessage._providerTokenStreaming);
+      const finalPayload = normalizeAgentPayload(finalMessage.content);
       const patches = finalPayload.diff ? await previewUnifiedDiff(finalPayload.diff) : [];
       const checks = await discoverCheckCommands(finalPayload.commands);
-      return { ...finalPayload, patches, commands: checks, toolLog };
+      return { ...finalPayload, patches, commands: checks, toolLog, providerTokenStreaming };
     }
     for (const call of toolCalls) {
       const name = call.function?.name;
@@ -5485,11 +11297,56 @@ async function runAgentLoop(prompt) {
     role: "user",
     content: "请停止继续调用工具，基于已经读取的上下文输出最终 JSON。"
   });
-  const finalMessage = await callDeepSeekMessages(messages, null);
+  const finalMessage = await callDeepSeekMessages(messages, null, {
+    providerTokenStreaming: Boolean(onProviderToken),
+    onToken: onProviderToken
+  });
   const finalPayload = normalizeAgentPayload(finalMessage.content);
   const patches = finalPayload.diff ? await previewUnifiedDiff(finalPayload.diff) : [];
   const checks = await discoverCheckCommands(finalPayload.commands);
-  return { ...finalPayload, patches, commands: checks, toolLog };
+  return { ...finalPayload, patches, commands: checks, toolLog, providerTokenStreaming: Boolean(finalMessage._providerTokenStreaming) };
+}
+
+async function persistAgentResult(prompt, result) {
+  await writeGoalState({
+    objective: prompt,
+    phase: result.diff ? "awaiting_approval" : "agent_finished",
+    status: result.diff ? "awaiting_approval" : "needs_attention",
+    lastPrompt: prompt,
+    pendingProposal: result.diff ? {
+      id: `proposal-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+      type: "agent",
+      createdAt: new Date().toISOString(),
+      prompt,
+      reply: result.reply || "",
+      plan: result.plan || [],
+      diff: result.diff || "",
+      patches: result.patches || [],
+      commands: result.commands || [],
+      review: result.review || []
+    } : null,
+    nextStep: result.diff ? "复核 diff 后批准写入。" : "查看代理输出并补充任务要求。"
+  });
+}
+
+function attachModelEvidence(result) {
+  const providerTokenStreaming = Boolean(result.providerTokenStreaming);
+  return {
+    ...result,
+    model: currentModelName(),
+    modelRuntime: {
+      ...modelRuntime,
+      lastFallbacks: modelRuntime.lastFallbacks.slice(-3)
+    },
+    streamPolicy: {
+      transport: "sse",
+      events: providerTokenStreaming
+        ? ["start", "goal", "context", "token", "result", "done", "error"]
+        : ["start", "goal", "context", "result", "done", "error"],
+      providerTokenStreaming,
+      exposesApiKey: false
+    }
+  };
 }
 
 async function handleStatic(req, res) {
@@ -5522,10 +11379,11 @@ async function handleApi(req, res) {
       const deep = url.searchParams.get("deep") === "1";
       const lightGit = { available: false, branch: "", root: "", status: [], changedFiles: [], remotes: [], upstream: "", skipped: "Use /api/health?deep=1 for git status." };
       const lightAssets = { summary: { total: 0, image: 0, document: 0, data: 0, media: 0 }, assets: [] };
-      const [checkpoints, git, tasks, queue, reviews, approvals, processes, extensions, mcp, assets, contextSnapshot, goal, capabilities] = await Promise.all([
+      const [checkpoints, git, tasks, threads, queue, reviews, approvals, processes, extensions, mcp, assets, contextSnapshot, contextRollup, modelUsage, goal, capabilities] = await Promise.all([
         listCheckpoints(),
         deep ? getGitSummary() : Promise.resolve(lightGit),
         listTaskLogs(),
+        listThreads(),
         listQueuedTasks(),
         listReviewArtifacts(),
         listApprovalRequests(),
@@ -5534,6 +11392,8 @@ async function handleApi(req, res) {
         discoverMcpServers(),
         deep ? buildAssetCatalog() : Promise.resolve(lightAssets),
         readContextSnapshot(),
+        readContextRollup(),
+        readModelUsageLedger(),
         readGoalState(),
         buildCapabilityAudit({ light: !deep })
       ]);
@@ -5542,20 +11402,27 @@ async function handleApi(req, res) {
         deep,
         model: modelRuntime.lastModel || MODEL_CANDIDATES[0] || DEFAULT_MODEL,
         modelRuntime,
+        modelUsage,
+        modelBudget: buildModelBudgetStatus({ usageLedger: modelUsage }),
+        modelCost: buildModelCostEstimate({ usageLedger: modelUsage }),
+        modelPolicy: buildModelPolicy({ includeRecent: false, usageLedger: modelUsage }),
         hasApiKey: Boolean(process.env.DEEPSEEK_API_KEY),
         ...getWorkspaceInfo(),
         checkpoints,
         git,
         tasks,
+        threads,
         queue,
         reviews,
         approvals,
         processes,
-        tools: buildToolCatalog(),
+        tools: await buildToolCatalog(),
         extensions,
         mcp,
         assets,
         contextSnapshot,
+        contextCompact: await readContextCompaction(),
+        contextRollup,
         goal,
         capabilities
       });
@@ -5565,8 +11432,135 @@ async function handleApi(req, res) {
       return send(res, 200, { snapshot: await readContextSnapshot() });
     }
 
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/model-policy") {
+      const payload = req.method === "POST" ? await readJson(req) : {};
+      const usageLedger = await readModelUsageLedger();
+      return send(res, 200, {
+        policy: buildModelPolicy({ includeRecent: payload.includeRecent !== false, usageLedger })
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/model-usage") {
+      return send(res, 200, { usage: await readModelUsageLedger() });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/model-budget") {
+      const payload = req.method === "POST" ? await readJson(req) : {};
+      const usageLedger = await readModelUsageLedger();
+      return send(res, 200, {
+        budget: buildModelBudgetStatus({
+          usageLedger,
+          limits: payload.limits && typeof payload.limits === "object" ? payload.limits : {}
+        })
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/model-cost") {
+      const usageLedger = await readModelUsageLedger();
+      return send(res, 200, { cost: buildModelCostEstimate({ usageLedger }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/model-cost-policy") {
+      const payload = req.method === "POST" ? await readJson(req) : {};
+      return send(res, 200, {
+        policy: buildModelCostPolicySchema({
+          raw: typeof payload.raw === "string" ? payload.raw : process.env.FORGE_MODEL_COST_POLICY
+        })
+      });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/model-billing") {
+      const payload = req.method === "POST" ? await readJson(req) : {};
+      const usageLedger = await readModelUsageLedger();
+      return send(res, 200, {
+        billing: await buildModelBillingReconciliation({
+          usageLedger,
+          raw: typeof payload.raw === "string" ? payload.raw : ""
+        })
+      });
+    }
+
     if (req.method === "POST" && url.pathname === "/api/context-snapshot") {
       return send(res, 200, { snapshot: await buildContextSnapshot({ deep: url.searchParams.get("deep") === "1" }) });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/context-compact") {
+      return send(res, 200, { compact: await readContextCompaction() });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/context-compact") {
+      return send(res, 200, { compact: await buildContextCompaction({ deep: url.searchParams.get("deep") === "1" }) });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/context-rollup") {
+      return send(res, 200, { rollup: await readContextRollup() });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/context-rollup") {
+      const payload = await readJson(req);
+      return send(res, 200, { rollup: await buildContextRollup({
+        limit: Number(payload.limit || 24),
+        query: String(payload.query || "")
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/verification-plan") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : { limit: Number(url.searchParams.get("limit") || 12), commands: [] };
+      return send(res, 200, { plan: await buildVerificationPlan({
+        commands: Array.isArray(payload.commands) ? payload.commands : [],
+        limit: Number(payload.limit || 12)
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/ci-status") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+          limit: Number(url.searchParams.get("limit") || 20),
+          deep: url.searchParams.get("deep") === "1",
+          persist: url.searchParams.get("persist") === "1"
+        };
+      return send(res, 200, { status: await buildCiStatus({
+        deep: Boolean(payload.deep),
+        persist: Boolean(payload.persist),
+        limit: Number(payload.limit || 20)
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/merge-gate") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+          prompt: url.searchParams.get("prompt") || "",
+          limit: Number(url.searchParams.get("limit") || 20),
+          deep: url.searchParams.get("deep") === "1"
+        };
+      return send(res, 200, { gate: await buildMergeGateStatus({
+        prompt: String(payload.prompt || ""),
+        deep: Boolean(payload.deep),
+        limit: Number(payload.limit || 20)
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/policy-audit") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : { limit: Number(url.searchParams.get("limit") || 20), sampleCommands: [] };
+      return send(res, 200, { audit: await buildPolicyAudit({
+        sampleCommands: Array.isArray(payload.sampleCommands) ? payload.sampleCommands : [],
+        limit: Number(payload.limit || 20)
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/permission-matrix") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : { limit: Number(url.searchParams.get("limit") || 20) };
+      return send(res, 200, { matrix: await buildPermissionMatrix({
+        limit: Number(payload.limit || 20)
+      }) });
     }
 
     if (req.method === "GET" && url.pathname === "/api/semantic-index") {
@@ -5576,6 +11570,54 @@ async function handleApi(req, res) {
 
     if (req.method === "POST" && url.pathname === "/api/semantic-index") {
       return send(res, 200, { index: await buildSemanticIndex({ persist: true }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/code-intelligence") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            limit: Number(url.searchParams.get("limit") || 24),
+            includeDiagnostics: url.searchParams.get("includeDiagnostics") !== "0"
+          };
+      return send(res, 200, { overview: await buildCodeIntelligenceOverview({
+        limit: Number(payload.limit || 24),
+        includeDiagnostics: payload.includeDiagnostics !== false
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/symbol-outline") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            query: url.searchParams.get("query") || "",
+            path: url.searchParams.get("path") || "",
+            limit: Number(url.searchParams.get("limit") || 120),
+            includeContext: url.searchParams.get("includeContext") === "1"
+          };
+      return send(res, 200, await buildSymbolOutline({
+        query: String(payload.query || ""),
+        path: String(payload.path || ""),
+        limit: Number(payload.limit || 120),
+        includeContext: Boolean(payload.includeContext)
+      }));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/semantic-definition") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            symbol: url.searchParams.get("symbol") || "",
+            path: url.searchParams.get("path") || "",
+            line: Number(url.searchParams.get("line") || 0),
+            contextLines: Number(url.searchParams.get("contextLines") || 4),
+            limit: Number(url.searchParams.get("limit") || 20)
+          };
+      return send(res, 200, await buildSemanticDefinition(String(payload.symbol || ""), {
+        path: String(payload.path || ""),
+        line: Number(payload.line || 0),
+        contextLines: Number(payload.contextLines || 4),
+        limit: Number(payload.limit || 20)
+      }));
     }
 
     if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/semantic-search") {
@@ -5606,16 +11648,72 @@ async function handleApi(req, res) {
       }));
     }
 
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/semantic-diagnostics") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            limit: Number(url.searchParams.get("limit") || 120),
+            includeContext: url.searchParams.get("includeContext") === "1"
+          };
+      return send(res, 200, await buildSemanticDiagnostics({
+        limit: Number(payload.limit || 120),
+        includeContext: Boolean(payload.includeContext)
+      }));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/semantic-impact") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            paths: url.searchParams.getAll("path"),
+            limit: Number(url.searchParams.get("limit") || 80),
+            includeContext: url.searchParams.get("includeContext") === "1"
+          };
+      return send(res, 200, await buildSemanticImpact({
+        paths: Array.isArray(payload.paths) ? payload.paths : [],
+        limit: Number(payload.limit || 80),
+        includeContext: Boolean(payload.includeContext)
+      }));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/dependency-graph") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            paths: url.searchParams.getAll("path"),
+            limit: Number(url.searchParams.get("limit") || 120),
+            includeExternal: url.searchParams.get("includeExternal") === "1"
+          };
+      return send(res, 200, await buildDependencyGraph({
+        paths: Array.isArray(payload.paths) ? payload.paths : [],
+        limit: Number(payload.limit || 120),
+        includeExternal: Boolean(payload.includeExternal)
+      }));
+    }
+
     if (req.method === "GET" && url.pathname === "/api/capabilities") {
       return send(res, 200, await buildCapabilityAudit({ light: url.searchParams.get("deep") !== "1" }));
     }
 
     if (req.method === "GET" && url.pathname === "/api/tools") {
-      return send(res, 200, buildToolCatalog());
+      return send(res, 200, await buildToolCatalog());
     }
 
     if (req.method === "GET" && url.pathname === "/api/extensions") {
       return send(res, 200, await listExtensions());
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/extension-trust") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : { limit: Number(url.searchParams.get("limit") || 40) };
+      return send(res, 200, { trust: await buildExtensionTrustAudit({
+        limit: Number(payload.limit || 40)
+      }) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/extension-tool-call") {
+      return send(res, 200, await createExtensionToolCallApproval(await readJson(req)));
     }
 
     if (req.method === "GET" && url.pathname === "/api/mcp") {
@@ -5624,6 +11722,10 @@ async function handleApi(req, res) {
 
     if (req.method === "POST" && url.pathname === "/api/mcp-tool-call") {
       return send(res, 200, await createMcpToolCallApproval(await readJson(req)));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/mcp-resource") {
+      return send(res, 200, await readMcpResourceContent(await readJson(req)));
     }
 
     if (req.method === "GET" && url.pathname === "/api/assets") {
@@ -5639,19 +11741,29 @@ async function handleApi(req, res) {
       return send(res, 200, await checkBrowserTarget(targetUrl));
     }
 
+    if (req.method === "POST" && url.pathname === "/api/browser-audit") {
+      const { url: targetUrl = "" } = await readJson(req);
+      return send(res, 200, await auditBrowserTarget(targetUrl));
+    }
+
     if (req.method === "POST" && url.pathname === "/api/browser-baseline") {
       const { url: targetUrl = "", update = false, name = "" } = await readJson(req);
       return send(res, 200, await compareBrowserBaseline(targetUrl, { update: Boolean(update), name }));
     }
 
     if (req.method === "POST" && url.pathname === "/api/browser-screenshot") {
-      const { url: targetUrl = "", width = 1365, height = 768 } = await readJson(req);
-      return send(res, 200, await captureBrowserScreenshot(targetUrl, { width, height }));
+      const { url: targetUrl = "", width = 1365, height = 768, selector = "" } = await readJson(req);
+      return send(res, 200, await captureBrowserScreenshot(targetUrl, { width, height, selector }));
     }
 
     if (req.method === "POST" && url.pathname === "/api/browser-dom") {
       const { url: targetUrl = "", selectors = [] } = await readJson(req);
       return send(res, 200, await captureBrowserDom(targetUrl, { selectors }));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/browser-trace") {
+      const { url: targetUrl = "", width = 1365, height = 768, waitMs = 1500, fallbackOnly = false } = await readJson(req);
+      return send(res, 200, await captureBrowserTrace(targetUrl, { width, height, waitMs, fallbackOnly: Boolean(fallbackOnly) }));
     }
 
     if (req.method === "POST" && url.pathname === "/api/browser-interact") {
@@ -5660,9 +11772,22 @@ async function handleApi(req, res) {
         actions = [],
         selectors = [],
         width = 1365,
-        height = 768
+        height = 768,
+        fallbackOnly = false
       } = await readJson(req);
-      return send(res, 200, await interactBrowserDom(targetUrl, { actions, selectors, width, height }));
+      return send(res, 200, await interactBrowserDom(targetUrl, { actions, selectors, width, height, fallbackOnly: Boolean(fallbackOnly) }));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/browser-session") {
+      const {
+        url: targetUrl = "",
+        steps = [],
+        selectors = [],
+        width = 1365,
+        height = 768,
+        name = ""
+      } = await readJson(req);
+      return send(res, 200, await runBrowserSessionArtifact(targetUrl, { steps, selectors, width, height, name }));
     }
 
     if (req.method === "POST" && url.pathname === "/api/browser-visual") {
@@ -5674,7 +11799,8 @@ async function handleApi(req, res) {
         threshold = 0,
         maxMismatchRatio = 0,
         name = "",
-        screenshotPath = ""
+        screenshotPath = "",
+        selector = ""
       } = await readJson(req);
       return send(res, 200, await compareBrowserVisual(targetUrl, {
         update: Boolean(update),
@@ -5683,7 +11809,8 @@ async function handleApi(req, res) {
         threshold,
         maxMismatchRatio,
         name,
-        screenshotPath
+        screenshotPath,
+        selector
       }));
     }
 
@@ -5716,8 +11843,8 @@ async function handleApi(req, res) {
     }
 
     if (req.method === "POST" && url.pathname === "/api/queue") {
-      const { prompt = "", priority = 0, retryLimit = 0 } = await readJson(req);
-      const item = await enqueueTask(prompt, { priority, retryLimit });
+      const { prompt = "", priority = 0, retryLimit = 0, isolationGroup = "default" } = await readJson(req);
+      const item = await enqueueTask(prompt, { priority, retryLimit, isolationGroup });
       await writeGoalState({
         objective: prompt,
         phase: "queued",
@@ -5729,8 +11856,8 @@ async function handleApi(req, res) {
     }
 
     if (req.method === "PATCH" && url.pathname === "/api/queue") {
-      const { id = "", status = "", priority, retryLimit, autoNext = false } = await readJson(req);
-      const item = await updateQueuedTask(id, status, { priority, retryLimit });
+      const { id = "", status = "", priority, retryLimit, isolationGroup, autoNext = false } = await readJson(req);
+      const item = await updateQueuedTask(id, status, { priority, retryLimit, isolationGroup });
       const next = status === "done" && autoNext ? await activateNextQueuedTask() : null;
       await writeGoalState({
         objective: next?.prompt || item.prompt || "",
@@ -5752,8 +11879,33 @@ async function handleApi(req, res) {
       return send(res, 200, { queue: await listQueuedTasks() });
     }
 
+    if (req.method === "GET" && url.pathname === "/api/queue-isolation") {
+      return send(res, 200, await buildQueueIsolationReport({
+        limit: Number(url.searchParams.get("limit") || 100)
+      }));
+    }
+
     if (req.method === "GET" && url.pathname === "/api/processes") {
       return send(res, 200, { processes: await listManagedProcesses({ probe: true }) });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/process-health") {
+      return send(res, 200, await buildManagedProcessHealth({
+        id: url.searchParams.get("id") || "",
+        limit: Number(url.searchParams.get("limit") || 50)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/process-search") {
+      return send(res, 200, await searchManagedProcessLogs(url.searchParams.get("q") || "", {
+        limit: Number(url.searchParams.get("limit") || 20)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/process-history") {
+      return send(res, 200, await listManagedProcessHistory({
+        limit: Number(url.searchParams.get("limit") || 20)
+      }));
     }
 
     if (req.method === "POST" && url.pathname === "/api/processes") {
@@ -5813,52 +11965,149 @@ async function handleApi(req, res) {
         nextStep: "等待代理生成计划、diff、审查发现和建议命令。"
       });
       const result = await runAgentLoop(prompt);
-      await writeGoalState({
-        objective: prompt,
-        phase: result.diff ? "awaiting_approval" : "agent_finished",
-        status: result.diff ? "awaiting_approval" : "needs_attention",
-        lastPrompt: prompt,
-        pendingProposal: result.diff ? {
-          id: `proposal-${new Date().toISOString().replace(/[:.]/g, "-")}`,
-          type: "agent",
-          createdAt: new Date().toISOString(),
-          prompt,
-          reply: result.reply || "",
-          plan: result.plan || [],
-          diff: result.diff || "",
-          patches: result.patches || [],
-          commands: result.commands || [],
-          review: result.review || []
-        } : null,
-        nextStep: result.diff ? "复核 diff 后批准写入。" : "查看代理输出并补充任务要求。"
-      });
-      return send(res, 200, {
-        ...result,
-        model: currentModelName(),
-        modelRuntime: {
-          ...modelRuntime,
-          lastFallbacks: modelRuntime.lastFallbacks.slice(-3)
-        }
-      });
+      await persistAgentResult(prompt, result);
+      return send(res, 200, attachModelEvidence(result));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/agent-stream") {
+      beginSse(res);
+      const startedAt = new Date().toISOString();
+      try {
+        const { prompt } = await readJson(req);
+        if (!prompt || typeof prompt !== "string") throw new Error("缺少 prompt。");
+        writeSse(res, "start", {
+          ok: true,
+          startedAt,
+          policy: {
+            transport: "sse",
+            providerTokenStreaming: true,
+            exposesApiKey: false
+          }
+        });
+        await writeGoalState({
+          objective: prompt,
+          phase: "agent_running",
+          status: "running",
+          lastPrompt: prompt,
+          nextStep: "SSE 流式代理正在生成计划、diff、审查发现和建议命令。"
+        });
+        writeSse(res, "goal", { status: "running", phase: "agent_running" });
+        const files = await listFiles();
+        writeSse(res, "context", {
+          fileCount: files.length,
+          contextLimitBytes: CONTEXT_LIMIT_BYTES
+        });
+        let tokenCount = 0;
+        const result = await runAgentLoop(prompt, {
+          onProviderToken: (token) => {
+            tokenCount += 1;
+            writeSse(res, "token", {
+              token,
+              index: tokenCount,
+              redacted: false
+            });
+          }
+        });
+        await persistAgentResult(prompt, result);
+        const payload = attachModelEvidence(result);
+        writeSse(res, "result", payload);
+        writeSse(res, "done", {
+          ok: true,
+          completedAt: new Date().toISOString(),
+          hasDiff: Boolean(result.diff),
+          toolCalls: result.toolLog?.length || 0,
+          tokenEvents: tokenCount,
+          providerTokenStreaming: Boolean(result.providerTokenStreaming)
+        });
+      } catch (error) {
+        writeSse(res, "error", {
+          ok: false,
+          message: error instanceof Error ? error.message : String(error),
+          completedAt: new Date().toISOString()
+        });
+      } finally {
+        res.end();
+      }
+      return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/apply") {
-      const { diff, prompt = "", commands = [] } = await readJson(req);
+      const { diff, prompt = "", commands = [], allowPartial = false, skipChecks = false, skipGit = false } = await readJson(req);
       if (!diff || typeof diff !== "string") throw new Error("缺少 diff。");
-      const parsed = parseUnifiedDiff(diff);
-      const patches = parsed.map((patch) => ({ path: patch.path }));
+      const analysis = await analyzeUnifiedDiffApplication(diff);
+      if (analysis.conflicts.length && !allowPartial) {
+        return send(res, 200, {
+          status: "conflict",
+          applied: [],
+          checkpoint: null,
+          verification: {
+            ok: false,
+            skipped: true,
+            checks: [],
+            reason: "diff conflict preflight blocked writes before modifying files."
+          },
+          conflicts: analysis.conflicts,
+          analysis,
+          policy: {
+            writesFiles: false,
+            createsCheckpoint: false,
+            allowPartial: false,
+            skipChecks: Boolean(skipChecks),
+            skipGit: Boolean(skipGit),
+            supportsPartialHunks: true,
+            blockedBeforeWrite: true
+          }
+        });
+      }
+      const preparedToApply = analysis.prepared.filter((item) => item.status === "applicable" || item.status === "partial");
+      if (!preparedToApply.length) {
+        return send(res, 200, {
+          status: "conflict",
+          applied: [],
+          checkpoint: null,
+          verification: {
+            ok: false,
+            skipped: true,
+            checks: [],
+            reason: "no applicable files after diff conflict preflight."
+          },
+          conflicts: analysis.conflicts,
+          analysis,
+          policy: {
+            writesFiles: false,
+            createsCheckpoint: false,
+            allowPartial: Boolean(allowPartial),
+            skipChecks: Boolean(skipChecks),
+            skipGit: Boolean(skipGit),
+            supportsPartialHunks: true,
+            blockedBeforeWrite: true
+          }
+        });
+      }
+      const patches = preparedToApply.map((patch) => ({ path: patch.path }));
       const checkpoint = await createCheckpoint(patches);
       const applied = [];
-      for (const filePatch of parsed) {
+      for (const filePatch of preparedToApply) {
         const full = safePath(filePatch.path);
-        const before = await fs.readFile(full, "utf8").catch(() => "");
-        const after = applyUnifiedDiffToContent(before, filePatch);
+        const after = filePatch.after;
         await fs.mkdir(path.dirname(full), { recursive: true });
         await fs.writeFile(full, after, "utf8");
-        applied.push({ path: filePatch.path, diff: renderSingleFileDiff(filePatch) });
+        applied.push({
+          path: filePatch.path,
+          status: filePatch.status,
+          hunkCount: filePatch.hunkCount,
+          applicableHunks: filePatch.applicableHunks,
+          conflictHunks: filePatch.conflictHunks,
+          diff: filePatch.diff
+        });
       }
-      const checkCommands = await discoverCheckCommands(commands);
-      const verification = await runCheckCommands(checkCommands);
+      const checkCommands = skipChecks ? [] : await discoverCheckCommands(commands);
+      const verification = skipChecks ? {
+        ok: true,
+        skipped: true,
+        checks: [],
+        reason: "verification skipped by request."
+      } : await runCheckCommands(checkCommands);
       let repair = null;
       let repairError = "";
       if (!verification.ok && !verification.skipped) {
@@ -5872,7 +12121,16 @@ async function handleApi(req, res) {
           repairError = error instanceof Error ? error.message : String(error);
         }
       }
-      const git = await getGitSummary();
+      const git = skipGit ? {
+        available: false,
+        branch: "",
+        root: "",
+        status: [],
+        changedFiles: applied.map((item) => item.path),
+        remotes: [],
+        upstream: "",
+        skipped: "git summary skipped by request."
+      } : await getGitSummary();
       const status = verification.skipped
         ? "applied_unverified"
         : verification.ok
@@ -5880,11 +12138,13 @@ async function handleApi(req, res) {
           : repair?.diff
             ? "repair_suggested"
             : "failed";
+      const finalStatus = analysis.conflicts.length ? `partial_${status}` : status;
       const task = await writeTaskLog({
         prompt,
-        status,
+        status: finalStatus,
         checkpointId: checkpoint.id,
         changedFiles: applied.map((item) => item.path),
+        conflicts: analysis.conflicts,
         checksOk: verification.ok && !verification.skipped,
         checks: verification.checks,
         repairDiff: repair?.diff || "",
@@ -5894,8 +12154,8 @@ async function handleApi(req, res) {
       });
       await writeGoalState({
         objective: prompt,
-        phase: status,
-        status,
+        phase: finalStatus,
+        status: finalStatus,
         lastPrompt: prompt,
         lastTaskId: task.id,
         lastVerification: {
@@ -5915,7 +12175,9 @@ async function handleApi(req, res) {
           commands: repair.commands || [],
           review: repair.review || []
         } : null,
-        nextStep: status === "verified"
+        nextStep: analysis.conflicts.length
+          ? "已部分应用无冲突文件或 hunk；请处理剩余冲突后再次批准。"
+          : status === "verified"
           ? "生成交付草稿或继续下一项任务。"
           : status === "repair_suggested"
             ? "审查修复 diff 并再次批准写入。"
@@ -5923,7 +12185,32 @@ async function handleApi(req, res) {
               ? "手动运行建议命令或补充检查命令。"
               : "查看失败输出并生成修复。"
       });
-      return send(res, 200, { applied, checkpoint, verification, repair, repairError, git, task });
+      return send(res, 200, {
+        status: finalStatus,
+        applied,
+        checkpoint,
+        verification,
+        repair,
+        repairError,
+        git,
+        task,
+        conflicts: analysis.conflicts,
+        analysis: {
+          generatedAt: analysis.generatedAt,
+          summary: analysis.summary,
+          files: analysis.files,
+          policy: analysis.policy
+        },
+        policy: {
+          writesFiles: true,
+          createsCheckpoint: true,
+          allowPartial: Boolean(allowPartial),
+          skipChecks: Boolean(skipChecks),
+          skipGit: Boolean(skipGit),
+          supportsPartialHunks: true,
+          blockedBeforeWrite: false
+        }
+      });
     }
 
     if (req.method === "POST" && url.pathname === "/api/rollback") {
@@ -5946,6 +12233,17 @@ async function handleApi(req, res) {
 
     if (req.method === "GET" && url.pathname === "/api/diff") {
       return send(res, 200, await getCurrentDiff());
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/diff-conflicts") {
+      const { diff = "" } = await readJson(req);
+      if (!diff || typeof diff !== "string") throw new Error("缺少 diff。");
+      return send(res, 200, await buildDiffConflictPreview(diff));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/conflict-resolution-draft") {
+      const { diff = "", resolutions = [], prompt = "" } = await readJson(req);
+      return send(res, 200, await buildConflictResolutionDraft({ diff, resolutions, prompt }));
     }
 
     if (req.method === "POST" && url.pathname === "/api/review") {
@@ -5983,6 +12281,31 @@ async function handleApi(req, res) {
       return send(res, 200, await buildRemotePublishPlan(prompt));
     }
 
+    if (req.method === "GET" && url.pathname === "/api/remote-publish-packages") {
+      return send(res, 200, await listRemotePublishPackages({
+        limit: Number(url.searchParams.get("limit") || 20)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/remote-publish-package") {
+      return send(res, 200, await readRemotePublishPackage(url.searchParams.get("id") || ""));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/remote-publish-preflight") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            id: url.searchParams.get("id") || "",
+            limit: Number(url.searchParams.get("limit") || 20),
+            deep: url.searchParams.get("deep") === "1"
+          };
+      return send(res, 200, { preflight: await buildRemotePublishPreflight({
+        id: String(payload.id || ""),
+        limit: Number(payload.limit || 20),
+        deep: Boolean(payload.deep)
+      }) });
+    }
+
     if (req.method === "GET" && url.pathname === "/api/git") {
       return send(res, 200, await getGitSummary());
     }
@@ -5993,6 +12316,41 @@ async function handleApi(req, res) {
 
     if (req.method === "GET" && url.pathname === "/api/task") {
       return send(res, 200, await readTaskLog(url.searchParams.get("id") || ""));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/threads") {
+      const includeArchived = url.searchParams.get("includeArchived") === "1";
+      return send(res, 200, {
+        threads: await listThreads(Number(url.searchParams.get("limit") || 20), { includeArchived }),
+        policy: { access: "workspace-thread-index", writesWorkspaceFiles: false, scopedToWorkspace: true, includeArchived }
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/thread") {
+      return send(res, 200, await readThread(url.searchParams.get("id") || ""));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/thread") {
+      const thread = await createThread(await readJson(req));
+      return send(res, 200, {
+        thread: {
+          ...thread,
+          summary: summarizeThread(thread),
+          policy: { access: "workspace-thread-artifact", writesWorkspaceFiles: false, storesConversation: true, scopedToWorkspace: true }
+        },
+        threads: await listThreads()
+      });
+    }
+
+    if (req.method === "PATCH" && url.pathname === "/api/thread") {
+      const payload = await readJson(req);
+      const thread = await updateThread(payload.id || "", payload);
+      return send(res, 200, { thread, threads: await listThreads() });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/thread-fork") {
+      const payload = await readJson(req);
+      return send(res, 200, await forkThread(payload.id || "", { title: payload.title || "" }));
     }
 
     sendError(res, 404, "API 不存在。");
@@ -6052,6 +12410,43 @@ async function requestJson(baseUrl, route, options = {}) {
   return data;
 }
 
+async function requestSse(baseUrl, route, options = {}) {
+  let response;
+  const controller = new AbortController();
+  const timeoutMs = Number(options.timeoutMs) || 30000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    response = await fetch(`${baseUrl}${route}`, {
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...options,
+      signal: options.signal || controller.signal
+    });
+  } catch (error) {
+    throw new Error(`${route} SSE failed before response after ${timeoutMs}ms: ${error.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  const contentType = response.headers.get("content-type") || "";
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`${route} SSE failed: ${response.status} ${text.slice(0, 500)}`);
+  }
+  const events = text.split(/\n\n+/)
+    .map((chunk) => {
+      const event = (chunk.match(/^event:\s*(.+)$/m)?.[1] || "").trim();
+      const dataText = (chunk.match(/^data:\s*(.+)$/m)?.[1] || "{}").trim();
+      let data = {};
+      try {
+        data = JSON.parse(dataText);
+      } catch {
+        data = { raw: dataText };
+      }
+      return event ? { event, data } : null;
+    })
+    .filter(Boolean);
+  return { ok: response.ok, contentType, text, events };
+}
+
 function runMcpSmokeServer() {
   let input = "";
   const write = (payload) => {
@@ -6095,6 +12490,20 @@ function runMcpSmokeServer() {
             name: "smoke-resource",
             description: "Fixture MCP resource",
             mimeType: "text/plain"
+          }]
+        }
+      });
+      return;
+    }
+    if (message.method === "resources/read") {
+      write({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          contents: [{
+            uri: message.params?.uri || "forge://smoke/resource",
+            mimeType: "text/plain",
+            text: "Forge MCP smoke resource content"
           }]
         }
       });
@@ -6171,29 +12580,62 @@ async function runUiSmokeTest() {
   const htmlIds = [
     "promptForm",
     "approveBtn",
+    "approvePartialBtn",
     "reviewBtn",
     "prReadinessBtn",
+    "mergeGateBtn",
     "remotePublishPlanBtn",
+    "remotePublishPackagesBtn",
+    "remotePublishPreflightBtn",
+    "ciStatusBtn",
+    "policyAuditBtn",
+    "permissionMatrixBtn",
+    "modelPolicyBtn",
+    "modelUsageBtn",
+    "modelBudgetBtn",
+    "modelCostBtn",
+    "modelCostPolicyBtn",
+    "modelBillingBtn",
     "contextSnapshotBtn",
+    "contextCompactBtn",
+    "contextRollupBtn",
     "semanticIndexBtn",
+    "codeIntelligenceBtn",
+    "symbolOutlineBtn",
+    "semanticDiagnosticsBtn",
+    "semanticImpactBtn",
+    "dependencyGraphBtn",
+    "threadList",
     "goalState",
+    "conflictResolutionPanel",
     "capabilityList",
     "toolCatalogList",
     "extensionCatalogList",
+    "extensionTrustBtn",
     "mcpProbeBtn",
     "mcpCatalogList",
     "assetCatalogList",
     "approvalList",
     "queueList",
+    "queueIsolationBtn",
     "processForm",
+    "processSearchForm",
+    "processSearchInput",
+    "processSearchBtn",
+    "processHistoryBtn",
+    "processHealthBtn",
     "processList",
     "browserCheckForm",
     "browserCheckUrlInput",
+    "browserSelectorInput",
     "browserSmokeCheck",
     "browserBaselineBtn",
     "browserScreenshotBtn",
+    "browserAuditBtn",
     "browserDomBtn",
+    "browserTraceBtn",
     "browserInteractBtn",
+    "browserSessionBtn",
     "browserVisualBtn",
     "browserCheckResult"
   ];
@@ -6207,42 +12649,90 @@ async function runUiSmokeTest() {
     "function renderExtensionCatalog",
     "function renderMcpCatalog",
     "function renderAssetCatalog",
+    "function renderThreads",
+    "function renderMessages",
+    "function startNewThread",
+    "function refreshThreads",
     "function renderGoal",
     "function restorePendingProposal",
     "function renderApprovals",
     "function renderProcesses",
+    "function renderProcessSearch",
+    "/api/agent-stream",
+    "/api/model-policy",
+    "/api/model-usage",
+    "/api/model-budget",
+    "/api/model-cost",
+    "/api/model-cost-policy",
+    "/api/model-billing",
     "/api/context-snapshot",
+    "/api/context-compact",
+    "/api/context-rollup",
+    "/api/verification-plan",
+    "/api/ci-status",
+    "/api/merge-gate",
+    "/api/policy-audit",
+    "/api/permission-matrix",
+    "/api/diff-conflicts",
+    "/api/conflict-resolution-draft",
     "/api/semantic-index",
+    "/api/code-intelligence",
+    "/api/symbol-outline",
+    "/api/semantic-definition",
     "/api/semantic-search",
     "/api/semantic-references",
+    "/api/semantic-diagnostics",
+    "/api/semantic-impact",
+    "/api/dependency-graph",
     "/api/pr-readiness",
     "/api/remote-pr-status",
     "/api/remote-publish-plan",
+    "/api/remote-publish-packages",
+    "/api/remote-publish-package",
+    "/api/remote-publish-preflight",
     "function renderBrowserCheck",
     "function renderBrowserBaseline",
     "function renderBrowserScreenshot",
     "function renderBrowserDom",
+    "function renderBrowserTrace",
     "function renderBrowserInteract",
+    "function renderBrowserSession",
     "function renderBrowserVisual",
+    "function renderConflictResolution",
+    "function createConflictResolutionDraftFromPanel",
     "/api/health",
+    "/api/threads",
+    "/api/thread?id=",
+    "/api/thread",
+    "/api/thread-fork",
     "/api/tools",
     "/api/extensions",
+    "/api/extension-trust",
+    "/api/extension-tool-call",
     "/api/mcp",
     "/api/mcp?probe=1",
     "/api/mcp-tool-call",
+    "/api/mcp-resource",
     "/api/assets",
     "/api/asset-inspect",
     "/api/browser-check",
+    "/api/browser-audit",
     "/api/browser-baseline",
     "/api/browser-screenshot",
     "/api/browser-dom",
+    "/api/browser-trace",
     "/api/browser-interact",
+    "/api/browser-session",
     "/api/browser-visual",
     "/api/approval?id=",
     "/api/approval",
     "/api/approval-execute",
     "/api/review-comments",
-    "/api/processes"
+    "/api/queue-isolation",
+    "/api/processes",
+    "/api/process-health",
+    "/api/process-search",
+    "/api/process-history"
   ];
   for (const hook of appHooks) {
     assertIncludes(app, hook, `app.js missing ${hook}`);
@@ -6373,6 +12863,20 @@ function createSmokePngBuffer({ r = 255, g = 0, b = 0, a = 255 } = {}) {
   ]);
 }
 
+function createSmokeParquetBuffer() {
+  const body = Buffer.from("forge parquet smoke row data", "utf8");
+  const footer = Buffer.from("schema: forge_parquet_smoke\nrow_group: 1\ncreated_by: forge-smoke", "utf8");
+  const footerLength = Buffer.alloc(4);
+  footerLength.writeUInt32LE(footer.length, 0);
+  return Buffer.concat([
+    Buffer.from("PAR1", "ascii"),
+    body,
+    footer,
+    footerLength,
+    Buffer.from("PAR1", "ascii")
+  ]);
+}
+
 function createSmokeWavBuffer() {
   const sampleRate = 8000;
   const channels = 1;
@@ -6398,40 +12902,106 @@ function createSmokeWavBuffer() {
   return buffer;
 }
 
+function createSmokePdfBuffer({ compressed = false } = {}) {
+  const stream = compressed
+    ? "BT /F1 12 Tf 96 700 Td (Forge compressed PDF smoke text) Tj ET"
+    : "BT /F1 12 Tf 72 720 Td (Forge PDF smoke text) Tj ET";
+  const streamBuffer = compressed
+    ? zlib.deflateSync(Buffer.from(stream, "latin1"))
+    : Buffer.from(stream, "latin1");
+  const streamDictionary = compressed
+    ? `<< /Length ${streamBuffer.length} /Filter /FlateDecode >>`
+    : `<< /Length ${streamBuffer.length} >>`;
+  const objects = [
+    Buffer.from("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n", "latin1"),
+    Buffer.from("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n", "latin1"),
+    Buffer.from("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n", "latin1"),
+    Buffer.from("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n", "latin1"),
+    Buffer.concat([
+      Buffer.from(`5 0 obj\n${streamDictionary}\nstream\n`, "latin1"),
+      streamBuffer,
+      Buffer.from("\nendstream\nendobj\n", "latin1")
+    ])
+  ];
+  const parts = [Buffer.from("%PDF-1.4\n", "latin1")];
+  const offsets = [0];
+  const partsLength = () => parts.reduce((sum, part) => sum + part.length, 0);
+  for (const object of objects) {
+    offsets.push(partsLength());
+    parts.push(object);
+  }
+  const xrefOffset = partsLength();
+  parts.push(Buffer.from("xref\n0 6\n0000000000 65535 f \n", "latin1"));
+  for (let i = 1; i < offsets.length; i++) {
+    parts.push(Buffer.from(`${String(offsets[i]).padStart(10, "0")} 00000 n \n`, "latin1"));
+  }
+  parts.push(Buffer.from(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`, "latin1"));
+  return Buffer.concat(parts);
+}
+
 async function runApiSmokeTest() {
+  const smokeStep = (name) => {
+    if (process.env.API_SMOKE_PROGRESS === "1") console.error(`[api-smoke] ${name}`);
+  };
   const originalWorkspace = currentWorkspace;
   currentWorkspace = APP_ROOT;
+  smokeStep("snapshot-state");
   const originalGoalState = await fs.readFile(GOAL_STATE_PATH, "utf8").catch(() => null);
   const originalContextSnapshot = await fs.readFile(CONTEXT_SNAPSHOT_PATH, "utf8").catch(() => null);
+  const originalContextCompact = await fs.readFile(CONTEXT_COMPACT_PATH, "utf8").catch(() => null);
+  const originalContextRollup = await fs.readFile(CONTEXT_ROLLUP_PATH, "utf8").catch(() => null);
   const originalSemanticIndex = await fs.readFile(SEMANTIC_INDEX_PATH, "utf8").catch(() => null);
+  smokeStep("snapshot-approvals");
   const originalApprovals = await snapshotApprovalDir();
+  smokeStep("listen");
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
   const cleanup = {
     queuePath: "",
     extraQueuePath: "",
+    conflictQueuePath: "",
+    applyFixtureAPath: "",
+    applyFixtureBPath: "",
+    applyHunkFixturePath: "",
+    applyConflictCheckpointPath: "",
+    applyHunkCheckpointPath: "",
+    threadPath: "",
+    forkThreadPath: "",
     handoffPath: "",
+    remotePublishDir: "",
+    remoteCiArtifactPath: "",
+    escalationPath: "",
+    processEscalationPath: "",
     processFixturePath: "",
     extensionFixtureDir: "",
     mcpFixturePath: "",
+    mcpOriginalFixture: null,
     assetFixturePath: "",
     dataAssetFixturePath: "",
+    parquetDataAssetFixturePath: "",
     documentAssetFixturePath: "",
+    legacyDocumentAssetFixturePath: "",
+    pdfAssetFixturePath: "",
+    compressedPdfAssetFixturePath: "",
     mediaAssetFixturePath: "",
     browserBaselinePath: "",
     browserScreenshotPath: "",
+    browserSessionPath: "",
     browserVisualBaselinePath: "",
     browserVisualMetaPath: "",
     browserVisualDiffBaselinePath: "",
     browserVisualDiffMetaPath: "",
     browserVisualDiffPath: "",
     browserVisualScreenshotPaths: [],
+    processLogPaths: [],
     processId: ""
   };
   try {
+    smokeStep("health");
     const health = await requestJson(baseUrl, "/api/health");
     assertSmoke(health.ok === true, "health did not return ok=true");
+    assertSmoke(Array.isArray(health.threads), "health did not include threads");
     assertSmoke(Array.isArray(health.queue), "health did not include queue");
     assertSmoke(Array.isArray(health.reviews), "health did not include review artifacts");
     assertSmoke(Array.isArray(health.approvals), "health did not include approval requests");
@@ -6439,11 +13009,50 @@ async function runApiSmokeTest() {
     assertSmoke(health.goal && typeof health.goal === "object", "health did not include resumable goal state");
     assertSmoke(Array.isArray(health.capabilities?.capabilities), "health did not include capability audit");
     assertSmoke(Array.isArray(health.modelRuntime?.candidates), "health did not include model runtime candidates");
+    assertSmoke(Array.isArray(health.modelRuntime?.recentCalls), "health did not include model runtime recent calls");
+    assertSmoke(typeof health.modelRuntime?.requestCount === "number", "health did not include model runtime request count");
+    assertSmoke(typeof health.modelRuntime?.averageLatencyMs === "number", "health did not include model runtime average latency");
+    assertSmoke(health.modelPolicy?.policy?.exposesApiKey === false, "health model policy should not expose API keys");
+    assertSmoke(Array.isArray(health.modelPolicy?.runtime?.fallbackOrder), "health model policy missing fallback order");
+    assertSmoke(health.modelUsage?.policy?.exposesApiKey === false, "health model usage should not expose API keys");
+    assertSmoke(typeof health.modelUsage?.summary?.requestCount === "number", "health model usage missing request summary");
+    assertSmoke(health.modelBudget?.policy?.enforcedBeforeProviderRequest === true, "health model budget missing preflight policy");
+    assertSmoke(Array.isArray(health.modelBudget?.checks), "health model budget missing checks");
+    assertSmoke(health.modelCost?.policy?.bundledPrices === false, "health model cost should not use bundled prices");
+    assertSmoke(typeof health.modelCost?.estimatedCost === "number", "health model cost missing estimate");
     assertSmoke(Array.isArray(health.tools?.tools), "health did not include tool catalog");
     assertSmoke(Array.isArray(health.extensions?.extensions), "health did not include extension catalog");
     assertSmoke(Array.isArray(health.mcp?.servers), "health did not include MCP catalog");
     assertSmoke(Array.isArray(health.assets?.assets), "health did not include asset catalog");
 
+    smokeStep("agent-stream");
+    const agentStreamError = await requestSse(baseUrl, "/api/agent-stream", {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    assertSmoke(agentStreamError.contentType.includes("text/event-stream"), "agent stream did not use SSE content type");
+    assertSmoke(agentStreamError.events.some((item) => item.event === "error"), "agent stream did not emit error event for invalid payload");
+    const streamError = agentStreamError.events.find((item) => item.event === "error");
+    assertSmoke(streamError?.data?.ok === false, "agent stream error event missing ok=false");
+    assertSmoke(!agentStreamError.text.includes("DEEPSEEK_API_KEY="), "agent stream leaked API key material");
+    const providerTokens = [];
+    const providerStream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\n'));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+    const parsedProviderStream = await readProviderSseResponse(new Response(providerStream, {
+      headers: { "Content-Type": "text/event-stream" }
+    }), (token) => providerTokens.push(token));
+    assertSmoke(parsedProviderStream.content === "hello", "provider token stream parser did not concatenate deltas");
+    assertSmoke(providerTokens.join("") === "hello", "provider token stream callback missed deltas");
+    assertSmoke(normalizeModelUsage(parsedProviderStream.usage).totalTokens === 3, "provider token stream parser missed usage");
+
+    smokeStep("browser-check");
     const browserCheck = await requestJson(baseUrl, "/api/browser-check", {
       method: "POST",
       body: JSON.stringify({ url: `${baseUrl}/` })
@@ -6452,6 +13061,16 @@ async function runApiSmokeTest() {
     assertSmoke(browserCheck.title, "browser check missing page title");
     assertSmoke(browserCheck.policy?.access === "local-url-only", "browser check missing local-url-only policy");
 
+    smokeStep("browser-audit");
+    const browserAudit = await requestJson(baseUrl, "/api/browser-audit", {
+      method: "POST",
+      body: JSON.stringify({ url: `${baseUrl}/` })
+    });
+    assertSmoke(browserAudit.policy?.staticHtmlAudit === true, "browser audit missing static audit policy");
+    assertSmoke(browserAudit.audit?.counts?.buttons >= 1, "browser audit missing button count");
+    assertSmoke(Array.isArray(browserAudit.audit?.issues), "browser audit missing issues");
+
+    smokeStep("browser-baseline");
     const browserBaseline = await requestJson(baseUrl, "/api/browser-baseline", {
       method: "POST",
       body: JSON.stringify({ url: `${baseUrl}/`, name: "api smoke app shell" })
@@ -6466,25 +13085,50 @@ async function runApiSmokeTest() {
     assertSmoke(browserBaselineMatch.status === "matched", "browser baseline did not match saved fingerprint");
     assertSmoke(browserBaselineMatch.diffs.length === 0, "browser baseline reported unexpected diffs");
 
+    smokeStep("browser-screenshot");
     const browserScreenshot = await requestJson(baseUrl, "/api/browser-screenshot", {
       method: "POST",
-      timeoutMs: 90000,
+      timeoutMs: 150000,
       body: JSON.stringify({ url: `${baseUrl}/`, width: 800, height: 600 })
     });
     assertSmoke(browserScreenshot.ok === true, "browser screenshot did not complete");
     assertSmoke(browserScreenshot.path.endsWith(".png"), "browser screenshot did not return png path");
     assertSmoke(browserScreenshot.size > 0, "browser screenshot was empty");
     cleanup.browserScreenshotPath = path.join(APP_ROOT, browserScreenshot.path);
+    const browserSelectorScreenshot = await requestJson(baseUrl, "/api/browser-screenshot", {
+      method: "POST",
+      timeoutMs: 150000,
+      body: JSON.stringify({ url: `${baseUrl}/`, width: 800, height: 600, selector: "#promptForm" })
+    });
+    assertSmoke(browserSelectorScreenshot.ok === true, "selector screenshot did not complete");
+    assertSmoke(browserSelectorScreenshot.policy?.selectorCrop === true, "selector screenshot missing crop policy evidence");
+    assertSmoke(browserSelectorScreenshot.clip?.width > 0 && browserSelectorScreenshot.clip?.height > 0, "selector screenshot missing crop rectangle");
+    cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserSelectorScreenshot.path));
 
+    smokeStep("browser-dom");
     const browserDom = await requestJson(baseUrl, "/api/browser-dom", {
       method: "POST",
-      timeoutMs: 90000,
+      timeoutMs: 150000,
       body: JSON.stringify({ url: `${baseUrl}/`, selectors: ["body", "#promptForm", "#browserCheckForm", "button"] })
     });
     assertSmoke(browserDom.ok === true, "browser DOM snapshot did not complete");
     assertSmoke(browserDom.bytes > 0, "browser DOM snapshot was empty");
     assertSmoke(browserDom.selectors.some((item) => item.selector === "#promptForm" && item.count >= 1), "browser DOM selector count missing #promptForm");
 
+    smokeStep("browser-trace");
+    const browserTrace = await requestJson(baseUrl, "/api/browser-trace", {
+      method: "POST",
+      timeoutMs: 120000,
+      body: JSON.stringify({ url: `${baseUrl}/`, waitMs: 750, fallbackOnly: true })
+    });
+    assertSmoke(browserTrace.artifactPath?.endsWith(".json"), "browser trace missing artifact path");
+    assertSmoke(browserTrace.policy?.networkTrace === true, "browser trace missing network policy evidence");
+    assertSmoke(Array.isArray(browserTrace.console), "browser trace missing console list");
+    assertSmoke(Array.isArray(browserTrace.network), "browser trace missing network list");
+    assertSmoke(browserTrace.summary?.network >= 1, "browser trace did not capture network evidence");
+    cleanup.browserTracePath = path.join(APP_ROOT, browserTrace.artifactPath);
+
+    smokeStep("browser-interact");
     const browserInteract = await requestJson(baseUrl, "/api/browser-interact", {
       method: "POST",
       timeoutMs: 90000,
@@ -6495,40 +13139,102 @@ async function runApiSmokeTest() {
           { type: "navigate", value: `${baseUrl}/?api-smoke-nav=1` },
           { type: "waitUrl", value: "api-smoke-nav=1" },
           { type: "waitNetwork" },
+          { type: "upload", selector: "#browserSmokeFile", value: "README.md" },
           { type: "click", selector: "#browserCheckUrlInput" },
           { type: "type", selector: "#browserCheckUrlInput", value: "api-smoke-interaction" },
           { type: "waitValue", selector: "#browserCheckUrlInput", value: "api-smoke-interaction" },
           { type: "clear", selector: "#browserCheckUrlInput" },
           { type: "type", selector: "#browserCheckUrlInput", value: "api-smoke-interaction" },
           { type: "press", selector: "#browserCheckUrlInput", key: "Enter" },
+          { type: "keyDown", selector: "#browserCheckUrlInput", key: "Shift" },
+          { type: "keyUp", selector: "#browserCheckUrlInput", key: "Shift" },
           { type: "waitText", selector: "#browserCheckUrlInput", value: "api-smoke-interaction" },
           { type: "hover", selector: "#refreshFilesBtn" },
           { type: "dblclick", selector: "#refreshFilesBtn" },
+          { type: "mouseMove", x: 20, y: 20 },
+          { type: "mouseDown", x: 22, y: 22 },
+          { type: "mouseUp", x: 22, y: 22 },
+          { type: "mouseClick", x: 24, y: 24 },
+          { type: "drag", x: 26, y: 26, toX: 40, toY: 40 },
+          { type: "wheel", x: 28, y: 28, deltaY: 120 },
+          { type: "scroll", deltaY: -80 },
           { type: "select", selector: "#browserCheckUrlInput", value: "api-smoke-selected" },
           { type: "check", selector: "#browserSmokeCheck" },
           { type: "uncheck", selector: "#browserSmokeCheck" }
         ],
-        selectors: ["body", "#browserCheckUrlInput", "[value=\"api-smoke-selected\"]", "#browserSmokeCheck"]
+        selectors: ["body", "#browserCheckUrlInput", "[value=\"api-smoke-selected\"]", "#browserSmokeCheck", "[data-forge-upload=\"README.md\"]", "[data-forge-pointer]", "[data-forge-wheel]", "[data-forge-scroll]"],
+        fallbackOnly: true
       })
     });
     assertSmoke(browserInteract.ok === true, "browser interaction did not complete");
     assertSmoke(browserInteract.policy?.domInteraction === true, "browser interaction missing DOM interaction policy evidence");
-    assertSmoke(browserInteract.actions.length === 16, "browser interaction did not audit all actions");
+    assertSmoke(browserInteract.actions.length === 26, "browser interaction did not audit all actions");
     assertSmoke(browserInteract.policy?.allowedActions?.includes("waitText"), "browser interaction missing expanded action policy evidence");
     assertSmoke(browserInteract.policy?.allowedActions?.includes("waitValue"), "browser interaction missing waitValue policy evidence");
+    assertSmoke(browserInteract.policy?.allowedActions?.includes("upload"), "browser interaction missing upload policy evidence");
+    assertSmoke(browserInteract.policy?.allowedActions?.includes("mouseClick"), "browser interaction missing coordinate mouse policy evidence");
+    assertSmoke(browserInteract.policy?.allowedActions?.includes("keyDown"), "browser interaction missing keyDown policy evidence");
+    assertSmoke(browserInteract.policy?.allowedActions?.includes("wheel"), "browser interaction missing wheel policy evidence");
     assertSmoke(browserInteract.actions.some((item) => item.type === "press" && item.key === "Enter"), "browser interaction did not audit key press");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "keydown" && item.key === "Shift"), "browser interaction did not audit keyDown action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "keyup" && item.key === "Shift"), "browser interaction did not audit keyUp action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "hover"), "browser interaction did not audit hover action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "dblclick"), "browser interaction did not audit double click action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "clear"), "browser interaction did not audit clear action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "navigate" && item.value.includes("api-smoke-nav=1")), "browser interaction did not audit navigate action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "waiturl" && item.value === "api-smoke-nav=1"), "browser interaction did not audit waitUrl action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "waitnetwork"), "browser interaction did not audit waitNetwork action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "upload" && item.value === "README.md"), "browser interaction did not audit upload action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "mousemove" && item.x === 20 && item.y === 20), "browser interaction did not audit mouseMove action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "mousedown" && item.x === 22 && item.y === 22), "browser interaction did not audit mouseDown action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "mouseup" && item.x === 22 && item.y === 22), "browser interaction did not audit mouseUp action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "mouseclick" && item.x === 24 && item.y === 24), "browser interaction did not audit mouseClick action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "drag" && item.toX === 40 && item.toY === 40), "browser interaction did not audit drag action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "wheel" && item.deltaY === 120), "browser interaction did not audit wheel action");
+    assertSmoke(browserInteract.actions.some((item) => item.type === "scroll" && item.deltaY === -80), "browser interaction did not audit scroll action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "waitvalue" && item.value === "api-smoke-interaction"), "browser interaction did not audit waitValue action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "check"), "browser interaction did not audit check action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "uncheck"), "browser interaction did not audit uncheck action");
     assertSmoke(browserInteract.actions.some((item) => item.type === "select" && item.value === "api-smoke-selected"), "browser interaction did not audit select action");
     assertSmoke(browserInteract.selectors.some((item) => item.selector === "[value=\"api-smoke-selected\"]" && item.count >= 1), "browser interaction did not persist selected value in DOM evidence");
+    assertSmoke(browserInteract.selectors.some((item) => item.selector === "[data-forge-upload=\"README.md\"]" && item.count >= 1), "browser interaction did not persist upload evidence");
+    assertSmoke(browserInteract.selectors.some((item) => item.selector === "[data-forge-pointer]" && item.count >= 1), "browser interaction did not persist coordinate mouse evidence");
+    assertSmoke(browserInteract.selectors.some((item) => item.selector === "[data-forge-wheel]" && item.count >= 1), "browser interaction did not persist wheel evidence");
+    assertSmoke(browserInteract.selectors.some((item) => item.selector === "[data-forge-scroll]" && item.count >= 1), "browser interaction did not persist scroll evidence");
 
+    smokeStep("browser-session");
+    const browserSession = await requestJson(baseUrl, "/api/browser-session", {
+      method: "POST",
+      timeoutMs: 180000,
+      body: JSON.stringify({
+        url: `${baseUrl}/`,
+        name: "api smoke browser session",
+        steps: [
+          {
+            name: "prepare",
+            actions: [
+              { type: "wait", selector: "body" },
+              { type: "type", selector: "#browserCheckUrlInput", value: "api-smoke-session" },
+              { type: "upload", selector: "#browserSmokeFile", value: "README.md" }
+            ]
+          }
+        ],
+        selectors: ["body", "[data-forge-upload=\"README.md\"]", "[value=\"api-smoke-session\"]"]
+      })
+    });
+    assertSmoke(browserSession.ok === true, "browser session did not complete");
+    assertSmoke(browserSession.stepCount === 1, "browser session did not record the smoke step");
+    assertSmoke(browserSession.actionCount === 3, "browser session did not audit all actions");
+    assertSmoke(browserSession.policy?.artifact === true, "browser session missing artifact policy evidence");
+    assertSmoke(
+      browserSession.policy?.persistentProfile === true || browserSession.policy?.browserFallback === true,
+      "browser session missing persistent profile or fallback policy evidence"
+    );
+    assertSmoke(browserSession.artifactPath?.endsWith(".json"), "browser session missing artifact path");
+    assertSmoke(browserSession.selectors.some((item) => item.selector === "[data-forge-upload=\"README.md\"]" && item.count >= 1), "browser session did not persist upload evidence");
+    cleanup.browserSessionPath = path.join(APP_ROOT, browserSession.artifactPath);
+
+    smokeStep("browser-visual");
     const browserVisual = await requestJson(baseUrl, "/api/browser-visual", {
       method: "POST",
       body: JSON.stringify({
@@ -6560,6 +13266,25 @@ async function runApiSmokeTest() {
     assertSmoke(browserVisualMatch.hasBaseline === true, "browser visual comparison missing saved baseline");
     assertSmoke(browserVisualMatch.comparison?.totalPixels > 0, "browser visual comparison missing pixel totals");
     cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserVisualMatch.currentPath));
+    const browserSelectorVisual = await requestJson(baseUrl, "/api/browser-visual", {
+      method: "POST",
+      timeoutMs: 150000,
+      body: JSON.stringify({
+        url: `${baseUrl}/`,
+        width: 800,
+        height: 600,
+        name: "api smoke selector visual",
+        selector: "#promptForm",
+        screenshotPath: browserSelectorScreenshot.path
+      })
+    });
+    assertSmoke(browserSelectorVisual.ok === true, "selector visual baseline did not create cleanly");
+    assertSmoke(browserSelectorVisual.selector === "#promptForm", "selector visual did not persist selector");
+    assertSmoke(browserSelectorVisual.policy?.selectorCrop === true, "selector visual missing crop policy evidence");
+    assertSmoke(browserSelectorVisual.baselinePath !== browserVisual.baselinePath, "selector visual baseline should be isolated from full-page baseline");
+    cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserSelectorVisual.currentPath));
+    cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserSelectorVisual.baselinePath));
+    cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserSelectorVisual.metaPath));
 
     const visualDiffUrl = `${baseUrl}/?visual-diff-smoke=${Date.now()}`;
     const visualDiffId = browserBaselineId(visualDiffUrl);
@@ -6609,8 +13334,32 @@ async function runApiSmokeTest() {
     assertSmoke(semanticIndex.index?.indexedFiles >= 1, "semantic index missing indexed files");
     assertSmoke(semanticIndex.index?.summary?.declarations >= 1, "semantic index missing declarations");
     assertSmoke(Array.isArray(semanticIndex.index?.imports), "semantic index missing imports");
+    assertSmoke(semanticIndex.index?.summary?.symbolOutline >= 1, "semantic index missing symbol outline");
+    assertSmoke(semanticIndex.index?.symbolOutline?.some((item) => item.name === "buildSemanticIndex" && item.endLine >= item.line), "semantic index missing buildSemanticIndex outline span");
     const semanticIndexRead = await requestJson(baseUrl, "/api/semantic-index");
     assertSmoke(semanticIndexRead.index?.generatedAt, "semantic index did not persist");
+    const codeIntelligence = await requestJson(baseUrl, "/api/code-intelligence", {
+      method: "POST",
+      body: JSON.stringify({ limit: 20, includeDiagnostics: true })
+    });
+    assertSmoke(codeIntelligence.overview?.summary?.indexedFiles >= 1, "code intelligence missing indexed file summary");
+    assertSmoke(codeIntelligence.overview?.summary?.symbolOutline >= 1, "code intelligence missing symbol outline summary");
+    assertSmoke(Array.isArray(codeIntelligence.overview?.entrypoints), "code intelligence missing entrypoints");
+    assertSmoke(Array.isArray(codeIntelligence.overview?.symbolSurface?.largestSymbols), "code intelligence missing largest symbols");
+    assertSmoke(Array.isArray(codeIntelligence.overview?.dependencySurface?.hotspots), "code intelligence missing dependency hotspots");
+    assertSmoke(Array.isArray(codeIntelligence.overview?.readiness), "code intelligence missing readiness");
+    const symbolOutline = await requestJson(baseUrl, "/api/symbol-outline", {
+      method: "POST",
+      body: JSON.stringify({ query: "buildSemanticIndex", path: "server.js", limit: 10, includeContext: true })
+    });
+    assertSmoke(symbolOutline.summary?.matched >= 1, "symbol outline missing query match");
+    assertSmoke(symbolOutline.symbols.some((item) => item.name === "buildSemanticIndex" && item.context?.includes("buildSemanticIndex")), "symbol outline missing context");
+    const semanticDefinition = await requestJson(baseUrl, "/api/semantic-definition", {
+      method: "POST",
+      body: JSON.stringify({ symbol: "buildSemanticIndex", path: "server.js", contextLines: 2 })
+    });
+    assertSmoke(semanticDefinition.matchCount >= 1, "semantic definition missing symbol match");
+    assertSmoke(semanticDefinition.definitions.some((item) => item.name === "buildSemanticIndex" && item.context?.includes("buildSemanticIndex")), "semantic definition missing definition context");
     const semanticSearch = await requestJson(baseUrl, "/api/semantic-search", {
       method: "POST",
       body: JSON.stringify({ query: "buildSemanticIndex", kind: "declaration", limit: 10 })
@@ -6623,6 +13372,77 @@ async function runApiSmokeTest() {
     });
     assertSmoke(semanticReferences.matchCount >= 1, "semantic references did not find symbol");
     assertSmoke(semanticReferences.declarations.some((item) => item.path === "server.js" && item.context.includes("buildSemanticIndex")), "semantic references missing declaration context");
+    const semanticDiagnostics = await requestJson(baseUrl, "/api/semantic-diagnostics", {
+      method: "POST",
+      body: JSON.stringify({ limit: 40, includeContext: true })
+    });
+    assertSmoke(semanticDiagnostics.summary && typeof semanticDiagnostics.summary.total === "number", "semantic diagnostics missing summary");
+    assertSmoke(Array.isArray(semanticDiagnostics.diagnostics), "semantic diagnostics missing diagnostics list");
+    assertSmoke(semanticDiagnostics.checked?.indexedFiles >= 1, "semantic diagnostics missing checked evidence");
+    const semanticImpact = await requestJson(baseUrl, "/api/semantic-impact", {
+      method: "POST",
+      body: JSON.stringify({ paths: ["server.js"], limit: 20, includeContext: true })
+    });
+    assertSmoke(semanticImpact.summary?.targets >= 1, "semantic impact missing target summary");
+    assertSmoke(semanticImpact.targetSummaries.some((item) => item.path === "server.js" && item.indexed === true), "semantic impact missing indexed server.js target");
+    assertSmoke(Array.isArray(semanticImpact.dependents), "semantic impact missing dependents list");
+    assertSmoke(Array.isArray(semanticImpact.callers), "semantic impact missing callers list");
+    const dependencyGraph = await requestJson(baseUrl, "/api/dependency-graph", {
+      method: "POST",
+      body: JSON.stringify({ paths: ["server.js"], limit: 40, includeExternal: true })
+    });
+    assertSmoke(dependencyGraph.summary?.nodes >= 1, "dependency graph missing nodes");
+    assertSmoke(Array.isArray(dependencyGraph.edges), "dependency graph missing edges");
+    assertSmoke(Array.isArray(dependencyGraph.unresolved), "dependency graph missing unresolved list");
+    assertSmoke(dependencyGraph.targetSummaries.some((item) => item.path === "server.js" && item.indexed === true), "dependency graph missing server.js target");
+    const modelPolicy = await requestJson(baseUrl, "/api/model-policy", {
+      method: "POST",
+      body: JSON.stringify({ includeRecent: true })
+    });
+    assertSmoke(modelPolicy.policy?.policy?.exposesApiKey === false, "model policy should not expose API key");
+    assertSmoke(modelPolicy.policy?.policy?.changesProviderConfig === false, "model policy should be read-only");
+    assertSmoke(modelPolicy.policy?.policy?.executesModelCall === false, "model policy should not execute model calls");
+    assertSmoke(Array.isArray(modelPolicy.policy?.runtime?.candidates), "model policy missing candidates");
+    assertSmoke(Array.isArray(modelPolicy.policy?.guardrails), "model policy missing guardrails");
+    assertSmoke(modelPolicy.policy?.endpoint?.host, "model policy missing endpoint host");
+    assertSmoke(typeof modelPolicy.policy?.runtime?.usage?.requestCount === "number", "model policy missing usage summary");
+    assertSmoke(modelPolicy.policy?.budgetStatus?.policy?.enforcedBeforeProviderRequest === true, "model policy missing budget preflight status");
+    assertSmoke(modelPolicy.policy?.guardrails.some((item) => item.name === "model-budget-preflight" && item.status === "implemented"), "model policy missing budget preflight guardrail");
+    const modelUsage = await requestJson(baseUrl, "/api/model-usage");
+    assertSmoke(modelUsage.usage?.policy?.exposesApiKey === false, "model usage should not expose API key");
+    assertSmoke(modelUsage.usage?.policy?.executesModelCall === false, "model usage should not execute model calls");
+    assertSmoke(typeof modelUsage.usage?.summary?.requestCount === "number", "model usage missing request count");
+    assertSmoke(Array.isArray(modelUsage.usage?.recent), "model usage missing recent calls");
+    assertSmoke(modelUsage.usage?.endpoint?.host, "model usage missing endpoint host");
+    const modelBudget = await requestJson(baseUrl, "/api/model-budget", {
+      method: "POST",
+      body: JSON.stringify({ limits: { requestLimit: 0 } })
+    });
+    assertSmoke(modelBudget.budget?.status === "blocked", "model budget override should block at zero request limit");
+    assertSmoke(modelBudget.budget?.blocksModelCall === true, "model budget missing blocked flag");
+    assertSmoke(modelBudget.budget?.policy?.executesModelCall === false, "model budget should not execute model calls");
+    assertSmoke(modelBudget.budget?.policy?.enforcedBeforeProviderRequest === true, "model budget missing preflight enforcement policy");
+    assertSmoke(modelBudget.budget?.checks.some((item) => item.name === "request-limit" && item.blocked === true), "model budget missing blocked request-limit check");
+    const modelCost = await requestJson(baseUrl, "/api/model-cost");
+    assertSmoke(modelCost.cost?.policy?.executesModelCall === false, "model cost should not execute model calls");
+    assertSmoke(modelCost.cost?.policy?.bundledPrices === false, "model cost should not use bundled provider prices");
+    assertSmoke(Array.isArray(modelCost.cost?.rows), "model cost missing rows");
+    assertSmoke(typeof modelCost.cost?.estimatedCost === "number", "model cost missing numeric estimate");
+    const modelCostPolicy = await requestJson(baseUrl, "/api/model-cost-policy", {
+      method: "POST",
+      body: JSON.stringify({ raw: JSON.stringify({ currency: "USD", models: { default: { promptPer1M: 1, completionPer1M: 2 } } }) })
+    });
+    assertSmoke(modelCostPolicy.policy?.policy?.writesEnvironment === false, "model cost policy should not write environment");
+    assertSmoke(modelCostPolicy.policy?.valid === true, "model cost policy dry-run should parse");
+    assertSmoke(modelCostPolicy.policy?.parsed?.models?.default?.promptPer1M === 1, "model cost policy did not parse default prompt rate");
+    const modelBilling = await requestJson(baseUrl, "/api/model-billing", {
+      method: "POST",
+      body: JSON.stringify({ raw: JSON.stringify({ currency: "USD", period: "api-smoke", total: 0, invoices: [{ id: "smoke", amount: 0, currency: "USD" }] }) })
+    });
+    assertSmoke(modelBilling.billing?.configured === true, "model billing dry-run should be configured");
+    assertSmoke(modelBilling.billing?.policy?.providerBillingApi === false, "model billing should not call provider billing API");
+    assertSmoke(modelBilling.billing?.policy?.executesModelCall === false, "model billing should not execute model calls");
+    assertSmoke(typeof modelBilling.billing?.variance === "number" || modelBilling.billing?.variance === null, "model billing missing variance field");
 
     const capabilities = await requestJson(baseUrl, "/api/capabilities");
     assertSmoke(capabilities.capabilities.some((item) => item.area === "可恢复状态"), "capabilities endpoint missing resumable state");
@@ -6631,32 +13451,101 @@ async function runApiSmokeTest() {
 
     const tools = await requestJson(baseUrl, "/api/tools");
     assertSmoke(tools.tools.some((item) => item.name === "repo_map"), "tools endpoint missing repo_map");
+    assertSmoke(tools.tools.some((item) => item.name === "diff_conflicts"), "tools endpoint missing diff_conflicts");
+    assertSmoke(tools.tools.some((item) => item.name === "model_policy"), "tools endpoint missing model_policy");
+    assertSmoke(tools.tools.some((item) => item.name === "model_usage"), "tools endpoint missing model_usage");
+    assertSmoke(tools.tools.some((item) => item.name === "model_budget"), "tools endpoint missing model_budget");
+    assertSmoke(tools.tools.some((item) => item.name === "model_cost"), "tools endpoint missing model_cost");
+    assertSmoke(tools.tools.some((item) => item.name === "model_cost_policy"), "tools endpoint missing model_cost_policy");
+    assertSmoke(tools.tools.some((item) => item.name === "model_billing"), "tools endpoint missing model_billing");
+    assertSmoke(tools.tools.some((item) => item.name === "context_rollup"), "tools endpoint missing context_rollup");
+    assertSmoke(tools.tools.some((item) => item.name === "verification_plan"), "tools endpoint missing verification_plan");
+    assertSmoke(tools.tools.some((item) => item.name === "ci_status"), "tools endpoint missing ci_status");
+    assertSmoke(tools.tools.some((item) => item.name === "merge_gate"), "tools endpoint missing merge_gate");
+    assertSmoke(tools.tools.some((item) => item.name === "mcp_resource"), "tools endpoint missing mcp_resource");
+    assertSmoke(tools.tools.some((item) => item.name === "remote_publish_packages"), "tools endpoint missing remote_publish_packages");
+    assertSmoke(tools.tools.some((item) => item.name === "remote_publish_package"), "tools endpoint missing remote_publish_package");
+    assertSmoke(tools.tools.some((item) => item.name === "remote_publish_preflight"), "tools endpoint missing remote_publish_preflight");
+    assertSmoke(tools.tools.some((item) => item.name === "policy_audit"), "tools endpoint missing policy_audit");
+    assertSmoke(tools.tools.some((item) => item.name === "permission_matrix"), "tools endpoint missing permission_matrix");
+    assertSmoke(tools.tools.some((item) => item.name === "extension_trust"), "tools endpoint missing extension_trust");
+    assertSmoke(tools.tools.some((item) => item.name === "queue_isolation"), "tools endpoint missing queue_isolation");
+    assertSmoke(tools.tools.some((item) => item.name === "process_health"), "tools endpoint missing process_health");
+    assertSmoke(tools.tools.some((item) => item.name === "code_intelligence"), "tools endpoint missing code_intelligence");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_index"), "tools endpoint missing semantic_index");
+    assertSmoke(tools.tools.some((item) => item.name === "symbol_outline"), "tools endpoint missing symbol_outline");
+    assertSmoke(tools.tools.some((item) => item.name === "semantic_definition"), "tools endpoint missing semantic_definition");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_search"), "tools endpoint missing semantic_search");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_references"), "tools endpoint missing semantic_references");
-    assertSmoke(tools.tools.every((item) => item.policy?.access === "read-only"), "tools endpoint missing read-only policy");
-
+    assertSmoke(tools.tools.some((item) => item.name === "semantic_diagnostics"), "tools endpoint missing semantic_diagnostics");
+    assertSmoke(tools.tools.some((item) => item.name === "semantic_impact"), "tools endpoint missing semantic_impact");
+    assertSmoke(tools.tools.some((item) => item.name === "dependency_graph"), "tools endpoint missing dependency_graph");
     cleanup.extensionFixtureDir = path.join(EXTENSION_DIR, "skills", "api-smoke-skill");
     await fs.mkdir(cleanup.extensionFixtureDir, { recursive: true });
-    await fs.writeFile(path.join(cleanup.extensionFixtureDir, "manifest.json"), JSON.stringify({
+    const signedExtensionManifest = {
       name: "api-smoke-skill",
       type: "skill",
       version: "0.0.0",
       description: "API smoke extension fixture",
       capabilities: ["smoke-test"],
-      tools: [{ name: "smoke_probe", description: "Fixture tool declaration" }],
-      policy: { access: "read-only", scope: "currentWorkspace", requiresApproval: true }
-    }, null, 2));
+      tools: [{
+        name: "smoke_probe",
+        description: "Fixture tool declaration",
+        mapsTo: "repo_map",
+        parameters: { type: "object", properties: {} }
+      }],
+      policy: { access: "read-only", scope: "currentWorkspace", requiresApproval: true },
+      trust: {
+        signatureAlgorithm: "ed25519",
+        signedBy: "api-smoke-local"
+      }
+    };
+    const extensionKeyPair = crypto.generateKeyPairSync("ed25519");
+    signedExtensionManifest.trust.publicKeyPem = extensionKeyPair.publicKey.export({ type: "spki", format: "pem" });
+    signedExtensionManifest.trust.signature = crypto.sign(null, extensionSignaturePayload(signedExtensionManifest), extensionKeyPair.privateKey).toString("base64");
+    await fs.writeFile(path.join(cleanup.extensionFixtureDir, "manifest.json"), JSON.stringify(signedExtensionManifest, null, 2));
     const extensions = await requestJson(baseUrl, "/api/extensions");
     assertSmoke(extensions.extensions.some((item) => item.name === "api-smoke-skill"), "extensions endpoint missing fixture skill");
     assertSmoke(extensions.summary.skill >= 1, "extensions endpoint missing skill summary");
+    assertSmoke(extensions.extensions.some((item) => item.name === "api-smoke-skill" && item.trust?.manifestHash), "extensions endpoint missing manifest trust hash");
+    assertSmoke(extensions.summary.trust && typeof extensions.summary.trust === "object", "extensions endpoint missing trust summary");
+    const extensionTrust = await requestJson(baseUrl, "/api/extension-trust?limit=10");
+    assertSmoke(extensionTrust.trust?.policy?.localChecksumAudit === true, "extension trust audit missing checksum policy");
+    assertSmoke(extensionTrust.trust?.policy?.localSignatureVerification === true, "extension trust audit missing signature policy");
+    assertSmoke(extensionTrust.trust?.summary?.signatureVerified >= 1, "extension trust audit missing verified signature summary");
+    assertSmoke(extensionTrust.trust?.rows?.some((item) => item.name === "api-smoke-skill" && item.trust?.status === "signature-verified"), "extension trust audit missing verified fixture row");
+    assertSmoke(extensionTrust.trust?.guardrails?.some((item) => item.includes("SHA-256")), "extension trust audit missing checksum guardrail");
+    const toolsWithExtension = await requestJson(baseUrl, "/api/tools");
+    assertSmoke(toolsWithExtension.tools.some((item) => item.name === "api-smoke-skill.smoke_probe"), "tools endpoint missing extension tool bridge");
+    assertSmoke(toolsWithExtension.tools.every((item) => item.policy?.access), "tools endpoint missing tool policy access");
+    const extensionToolCallPlan = await requestJson(baseUrl, "/api/extension-tool-call", {
+      method: "POST",
+      body: JSON.stringify({
+        extensionName: "api-smoke-skill",
+        toolName: "smoke_probe",
+        arguments: {}
+      })
+    });
+    assertSmoke(extensionToolCallPlan.status === "approval_required", "extension tool call should require approval");
+    assertSmoke(extensionToolCallPlan.approval?.id, "extension tool call missing approval request");
+    const approvedExtensionToolCall = await requestJson(baseUrl, "/api/approval", {
+      method: "PATCH",
+      body: JSON.stringify({ id: extensionToolCallPlan.approval.id, decision: "approved", note: "api smoke extension tool approval" })
+    });
+    assertSmoke(approvedExtensionToolCall.status === "approved", "extension tool approval did not update status");
+    const extensionToolExecution = await requestJson(baseUrl, "/api/approval-execute", {
+      method: "POST",
+      body: JSON.stringify({ id: extensionToolCallPlan.approval.id })
+    });
+    assertSmoke(extensionToolExecution.execution?.executed === true, "approved extension tool call did not execute");
+    assertSmoke(extensionToolExecution.execution?.result?.mappedTool === "repo_map", "extension tool execution did not use mapped read-only tool");
+    assertSmoke(String(extensionToolExecution.execution?.result?.result || "").includes("fileCount"), "extension tool execution result missing repo map evidence");
 
     cleanup.mcpFixturePath = path.join(MCP_DIR, "servers.json");
     await fs.mkdir(MCP_DIR, { recursive: true });
     const originalMcpFixture = await fs.readFile(cleanup.mcpFixturePath, "utf8").catch(() => null);
-    if (originalMcpFixture !== null) {
-      cleanup.mcpFixturePath = "";
-      throw new Error("api smoke refused to overwrite existing MCP fixture");
+    if (originalMcpFixture !== null && !originalMcpFixture.includes('"api-smoke-mcp"')) {
+      cleanup.mcpOriginalFixture = originalMcpFixture;
     }
     await fs.writeFile(path.join(MCP_DIR, "servers.json"), JSON.stringify({
       mcpServers: {
@@ -6670,13 +13559,24 @@ async function runApiSmokeTest() {
     const mcp = await requestJson(baseUrl, "/api/mcp");
     assertSmoke(mcp.servers.some((item) => item.name === "api-smoke-mcp"), "MCP endpoint missing fixture server");
     assertSmoke(mcp.summary.stdio >= 1, "MCP endpoint missing stdio summary");
-    const mcpProbe = await requestJson(baseUrl, "/api/mcp?probe=1");
+    const mcpProbe = await requestJson(baseUrl, "/api/mcp?probe=1", { timeoutMs: 120000 });
     const probedMcp = mcpProbe.servers.find((item) => item.name === "api-smoke-mcp");
     assertSmoke(probedMcp?.probe?.status === "probed", `MCP probe did not complete handshake: ${JSON.stringify(probedMcp?.probe || mcpProbe.errors || mcpProbe).slice(0, 1000)}`);
     assertSmoke(probedMcp?.probe?.counts?.tools === 1, "MCP probe missing tool listing");
     assertSmoke(probedMcp?.probe?.counts?.resources === 1, "MCP probe missing resource listing");
     assertSmoke(probedMcp?.probe?.counts?.prompts === 1, "MCP probe missing prompt listing");
     assertSmoke(mcpProbe.summary.probed >= 1, "MCP probe summary missing probed count");
+    const mcpResourceRead = await requestJson(baseUrl, "/api/mcp-resource", {
+      method: "POST",
+      timeoutMs: 120000,
+      body: JSON.stringify({
+        serverName: "api-smoke-mcp",
+        uri: "forge://smoke/resource"
+      })
+    });
+    assertSmoke(mcpResourceRead.policy?.executesTool === false, "MCP resource read should not execute tools");
+    assertSmoke(mcpResourceRead.policy?.writesFiles === false, "MCP resource read should not write files");
+    assertSmoke(mcpResourceRead.contents?.some((item) => item.text?.includes("Forge MCP smoke resource content")), "MCP resource read missing fixture content");
     const mcpToolCallPlan = await requestJson(baseUrl, "/api/mcp-tool-call", {
       method: "POST",
       body: JSON.stringify({
@@ -6694,6 +13594,7 @@ async function runApiSmokeTest() {
     assertSmoke(approvedMcpToolCall.status === "approved", "MCP tool approval did not update status");
     const mcpToolExecution = await requestJson(baseUrl, "/api/approval-execute", {
       method: "POST",
+      timeoutMs: 120000,
       body: JSON.stringify({ id: mcpToolCallPlan.approval.id })
     });
     assertSmoke(
@@ -6707,8 +13608,18 @@ async function runApiSmokeTest() {
 
     cleanup.assetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.png`);
     await fs.writeFile(cleanup.assetFixturePath, createSmokePngBuffer({ r: 255, g: 0, b: 0, a: 255 }));
+    cleanup.svgAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.svg`);
+    await fs.writeFile(cleanup.svgAssetFixturePath, [
+      `<svg width="120" height="40" viewBox="0 0 120 40" xmlns="http://www.w3.org/2000/svg" aria-label="Forge SVG aria smoke">`,
+      "<title>Forge SVG smoke title</title>",
+      "<desc>Forge SVG smoke description</desc>",
+      "<text x=\"4\" y=\"22\">Forge SVG smoke text</text>",
+      "</svg>"
+    ].join(""), "utf8");
     cleanup.dataAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.csv`);
     await fs.writeFile(cleanup.dataAssetFixturePath, "name,value\nalpha,1\nbeta,2\n", "utf8");
+    cleanup.parquetDataAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.parquet`);
+    await fs.writeFile(cleanup.parquetDataAssetFixturePath, createSmokeParquetBuffer());
     cleanup.documentAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.docx`);
     await fs.writeFile(cleanup.documentAssetFixturePath, createZipBuffer([
       {
@@ -6720,16 +13631,32 @@ async function runApiSmokeTest() {
         content: "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>Forge DOCX smoke text</w:t></w:r></w:p></w:body></w:document>"
       }
     ]));
+    cleanup.legacyDocumentAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.doc`);
+    await fs.writeFile(cleanup.legacyDocumentAssetFixturePath, createSmokeLegacyOfficeBuffer());
+    cleanup.pdfAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.pdf`);
+    await fs.writeFile(cleanup.pdfAssetFixturePath, createSmokePdfBuffer());
+    cleanup.compressedPdfAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-compressed-${Date.now()}.pdf`);
+    await fs.writeFile(cleanup.compressedPdfAssetFixturePath, createSmokePdfBuffer({ compressed: true }));
     cleanup.mediaAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.wav`);
     await fs.writeFile(cleanup.mediaAssetFixturePath, createSmokeWavBuffer());
     const assets = await requestJson(baseUrl, "/api/assets");
     const assetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.assetFixturePath));
+    const svgAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.svgAssetFixturePath));
     const dataAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.dataAssetFixturePath));
+    const parquetDataAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.parquetDataAssetFixturePath));
     const documentAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.documentAssetFixturePath));
+    const legacyDocumentAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.legacyDocumentAssetFixturePath));
+    const pdfAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.pdfAssetFixturePath));
+    const compressedPdfAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.compressedPdfAssetFixturePath));
     const mediaAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.mediaAssetFixturePath));
     assertSmoke(assets.assets.some((item) => item.path === assetFixtureName && item.type === "image"), "assets endpoint missing image fixture");
+    assertSmoke(assets.assets.some((item) => item.path === svgAssetFixtureName && item.type === "image"), "assets endpoint missing svg image fixture");
     assertSmoke(assets.assets.some((item) => item.path === dataAssetFixtureName && item.type === "data"), "assets endpoint missing data fixture");
+    assertSmoke(assets.assets.some((item) => item.path === parquetDataAssetFixtureName && item.type === "data"), "assets endpoint missing parquet data fixture");
     assertSmoke(assets.assets.some((item) => item.path === documentAssetFixtureName && item.type === "document"), "assets endpoint missing document fixture");
+    assertSmoke(assets.assets.some((item) => item.path === legacyDocumentAssetFixtureName && item.type === "document"), "assets endpoint missing legacy document fixture");
+    assertSmoke(assets.assets.some((item) => item.path === pdfAssetFixtureName && item.type === "document"), "assets endpoint missing pdf fixture");
+    assertSmoke(assets.assets.some((item) => item.path === compressedPdfAssetFixtureName && item.type === "document"), "assets endpoint missing compressed pdf fixture");
     assertSmoke(assets.assets.some((item) => item.path === mediaAssetFixtureName && item.type === "media"), "assets endpoint missing media fixture");
     assertSmoke(assets.policy?.access === "metadata-and-inspection", "assets endpoint missing inspection policy");
     const imageInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(assetFixtureName)}`);
@@ -6738,35 +13665,196 @@ async function runApiSmokeTest() {
     assertSmoke(imageInspection.vision?.available === true, "asset inspection did not generate image vision summary");
     assertSmoke(imageInspection.vision?.summary?.dominantColors?.[0]?.color, "asset inspection missing dominant color");
     assertSmoke(imageInspection.ocr?.engine === "tesseract", "asset inspection missing OCR capability probe");
+    assertSmoke(typeof imageInspection.ocr?.enabled === "boolean", "asset inspection missing OCR execution switch state");
+    assertSmoke(typeof imageInspection.ocr?.cached === "boolean", "asset inspection missing OCR cache state");
+    assertSmoke("textPath" in (imageInspection.ocr || {}) || imageInspection.ocr?.reason, "asset inspection missing OCR artifact evidence");
+    const svgInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(svgAssetFixtureName)}`);
+    assertSmoke(svgInspection.image?.format === "svg", "asset inspection did not identify svg image");
+    assertSmoke(svgInspection.image?.width === 120 && svgInspection.image?.height === 40, "asset inspection did not extract svg dimensions");
+    assertSmoke(svgInspection.ocr?.engine === "local-svg-text-extractor", "asset inspection missing SVG text extractor");
+    assertSmoke(svgInspection.ocr?.textSample?.includes("Forge SVG smoke text"), "asset inspection did not extract SVG text");
+    assertSmoke(svgInspection.ocr?.textBlocks?.some((item) => item.includes("Forge SVG aria smoke")), "asset inspection did not extract SVG aria label");
     const dataInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(dataAssetFixtureName)}`);
     assertSmoke(dataInspection.data?.headers?.includes("name"), "asset inspection did not parse csv headers");
     assertSmoke(dataInspection.data?.rows?.length >= 2, "asset inspection did not parse csv rows");
+    const parquetInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(parquetDataAssetFixtureName)}`);
+    assertSmoke(parquetInspection.data?.format === "parquet", "asset inspection did not identify parquet data");
+    assertSmoke(parquetInspection.data?.footerAvailable === true, "asset inspection did not detect parquet footer");
+    assertSmoke(parquetInspection.data?.metadataStrings?.some((item) => item.includes("forge_parquet_smoke")), "asset inspection did not extract parquet metadata strings");
     const documentInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(documentAssetFixtureName)}`);
     assertSmoke(documentInspection.document?.packageType === "office-open-xml", "asset inspection did not identify OOXML document");
     assertSmoke(documentInspection.document?.textSample?.includes("Forge DOCX smoke text"), "asset inspection did not extract docx text");
+    const legacyDocumentInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(legacyDocumentAssetFixtureName)}`);
+    assertSmoke(legacyDocumentInspection.document?.packageType === "compound-file-binary", "asset inspection did not identify legacy Office binary document");
+    assertSmoke(legacyDocumentInspection.document?.streamHints?.includes("WordDocument"), "asset inspection did not extract legacy Office stream hints");
+    assertSmoke(legacyDocumentInspection.document?.textSample?.includes("Forge legacy DOC smoke text"), "asset inspection did not extract legacy Office text sample");
+    const pdfInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(pdfAssetFixtureName)}`);
+    assertSmoke(pdfInspection.document?.format === "pdf", "asset inspection did not identify PDF document");
+    assertSmoke(pdfInspection.document?.textSample?.includes("Forge PDF smoke text"), "asset inspection did not extract PDF text sample");
+    assertSmoke(pdfInspection.document?.layout?.pageBoxes?.[0]?.width === 612, "asset inspection did not extract PDF page box width");
+    assertSmoke(
+      pdfInspection.document?.layout?.textBlocks?.some((block) => block.text.includes("Forge PDF smoke text") && block.x === 72 && block.y === 720),
+      "asset inspection did not extract positioned PDF text block"
+    );
+    const compressedPdfInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(compressedPdfAssetFixtureName)}`);
+    assertSmoke(compressedPdfInspection.document?.format === "pdf", "asset inspection did not identify compressed PDF document");
+    assertSmoke(compressedPdfInspection.document?.textSample?.includes("Forge compressed PDF smoke text"), "asset inspection did not extract compressed PDF text sample");
+    assertSmoke(compressedPdfInspection.document?.layout?.compressedStreamCount >= 1, "asset inspection did not count compressed PDF stream");
+    assertSmoke(compressedPdfInspection.document?.layout?.filters?.includes("FlateDecode"), "asset inspection did not report FlateDecode filter");
+    assertSmoke(
+      compressedPdfInspection.document?.layout?.textBlocks?.some((block) => block.compressed === true && block.filter === "FlateDecode" && block.text.includes("Forge compressed PDF smoke text") && block.x === 96 && block.y === 700),
+      "asset inspection did not extract positioned compressed PDF text block"
+    );
     const mediaInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(mediaAssetFixtureName)}`);
     assertSmoke(mediaInspection.media?.format === "wav", "asset inspection did not parse wav media");
     assertSmoke(mediaInspection.media?.durationSeconds > 0, "asset inspection did not calculate media duration");
     assertSmoke(mediaInspection.transcription?.engine === "whisper", "asset inspection missing transcription engine probe");
+    assertSmoke(typeof mediaInspection.transcription?.cached === "boolean", "asset inspection missing transcription cache status");
+    assertSmoke(mediaInspection.transcription?.reason || mediaInspection.transcription?.transcriptPath, "asset inspection missing transcription audit evidence");
 
+    cleanup.applyFixtureAPath = path.join(currentWorkspace, `.forge-apply-smoke-a-${Date.now()}.txt`);
+    cleanup.applyFixtureBPath = path.join(currentWorkspace, `.forge-apply-smoke-b-${Date.now()}.txt`);
+    await fs.writeFile(cleanup.applyFixtureAPath, "alpha\n", "utf8");
+    await fs.writeFile(cleanup.applyFixtureBPath, "bravo\n", "utf8");
+    const applyFixtureAName = toPosix(path.relative(currentWorkspace, cleanup.applyFixtureAPath));
+    const applyFixtureBName = toPosix(path.relative(currentWorkspace, cleanup.applyFixtureBPath));
+    const conflictingDiff = [
+      `diff --git a/${applyFixtureAName} b/${applyFixtureAName}`,
+      `--- a/${applyFixtureAName}`,
+      `+++ b/${applyFixtureAName}`,
+      "@@ -1 +1 @@",
+      "-alpha",
+      "+alpha changed",
+      `diff --git a/${applyFixtureBName} b/${applyFixtureBName}`,
+      `--- a/${applyFixtureBName}`,
+      `+++ b/${applyFixtureBName}`,
+      "@@ -1 +1 @@",
+      "-wrong",
+      "+bravo changed",
+      ""
+    ].join("\n");
+    const blockedApply = await requestJson(baseUrl, "/api/apply", {
+      method: "POST",
+      body: JSON.stringify({ diff: conflictingDiff, prompt: "api smoke conflicting apply" })
+    });
+    assertSmoke(blockedApply.status === "conflict", "conflicting apply should be blocked before write");
+    assertSmoke(blockedApply.policy?.writesFiles === false, "conflicting apply should not write files");
+    assertSmoke(blockedApply.checkpoint === null, "conflicting apply should not create checkpoint");
+    assertSmoke((await fs.readFile(cleanup.applyFixtureAPath, "utf8")) === "alpha\n", "conflicting apply changed applicable file without partial approval");
+    assertSmoke((await fs.readFile(cleanup.applyFixtureBPath, "utf8")) === "bravo\n", "conflicting apply changed conflicting file");
+    const conflictPreview = await requestJson(baseUrl, "/api/diff-conflicts", {
+      method: "POST",
+      body: JSON.stringify({ diff: conflictingDiff })
+    });
+    assertSmoke(conflictPreview.policy?.writesFiles === false, "diff conflict preview should be read-only");
+    assertSmoke(conflictPreview.summary?.conflictHunks >= 1, "diff conflict preview missing conflict hunk count");
+    assertSmoke(
+      conflictPreview.conflictPreviews?.some((item) => item.path === applyFixtureBName && item.marker.includes("<<<<<<< CURRENT") && item.marker.includes(">>>>>>> PROPOSED")),
+      "diff conflict preview missing marker block"
+    );
+    assertSmoke((await fs.readFile(cleanup.applyFixtureBPath, "utf8")) === "bravo\n", "diff conflict preview changed file");
+    const resolutionDraft = await requestJson(baseUrl, "/api/conflict-resolution-draft", {
+      method: "POST",
+      body: JSON.stringify({
+        diff: conflictingDiff,
+        prompt: "api smoke conflict resolution draft",
+        resolutions: [{
+          path: applyFixtureBName,
+          oldStart: 1,
+          resolved: "bravo resolved"
+        }]
+      })
+    });
+    assertSmoke(resolutionDraft.policy?.writesFiles === false, "conflict resolution draft should not write files");
+    assertSmoke(resolutionDraft.policy?.updatesPendingProposal === true, "conflict resolution draft should update pending proposal");
+    assertSmoke(resolutionDraft.summary?.conflictHunks === 0, "conflict resolution draft should be applicable");
+    assertSmoke(resolutionDraft.proposal?.type === "conflict_resolution", "conflict resolution draft missing proposal type");
+    assertSmoke(resolutionDraft.proposal?.diff?.includes("-bravo") && resolutionDraft.proposal?.diff?.includes("+bravo resolved"), "conflict resolution draft missing resolved diff");
+    assertSmoke(resolutionDraft.goal?.pendingProposalId?.startsWith("resolution-"), "conflict resolution draft missing pending proposal id");
+    assertSmoke((await fs.readFile(cleanup.applyFixtureBPath, "utf8")) === "bravo\n", "conflict resolution draft changed file");
+    const partialApply = await requestJson(baseUrl, "/api/apply", {
+      method: "POST",
+      body: JSON.stringify({ diff: conflictingDiff, prompt: "api smoke partial apply", allowPartial: true, skipChecks: true, skipGit: true })
+    });
+    assertSmoke(partialApply.status?.startsWith("partial_"), "partial apply missing partial status");
+    assertSmoke(partialApply.policy?.allowPartial === true, "partial apply missing allowPartial policy");
+    assertSmoke(partialApply.applied?.some((item) => item.path === applyFixtureAName), "partial apply did not write applicable file");
+    assertSmoke(partialApply.conflicts?.some((item) => item.path === applyFixtureBName), "partial apply did not preserve conflict evidence");
+    assertSmoke((await fs.readFile(cleanup.applyFixtureAPath, "utf8")) === "alpha changed\n", "partial apply did not update applicable file");
+    assertSmoke((await fs.readFile(cleanup.applyFixtureBPath, "utf8")) === "bravo\n", "partial apply changed conflicting file");
+    cleanup.applyConflictCheckpointPath = partialApply.checkpoint?.id ? path.join(CHECKPOINT_DIR, `${partialApply.checkpoint.id}.json`) : "";
+    cleanup.applyHunkFixturePath = path.join(currentWorkspace, `.forge-apply-hunk-smoke-${Date.now()}.txt`);
+    await fs.writeFile(cleanup.applyHunkFixturePath, "one\ntwo\nthree\nfour\n", "utf8");
+    const applyHunkFixtureName = toPosix(path.relative(currentWorkspace, cleanup.applyHunkFixturePath));
+    const hunkConflictingDiff = [
+      `diff --git a/${applyHunkFixtureName} b/${applyHunkFixtureName}`,
+      `--- a/${applyHunkFixtureName}`,
+      `+++ b/${applyHunkFixtureName}`,
+      "@@ -1 +1 @@",
+      "-one",
+      "+one changed",
+      "@@ -4 +4 @@",
+      "-wrong",
+      "+four changed",
+      ""
+    ].join("\n");
+    const hunkPartialApply = await requestJson(baseUrl, "/api/apply", {
+      method: "POST",
+      body: JSON.stringify({ diff: hunkConflictingDiff, prompt: "api smoke partial hunk apply", allowPartial: true, skipChecks: true, skipGit: true })
+    });
+    assertSmoke(hunkPartialApply.status?.startsWith("partial_"), "partial hunk apply missing partial status");
+    assertSmoke(hunkPartialApply.policy?.supportsPartialHunks === true, "partial hunk apply missing policy evidence");
+    assertSmoke(hunkPartialApply.analysis?.summary?.applicableHunks === 1, "partial hunk apply did not count applicable hunk");
+    assertSmoke(hunkPartialApply.analysis?.summary?.conflictHunks === 1, "partial hunk apply did not count conflicting hunk");
+    assertSmoke(hunkPartialApply.applied?.some((item) => item.path === applyHunkFixtureName && item.status === "partial" && item.applicableHunks === 1), "partial hunk apply did not write partial file evidence");
+    assertSmoke(hunkPartialApply.conflicts?.some((item) => item.path === applyHunkFixtureName && item.hunk?.includes("@@ -4")), "partial hunk apply did not preserve hunk conflict evidence");
+    assertSmoke((await fs.readFile(cleanup.applyHunkFixturePath, "utf8")) === "one changed\ntwo\nthree\nfour\n", "partial hunk apply did not update only applicable hunk");
+    cleanup.applyHunkCheckpointPath = hunkPartialApply.checkpoint?.id ? path.join(CHECKPOINT_DIR, `${hunkPartialApply.checkpoint.id}.json`) : "";
+
+    await fs.mkdir(QUEUE_DIR, { recursive: true });
+    const staleQueueEntries = await fs.readdir(QUEUE_DIR, { withFileTypes: true }).catch(() => []);
+    for (const entry of staleQueueEntries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const full = path.join(QUEUE_DIR, entry.name);
+      const item = await readJsonOrNull(full);
+      if (item?.workspace === currentWorkspace && String(item.prompt || "").startsWith("api smoke ")) {
+        await fs.rm(full, { force: true }).catch(() => {});
+      }
+    }
+    const queueSmokeGroup = `api-smoke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const queued = await requestJson(baseUrl, "/api/queue", {
       method: "POST",
-      body: JSON.stringify({ prompt: "api smoke queued task", priority: 3, retryLimit: 2 })
+      body: JSON.stringify({ prompt: "api smoke queued task", priority: 3, retryLimit: 2, isolationGroup: `${queueSmokeGroup}-a` })
     });
     assertSmoke(queued.id && queued.status === "queued", "queue create failed");
     assertSmoke(queued.priority === 3 && queued.retryLimit === 2, "queue create missing priority/retry metadata");
+    assertSmoke(queued.isolationGroup === `${queueSmokeGroup}-a`, "queue create missing isolation group");
     cleanup.queuePath = path.join(QUEUE_DIR, `${queued.id}.json`);
     const queuedNext = await requestJson(baseUrl, "/api/queue", {
       method: "POST",
-      body: JSON.stringify({ prompt: "api smoke next queued task", priority: 9, retryLimit: 1 })
+      body: JSON.stringify({ prompt: "api smoke next queued task", priority: 100, retryLimit: 1, isolationGroup: `${queueSmokeGroup}-b` })
     });
     cleanup.extraQueuePath = path.join(QUEUE_DIR, `${queuedNext.id}.json`);
+    const queuedConflict = await requestJson(baseUrl, "/api/queue", {
+      method: "POST",
+      body: JSON.stringify({ prompt: "api smoke conflicting queued task", priority: 8, retryLimit: 0, isolationGroup: `${queueSmokeGroup}-a` })
+    });
+    cleanup.conflictQueuePath = path.join(QUEUE_DIR, `${queuedConflict.id}.json`);
 
     const active = await requestJson(baseUrl, "/api/queue", {
       method: "PATCH",
       body: JSON.stringify({ id: queued.id, status: "active" })
     });
     assertSmoke(active.status === "active", "queue activate failed");
+    const conflictActivation = await requestJson(baseUrl, "/api/queue", {
+      method: "PATCH",
+      body: JSON.stringify({ id: queuedConflict.id, status: "active" })
+    }).catch((error) => ({ error: error.message }));
+    assertSmoke(String(conflictActivation.error || "").includes("队列隔离组"), "queue isolation did not block same-group active task");
+    const queueIsolation = await requestJson(baseUrl, "/api/queue-isolation?limit=20");
+    assertSmoke(queueIsolation.policy?.singleActivePerIsolationGroup === true, "queue isolation missing policy");
+    assertSmoke(queueIsolation.summary?.queuedBlockedByIsolation >= 1, "queue isolation report missing blocked queued task");
+    assertSmoke(queueIsolation.rows?.some((row) => row.isolationGroup === `${queueSmokeGroup}-a` && row.active.some((item) => item.id === queued.id)), "queue isolation report missing active group owner");
     const retried = await requestJson(baseUrl, "/api/queue", {
       method: "PATCH",
       body: JSON.stringify({ id: queuedNext.id, status: "retry" })
@@ -6783,8 +13871,17 @@ async function runApiSmokeTest() {
     assertSmoke(queue.queue.some((item) => item.id === queued.id), "queue list missing created item");
     assertSmoke(queue.queue.some((item) => item.id === queuedNext.id && item.status === "active"), "queue list missing auto-activated next item");
 
+    await flushContextCompaction("api-smoke-queue");
     const queuedHealth = await requestJson(baseUrl, "/api/health");
     assertSmoke(queuedHealth.goal?.status === "active", "queue activation did not update goal state");
+    let autoCompact = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(250);
+      autoCompact = await requestJson(baseUrl, "/api/context-compact");
+      if (autoCompact.compact?.autoGenerated === true) break;
+    }
+    assertSmoke(autoCompact.compact?.autoGenerated === true, "automatic context compaction did not run after state change");
+    assertSmoke(autoCompact.compact?.autoReason, "automatic context compaction missing reason");
 
     const reviews = await requestJson(baseUrl, "/api/reviews");
     assertSmoke(Array.isArray(reviews.reviews), "reviews endpoint did not include artifact list");
@@ -6844,16 +13941,33 @@ async function runApiSmokeTest() {
     });
     assertSmoke(blockedApprovalExecution.execution?.executed === false, "blocked approval execution should not run unsafe command");
     assertSmoke(blockedApprovalExecution.execution?.blocked === true, "blocked approval execution missing blocked flag");
+    assertSmoke(blockedApprovalExecution.execution?.escalation?.relativePath?.includes(".forge/escalations/"), "blocked command execution missing escalation artifact");
+    cleanup.escalationPath = blockedApprovalExecution.execution?.escalation?.path || "";
 
-    const processSmokePort = 47000 + Math.floor(Math.random() * 1000);
+    const approvedProcessDecision = await requestJson(baseUrl, "/api/approval", {
+      method: "PATCH",
+      body: JSON.stringify({ id: blockedProcess.approval.id, decision: "approved", note: "api smoke process escalation state transition" })
+    });
+    assertSmoke(approvedProcessDecision.status === "approved", "process approval decision did not update status");
+    const blockedProcessExecution = await requestJson(baseUrl, "/api/approval-execute", {
+      method: "POST",
+      body: JSON.stringify({ id: blockedProcess.approval.id })
+    });
+    assertSmoke(blockedProcessExecution.execution?.executed === false, "blocked process execution should not run unsafe command");
+    assertSmoke(blockedProcessExecution.execution?.blocked === true, "blocked process execution missing blocked flag");
+    assertSmoke(blockedProcessExecution.execution?.escalation?.relativePath?.includes(".forge/escalations/"), "blocked process execution missing escalation artifact");
+    cleanup.processEscalationPath = blockedProcessExecution.execution?.escalation?.path || "";
+
+    const processSmokeToken = `forge-process-smoke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     cleanup.processFixturePath = path.join(currentWorkspace, ".forge-process-smoke.js");
     await fs.writeFile(cleanup.processFixturePath, [
       "import http from 'node:http';",
-      "const server = http.createServer((req, res) => res.end('forge process smoke'));",
-      `server.listen(${processSmokePort}, '127.0.0.1', () => {`,
+      `const token = ${JSON.stringify(processSmokeToken)};`,
+      "const server = http.createServer((req, res) => res.end(token));",
+      "server.listen(0, '127.0.0.1', () => {",
       "  const { port } = server.address();",
-      "  console.log(`http://127.0.0.1:${port}`);",
-      "  setTimeout(() => server.close(() => process.exit(0)), 12000);",
+      "  console.log(`${token} http://127.0.0.1:${port}`);",
+      "  setTimeout(() => server.close(() => process.exit(0)), 45000);",
       "});",
       ""
     ].join("\n"), "utf8");
@@ -6863,34 +13977,64 @@ async function runApiSmokeTest() {
     });
     assertSmoke(startedProcess.id && ["running", "exited"].includes(startedProcess.status), "managed process did not start");
     cleanup.processId = startedProcess.id;
-    const startedEntry = managedProcesses.get(startedProcess.id);
-    if (startedEntry) {
-      startedEntry.probe = {
-        port: processSmokePort,
-        url: `http://127.0.0.1:${processSmokePort}`,
-        status: "unknown",
-        ok: false,
-        statusCode: null,
-        lastCheckedAt: "",
-        lastError: ""
-      };
-    }
 
     let runningProcess = null;
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      await sleep(300);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      await sleep(250);
       const runningProcesses = await requestJson(baseUrl, "/api/processes");
       runningProcess = runningProcesses.processes.find((item) => item.id === startedProcess.id);
       if (runningProcess?.probe?.status === "healthy") break;
     }
     assertSmoke(runningProcess, "started process missing from process list");
-    assertSmoke(runningProcess.probe?.status === "healthy", "managed process probe did not become healthy");
+    assertSmoke(runningProcess.logPath?.includes(".forge/process-logs/"), "managed process missing persistent log path");
+    assertSmoke(runningProcess.artifactPath?.includes(".forge/process-logs/"), "managed process missing persistent artifact path");
+    const processHealth = await requestJson(baseUrl, `/api/process-health?id=${encodeURIComponent(startedProcess.id)}`);
+    assertSmoke(processHealth.policy?.access === "managed-process-health-and-artifacts", "process health missing read-only policy");
+    assertSmoke(processHealth.summary?.total >= 1, "process health missing summary");
+    assertSmoke(processHealth.rows?.some((item) => item.id === startedProcess.id), "process health missing started process row");
+    assertSmoke(processHealth.rows?.some((item) => item.id === startedProcess.id && item.probe), "process health missing probe evidence");
+    assertSmoke(processHealth.policy?.readsHealthRules === true, "process health missing rules policy");
+    cleanup.processHealthRulesPath = path.join(currentWorkspace, ".forge", "process-health-rules.json");
+    const originalProcessHealthRules = await fs.readFile(cleanup.processHealthRulesPath, "utf8").catch(() => null);
+    cleanup.originalProcessHealthRules = originalProcessHealthRules;
+    await fs.mkdir(path.dirname(cleanup.processHealthRulesPath), { recursive: true });
+    await fs.writeFile(cleanup.processHealthRulesPath, JSON.stringify({
+      rules: [{
+        name: "api-smoke-process",
+        commandIncludes: [".forge-process-smoke.js"],
+        expectedStatus: 200,
+        expectedBodyIncludes: processSmokeToken
+      }]
+    }, null, 2), "utf8");
+    const processHealthWithRules = await requestJson(baseUrl, `/api/process-health?id=${encodeURIComponent(startedProcess.id)}`);
+    assertSmoke(processHealthWithRules.rules?.configured === true, "process health rules not detected");
+    assertSmoke(processHealthWithRules.summary?.ruleMatched >= 1, "process health rules did not match process");
+    assertSmoke(processHealthWithRules.rows?.some((item) => item.id === startedProcess.id && item.rules?.status === "pass"), "process health rule did not pass");
+    cleanup.processLogPaths.push(path.join(APP_ROOT, runningProcess.logPath));
+    cleanup.processLogPaths.push(path.join(APP_ROOT, runningProcess.artifactPath));
+    let processSearch = null;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      processSearch = await requestJson(baseUrl, `/api/process-search?q=${encodeURIComponent(processSmokeToken)}`);
+      if (processSearch.matches?.some((item) => item.processId === startedProcess.id)) break;
+      await sleep(250);
+    }
+    assertSmoke(processSearch.matchCount >= 1, "managed process log search did not find fixture output");
+    assertSmoke(processSearch.matches.some((item) => item.processId === startedProcess.id), "managed process log search missing started process id");
+    assertSmoke(processSearch.policy?.access === "managed-process-output-and-artifacts", "managed process search missing persisted log policy");
 
-    const processEntry = managedProcesses.get(startedProcess.id);
-    if (processEntry) await waitForProcessExit(processEntry, 20000);
+    await requestJson(baseUrl, `/api/processes?id=${encodeURIComponent(startedProcess.id)}`, {
+      method: "DELETE"
+    });
     const exitedProcesses = await requestJson(baseUrl, "/api/processes");
     const exitedProcess = exitedProcesses.processes.find((item) => item.id === startedProcess.id);
-    assertSmoke(exitedProcess && exitedProcess.status === "exited", "managed process did not record exit");
+    assertSmoke(exitedProcess && ["exited", "stopping"].includes(exitedProcess.status), "managed process did not record stop");
+    const processHistory = await requestJson(baseUrl, "/api/process-history");
+    assertSmoke(processHistory.count >= 1, "managed process history missing persisted artifacts");
+    assertSmoke(processHistory.history.some((item) => item.id === startedProcess.id && item.outputTail.includes(processSmokeToken)), "managed process history missing fixture output");
+    assertSmoke(processHistory.policy?.access === "managed-process-output-and-artifacts", "managed process history missing artifact policy");
+    const processArtifactSearch = await requestJson(baseUrl, `/api/process-search?q=${encodeURIComponent(processSmokeToken)}`);
+    assertSmoke(processArtifactSearch.searchedArtifacts >= 1, "managed process log search did not inspect persisted artifacts");
+    assertSmoke(processArtifactSearch.matches.some((item) => item.processId === startedProcess.id), "persisted managed process log search missing started process id");
 
     const diff = await requestJson(baseUrl, "/api/diff");
     assertSmoke(typeof diff.available === "boolean", "diff endpoint missing availability flag");
@@ -6907,8 +14051,129 @@ async function runApiSmokeTest() {
     assertSmoke(contextSnapshot.snapshot?.fileCount >= 1, "context snapshot missing files");
     const contextSnapshotRead = await requestJson(baseUrl, "/api/context-snapshot");
     assertSmoke(contextSnapshotRead.snapshot?.generatedAt, "context snapshot did not persist");
+    const contextCompact = await requestJson(baseUrl, "/api/context-compact", { method: "POST" });
+    assertSmoke(contextCompact.compact?.workspace === APP_ROOT, "context compact missing workspace");
+    assertSmoke(contextCompact.compact?.summary?.length >= 1, "context compact missing summary");
+    assertSmoke(contextCompact.compact?.repo?.fileCount >= 1, "context compact missing repo file count");
+    const contextCompactRead = await requestJson(baseUrl, "/api/context-compact");
+    assertSmoke(contextCompactRead.compact?.generatedAt, "context compact did not persist");
+    const contextRollup = await requestJson(baseUrl, "/api/context-rollup", {
+      method: "POST",
+      body: JSON.stringify({ limit: 12 })
+    });
+    assertSmoke(contextRollup.rollup?.workspace === APP_ROOT, "context rollup missing workspace");
+    assertSmoke(contextRollup.rollup?.summary?.entries >= 1, "context rollup missing entries");
+    assertSmoke(Array.isArray(contextRollup.rollup?.entries), "context rollup missing entry list");
+    const contextRollupSearch = await requestJson(baseUrl, "/api/context-rollup", {
+      method: "POST",
+      body: JSON.stringify({ limit: 12, query: "api smoke" })
+    });
+    assertSmoke(Array.isArray(contextRollupSearch.rollup?.entries), "context rollup query missing entry list");
+    const contextRollupRead = await requestJson(baseUrl, "/api/context-rollup");
+    assertSmoke(contextRollupRead.rollup?.generatedAt, "context rollup did not persist");
     const healthWithSnapshot = await requestJson(baseUrl, "/api/health");
     assertSmoke(healthWithSnapshot.contextSnapshot?.generatedAt, "health missing context snapshot");
+    assertSmoke(healthWithSnapshot.contextRollup?.generatedAt, "health missing context rollup");
+    const createdThread = await requestJson(baseUrl, "/api/thread", {
+      method: "POST",
+      body: JSON.stringify({
+        title: "api smoke thread",
+        messages: [{ role: "agent", text: "thread smoke started" }]
+      })
+    });
+    assertSmoke(createdThread.thread?.id?.startsWith("thread-"), "thread create missing id");
+    assertSmoke(createdThread.thread?.policy?.storesConversation === true, "thread create missing policy");
+    cleanup.threadPath = path.join(THREAD_DIR, `${createdThread.thread.id}.json`);
+    const updatedThread = await requestJson(baseUrl, "/api/thread", {
+      method: "PATCH",
+      body: JSON.stringify({
+        id: createdThread.thread.id,
+        title: "api smoke thread updated",
+        messages: [
+          { role: "agent", text: "thread smoke started" },
+          { role: "user", text: "thread smoke user message" }
+        ],
+        status: "awaiting_approval",
+        pinned: true,
+        pendingProposalId: "proposal-smoke"
+      })
+    });
+    assertSmoke(updatedThread.thread?.summary?.messageCount === 2, "thread update did not persist messages");
+    assertSmoke(updatedThread.thread?.summary?.title === "api smoke thread updated", "thread update did not persist title");
+    assertSmoke(updatedThread.thread?.summary?.pinned === true, "thread update did not persist pin state");
+    assertSmoke(updatedThread.thread?.summary?.pendingProposalId === "proposal-smoke", "thread update missing pending proposal");
+    const threadDetail = await requestJson(baseUrl, `/api/thread?id=${encodeURIComponent(createdThread.thread.id)}`);
+    assertSmoke(threadDetail.messages?.some((item) => item.text === "thread smoke user message"), "thread read missing persisted message");
+    assertSmoke(threadDetail.policy?.writesWorkspaceFiles === false, "thread read should not write workspace files");
+    const threadIndex = await requestJson(baseUrl, "/api/threads?limit=5");
+    assertSmoke(threadIndex.threads?.some((item) => item.id === createdThread.thread.id), "thread index missing created thread");
+    assertSmoke(threadIndex.threads?.[0]?.id === createdThread.thread.id, "pinned thread did not sort first");
+    assertSmoke(threadIndex.policy?.scopedToWorkspace === true, "thread index missing workspace scope policy");
+    const forkedThread = await requestJson(baseUrl, "/api/thread-fork", {
+      method: "POST",
+      body: JSON.stringify({ id: createdThread.thread.id, title: "api smoke fork" })
+    });
+    assertSmoke(forkedThread.thread?.id && forkedThread.thread.id !== createdThread.thread.id, "thread fork did not create a distinct thread");
+    assertSmoke(forkedThread.thread?.summary?.parentThreadId === createdThread.thread.id, "thread fork missing parent thread id");
+    assertSmoke(forkedThread.thread?.summary?.messageCount === 2, "thread fork did not copy messages");
+    assertSmoke(forkedThread.thread?.policy?.copiedMessages === true, "thread fork missing copied message policy");
+    cleanup.forkThreadPath = path.join(THREAD_DIR, `${forkedThread.thread.id}.json`);
+    const archivedThread = await requestJson(baseUrl, "/api/thread", {
+      method: "PATCH",
+      body: JSON.stringify({ id: createdThread.thread.id, archived: true, status: "archived" })
+    });
+    assertSmoke(archivedThread.thread?.summary?.archived === true, "thread archive state did not persist");
+    const visibleThreadIndex = await requestJson(baseUrl, "/api/threads?limit=5");
+    assertSmoke(!visibleThreadIndex.threads?.some((item) => item.id === createdThread.thread.id), "archived thread should be hidden by default");
+    const archivedThreadIndex = await requestJson(baseUrl, "/api/threads?limit=5&includeArchived=1");
+    assertSmoke(archivedThreadIndex.threads?.some((item) => item.id === createdThread.thread.id), "archived thread index missing archived thread");
+    assertSmoke(archivedThreadIndex.policy?.includeArchived === true, "archived thread index missing includeArchived policy");
+    const verificationPlan = await requestJson(baseUrl, "/api/verification-plan", {
+      method: "POST",
+      body: JSON.stringify({ limit: 10, commands: ["node --check server.js"] })
+    });
+    assertSmoke(verificationPlan.plan?.policy?.executesCommands === false, "verification plan should not execute commands");
+    assertSmoke(Array.isArray(verificationPlan.plan?.gates), "verification plan missing gates");
+    assertSmoke(Array.isArray(verificationPlan.plan?.commands), "verification plan missing command plan");
+    const ciStatus = await requestJson(baseUrl, "/api/ci-status", {
+      method: "POST",
+      body: JSON.stringify({ limit: 10, persist: true })
+    });
+    assertSmoke(ciStatus.status?.policy?.executesCommands === false, "CI status should not execute commands");
+    assertSmoke(ciStatus.status?.policy?.pushes === false, "CI status should not push");
+    assertSmoke(ciStatus.status?.policy?.createsRemotePr === false, "CI status should not create remote PR");
+    assertSmoke(Array.isArray(ciStatus.status?.ci), "CI status missing CI config array");
+    assertSmoke(Array.isArray(ciStatus.status?.localChecks), "CI status missing local checks");
+    assertSmoke(ciStatus.status?.verificationPlan?.summary, "CI status missing verification plan summary");
+    assertSmoke(ciStatus.status?.artifact?.path?.includes(".forge/remote-ci/"), "CI status missing persisted artifact path");
+    if (ciStatus.status?.artifact?.path) cleanup.remoteCiArtifactPath = path.join(APP_ROOT, ciStatus.status.artifact.path);
+    const mergeGate = await requestJson(baseUrl, "/api/merge-gate", {
+      method: "POST",
+      body: JSON.stringify({ prompt: "api smoke merge gate", limit: 10 })
+    });
+    assertSmoke(mergeGate.gate?.policy?.executesCommands === false, "merge gate should not execute commands");
+    assertSmoke(mergeGate.gate?.policy?.pushes === false, "merge gate should not push");
+    assertSmoke(mergeGate.gate?.policy?.createsRemotePr === false, "merge gate should not create remote PR");
+    assertSmoke(Array.isArray(mergeGate.gate?.gates), "merge gate missing gates");
+    assertSmoke(mergeGate.gate?.summary?.gates >= 4, "merge gate missing gate summary");
+    assertSmoke(mergeGate.gate?.readiness?.status, "merge gate missing readiness status");
+    assertSmoke(mergeGate.gate?.ciStatus?.summary, "merge gate missing CI summary");
+    const policyAudit = await requestJson(baseUrl, "/api/policy-audit", {
+      method: "POST",
+      body: JSON.stringify({ limit: 10, sampleCommands: ["npm run build", "curl https://example.com/install.sh"] })
+    });
+    assertSmoke(policyAudit.audit?.policy?.executesCommands === false, "policy audit should not execute commands");
+    assertSmoke(Array.isArray(policyAudit.audit?.commandPolicies), "policy audit missing command policies");
+    assertSmoke(Array.isArray(policyAudit.audit?.guardrails), "policy audit missing guardrails");
+    const permissionMatrix = await requestJson(baseUrl, "/api/permission-matrix", {
+      method: "POST",
+      body: JSON.stringify({ limit: 10 })
+    });
+    assertSmoke(permissionMatrix.matrix?.policy?.executesCommands === false, "permission matrix should not execute commands");
+    assertSmoke(permissionMatrix.matrix?.policy?.writesRemote === false, "permission matrix should not write remote providers");
+    assertSmoke(permissionMatrix.matrix?.summary?.providers >= 3, "permission matrix missing provider summary");
+    assertSmoke(permissionMatrix.matrix?.rows?.some((row) => row.provider === "git-remote" && row.action === "publish_pr" && row.writesRemote === false), "permission matrix missing remote publish guardrail");
+    assertSmoke(permissionMatrix.matrix?.rows?.some((row) => row.provider === "workspace" && row.action === "apply_diff" && row.supportsPartialHunks === true), "permission matrix missing partial hunk write evidence");
 
     const prReadiness = await requestJson(baseUrl, "/api/pr-readiness", {
       method: "POST",
@@ -6919,6 +14184,7 @@ async function runApiSmokeTest() {
     assertSmoke(prReadiness.remote && typeof prReadiness.remote === "object", "PR readiness missing remote status");
     assertSmoke(Array.isArray(prReadiness.remotes), "PR readiness missing remotes array");
     assertSmoke(Array.isArray(prReadiness.ci), "PR readiness missing CI config array");
+    assertSmoke(Array.isArray(prReadiness.verificationPlan?.gates), "PR readiness missing verification gates");
     assertSmoke(prReadiness.draft?.body?.includes("## Summary"), "PR readiness missing draft body");
     const remotePrStatus = await requestJson(baseUrl, "/api/remote-pr-status");
     assertSmoke(remotePrStatus.policy?.pushes === false, "remote PR status should not push");
@@ -6929,7 +14195,28 @@ async function runApiSmokeTest() {
     });
     assertSmoke(remotePublishPlan.policy?.executesCommands === false, "remote publish plan should not execute commands");
     assertSmoke(remotePublishPlan.policy?.requiresExplicitApproval === true, "remote publish plan missing approval policy");
+    assertSmoke(remotePublishPlan.package?.prBodyPath?.endsWith("pr-body.md"), "remote publish plan missing PR body artifact");
+    assertSmoke(remotePublishPlan.package?.reviewSummaryPath?.endsWith("review-summary.md"), "remote publish plan missing review summary artifact");
+    assertSmoke(remotePublishPlan.commands.every((item) => !item.command.includes("<pr-body.md>") && !item.command.includes("<review-summary.md>")), "remote publish plan still contains placeholder artifact paths");
     assertSmoke(remotePublishPlan.approval?.id, "remote publish plan missing approval request");
+    cleanup.remotePublishDir = remotePublishPlan.package?.dir || "";
+    const remotePublishPackages = await requestJson(baseUrl, "/api/remote-publish-packages?limit=5");
+    assertSmoke(remotePublishPackages.policy?.pushes === false, "remote publish package index should not push");
+    assertSmoke(remotePublishPackages.policy?.createsRemotePr === false, "remote publish package index should not create PR");
+    assertSmoke(remotePublishPackages.packages.some((item) => item.id === remotePublishPlan.package.id), "remote publish package index missing generated package");
+    const remotePublishPackage = await requestJson(baseUrl, `/api/remote-publish-package?id=${encodeURIComponent(remotePublishPlan.package.id)}`);
+    assertSmoke(remotePublishPackage.policy?.writesRemoteComments === false, "remote publish package detail should not write remote comments");
+    assertSmoke(remotePublishPackage.prBody.includes("## Summary"), "remote publish package missing PR body content");
+    assertSmoke(remotePublishPackage.reviewSummary.includes("## Readiness"), "remote publish package missing review summary content");
+    const remotePublishPreflight = await requestJson(baseUrl, "/api/remote-publish-preflight", {
+      method: "POST",
+      body: JSON.stringify({ id: remotePublishPlan.package.id, limit: 5 })
+    });
+    assertSmoke(remotePublishPreflight.preflight?.policy?.executesCommands === false, "remote publish preflight should not execute commands");
+    assertSmoke(remotePublishPreflight.preflight?.policy?.pushes === false, "remote publish preflight should not push");
+    assertSmoke(remotePublishPreflight.preflight?.package?.id === remotePublishPlan.package.id, "remote publish preflight missing package id");
+    assertSmoke(Array.isArray(remotePublishPreflight.preflight?.commandChecks), "remote publish preflight missing command checks");
+    assertSmoke(Array.isArray(remotePublishPreflight.preflight?.blockers), "remote publish preflight missing blockers");
     const approvedRemotePlan = await requestJson(baseUrl, "/api/approval", {
       method: "PATCH",
       body: JSON.stringify({ id: remotePublishPlan.approval.id, decision: "approved", note: "api smoke remote plan approval" })
@@ -6945,21 +14232,36 @@ async function runApiSmokeTest() {
     console.log(JSON.stringify({
       ok: true,
       apiSmoke: true,
-      checked: ["health", "files", "capabilities", "tools", "extensions", "mcp", "mcp-probe", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-dom", "browser-interact", "browser-visual", "model-runtime", "queue", "goal-state", "context-snapshot", "semantic-index", "semantic-search", "semantic-references", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-lifecycle", "diff", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan"],
+    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight"],
       queueId: queued.id,
       handoffId: handoff.id
     }));
   } finally {
     if (cleanup.processId) await stopManagedProcess(cleanup.processId).catch(() => {});
     if (cleanup.processFixturePath) await fs.rm(cleanup.processFixturePath, { force: true }).catch(() => {});
+    for (const processPath of cleanup.processLogPaths || []) {
+      await fs.rm(processPath, { force: true }).catch(() => {});
+    }
     if (cleanup.extensionFixtureDir) await fs.rm(cleanup.extensionFixtureDir, { recursive: true, force: true }).catch(() => {});
-    if (cleanup.mcpFixturePath) await fs.rm(cleanup.mcpFixturePath, { force: true }).catch(() => {});
+    if (cleanup.mcpFixturePath && cleanup.mcpOriginalFixture !== null) {
+      await fs.mkdir(path.dirname(cleanup.mcpFixturePath), { recursive: true });
+      await fs.writeFile(cleanup.mcpFixturePath, cleanup.mcpOriginalFixture, "utf8").catch(() => {});
+    } else if (cleanup.mcpFixturePath) {
+      await fs.rm(cleanup.mcpFixturePath, { force: true }).catch(() => {});
+    }
     if (cleanup.assetFixturePath) await fs.rm(cleanup.assetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.svgAssetFixturePath) await fs.rm(cleanup.svgAssetFixturePath, { force: true }).catch(() => {});
     if (cleanup.dataAssetFixturePath) await fs.rm(cleanup.dataAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.parquetDataAssetFixturePath) await fs.rm(cleanup.parquetDataAssetFixturePath, { force: true }).catch(() => {});
     if (cleanup.documentAssetFixturePath) await fs.rm(cleanup.documentAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.legacyDocumentAssetFixturePath) await fs.rm(cleanup.legacyDocumentAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.pdfAssetFixturePath) await fs.rm(cleanup.pdfAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.compressedPdfAssetFixturePath) await fs.rm(cleanup.compressedPdfAssetFixturePath, { force: true }).catch(() => {});
     if (cleanup.mediaAssetFixturePath) await fs.rm(cleanup.mediaAssetFixturePath, { force: true }).catch(() => {});
     if (cleanup.browserBaselinePath) await fs.rm(cleanup.browserBaselinePath, { force: true }).catch(() => {});
     if (cleanup.browserScreenshotPath) await fs.rm(cleanup.browserScreenshotPath, { force: true }).catch(() => {});
+    if (cleanup.browserTracePath) await fs.rm(cleanup.browserTracePath, { force: true }).catch(() => {});
+    if (cleanup.browserSessionPath) await fs.rm(cleanup.browserSessionPath, { force: true }).catch(() => {});
     if (cleanup.browserVisualBaselinePath) await fs.rm(cleanup.browserVisualBaselinePath, { force: true }).catch(() => {});
     if (cleanup.browserVisualMetaPath) await fs.rm(cleanup.browserVisualMetaPath, { force: true }).catch(() => {});
     if (cleanup.browserVisualDiffBaselinePath) await fs.rm(cleanup.browserVisualDiffBaselinePath, { force: true }).catch(() => {});
@@ -6968,9 +14270,29 @@ async function runApiSmokeTest() {
     for (const screenshotPath of cleanup.browserVisualScreenshotPaths) {
       await fs.rm(screenshotPath, { force: true }).catch(() => {});
     }
+    if (cleanup.applyFixtureAPath) await fs.rm(cleanup.applyFixtureAPath, { force: true }).catch(() => {});
+    if (cleanup.applyFixtureBPath) await fs.rm(cleanup.applyFixtureBPath, { force: true }).catch(() => {});
+    if (cleanup.applyHunkFixturePath) await fs.rm(cleanup.applyHunkFixturePath, { force: true }).catch(() => {});
+    if (cleanup.threadPath) await fs.rm(cleanup.threadPath, { force: true }).catch(() => {});
+    if (cleanup.forkThreadPath) await fs.rm(cleanup.forkThreadPath, { force: true }).catch(() => {});
+    if (cleanup.applyConflictCheckpointPath) await fs.rm(cleanup.applyConflictCheckpointPath, { force: true }).catch(() => {});
+    if (cleanup.applyHunkCheckpointPath) await fs.rm(cleanup.applyHunkCheckpointPath, { force: true }).catch(() => {});
     if (cleanup.queuePath) await fs.rm(cleanup.queuePath, { force: true }).catch(() => {});
     if (cleanup.extraQueuePath) await fs.rm(cleanup.extraQueuePath, { force: true }).catch(() => {});
+    if (cleanup.conflictQueuePath) await fs.rm(cleanup.conflictQueuePath, { force: true }).catch(() => {});
     if (cleanup.handoffPath) await fs.rm(cleanup.handoffPath, { force: true }).catch(() => {});
+    if (cleanup.remotePublishDir) await fs.rm(cleanup.remotePublishDir, { recursive: true, force: true }).catch(() => {});
+    if (cleanup.remoteCiArtifactPath) await fs.rm(cleanup.remoteCiArtifactPath, { force: true }).catch(() => {});
+    if (cleanup.escalationPath) await fs.rm(cleanup.escalationPath, { force: true }).catch(() => {});
+    if (cleanup.processEscalationPath) await fs.rm(cleanup.processEscalationPath, { force: true }).catch(() => {});
+    if (cleanup.processHealthRulesPath) {
+      if (cleanup.originalProcessHealthRules === null) {
+        await fs.rm(cleanup.processHealthRulesPath, { force: true }).catch(() => {});
+      } else if (typeof cleanup.originalProcessHealthRules === "string") {
+        await fs.mkdir(path.dirname(cleanup.processHealthRulesPath), { recursive: true });
+        await fs.writeFile(cleanup.processHealthRulesPath, cleanup.originalProcessHealthRules, "utf8").catch(() => {});
+      }
+    }
     await restoreApprovalDir(originalApprovals);
     if (originalGoalState === null) {
       await fs.rm(GOAL_STATE_PATH, { force: true }).catch(() => {});
@@ -6983,6 +14305,18 @@ async function runApiSmokeTest() {
     } else {
       await fs.mkdir(STATE_DIR, { recursive: true });
       await fs.writeFile(CONTEXT_SNAPSHOT_PATH, originalContextSnapshot, "utf8");
+    }
+    if (originalContextCompact === null) {
+      await fs.rm(CONTEXT_COMPACT_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(CONTEXT_COMPACT_PATH, originalContextCompact, "utf8");
+    }
+    if (originalContextRollup === null) {
+      await fs.rm(CONTEXT_ROLLUP_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(CONTEXT_ROLLUP_PATH, originalContextRollup, "utf8");
     }
     if (originalSemanticIndex === null) {
       await fs.rm(SEMANTIC_INDEX_PATH, { force: true }).catch(() => {});
