@@ -8,10 +8,22 @@ import zlib from "node:zlib";
 
 const __filename = fileURLToPath(import.meta.url);
 const APP_ROOT = path.dirname(__filename);
-const DEFAULT_WORKSPACE = "D:\\cc-picture\\aaa\\coder-workspace";
+const DEFAULT_WORKSPACE = APP_ROOT;
 const INITIAL_WORKSPACE = path.resolve(process.env.FORGE_WORKSPACE || DEFAULT_WORKSPACE);
 let currentWorkspace = INITIAL_WORKSPACE;
-const PORT = Number(process.env.PORT || 4173);
+function parsePositivePort(value, fallback) {
+  const port = Number(value);
+  if (Number.isInteger(port) && port >= 1 && port <= 65535) return port;
+  return fallback;
+}
+function parseNonNegativeInteger(value, fallback) {
+  const parsed = Number(value);
+  if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  return fallback;
+}
+const PORT = parsePositivePort(process.env.FORGE_PORT || process.env.PORT, 4173);
+const PORT_AUTO_RETRY = process.env.FORGE_PORT_AUTO_RETRY !== "0";
+const PORT_RETRY_LIMIT = parseNonNegativeInteger(process.env.FORGE_PORT_RETRY_LIMIT, 50);
 const DEFAULT_MODEL = "deepseek-v4-pro";
 const MODEL_API_URL = process.env.FORGE_MODEL_API_URL || "https://api.deepseek.com/chat/completions";
 const MODEL_CANDIDATES = (process.env.FORGE_MODELS || process.env.DEEPSEEK_MODEL || DEFAULT_MODEL)
@@ -744,6 +756,7 @@ function buildModelPolicy({ includeRecent = true, usageLedger = null } = {}) {
 }
 const CONTEXT_LIMIT_BYTES = 220 * 1024;
 const MAX_FILE_BYTES = 120 * 1024;
+const MAX_PROMPT_REFERENCE_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_SEMANTIC_FILE_BYTES = 512 * 1024;
 const SEMANTIC_INDEX_ENTRYPOINTS = new Set(["server.js", "app.js", "index.html", "package.json"]);
 const MAX_AGENT_TURNS = 8;
@@ -785,14 +798,25 @@ const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".
 const DOCUMENT_EXTS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]);
 const DATA_EXTS = new Set([".csv", ".tsv", ".parquet", ".jsonl"]);
 const MEDIA_EXTS = new Set([".mp3", ".wav", ".m4a", ".mp4", ".mov", ".webm"]);
-const CHECK_SCRIPT_NAMES = ["check", "test", "lint", "build"];
+const CHECK_SCRIPT_NAMES = ["check", "typecheck", "test", "lint", "build"];
+const START_SCRIPT_NAMES = ["dev", "start", "serve", "preview"];
+const FOCUSED_API_SMOKE_CHECKS = [
+  { command: "node server.js --api-smoke-section=fast", reason: "快速 API 分段 smoke：核心、语义、模型、写入、上下文和门禁" },
+  { command: "node server.js --api-smoke-section=debug", reason: "调试 API 分段 smoke：浏览器、诊断、运行时和门禁" },
+  { command: "node server.js --api-smoke-section=integrations", reason: "集成 API 分段 smoke：扩展、MCP 和资产检查" },
+  { command: "node server.js --api-smoke-section=publish", reason: "发布 API 分段 smoke：PR readiness、发布审批和预检" }
+];
 const SAFE_COMMAND_PATTERNS = [
-  /^npm (?:run )?(?:check|test|lint|build)(?:\s+--\s*[\w:./=-]+)?$/i,
+  /^npm (?:run )?(?:check|typecheck|test|lint|build)(?:\s+--\s*[\w:./=-]+)?$/i,
+  /^npm run api-smoke:(?:fast|coding|debug|integrations|publish)(?:\s+--\s*[\w:./=-]+)?$/i,
   /^npm test(?:\s+--\s*[\w:./=-]+)?$/i,
-  /^pnpm (?:run )?(?:check|test|lint|build)(?:\s+--\s*[\w:./=-]+)?$/i,
-  /^yarn (?:run )?(?:check|test|lint|build)(?:\s+[\w:./=-]+)?$/i,
+  /^pnpm (?:run )?(?:check|typecheck|test|lint|build)(?:\s+--\s*[\w:./=-]+)?$/i,
+  /^yarn (?:run )?(?:check|typecheck|test|lint|build)(?:\s+[\w:./=-]+)?$/i,
+  /^tsc --noEmit(?: --pretty false)?$/i,
+  /^node_modules[\\\/]\.bin[\\\/]tsc(?:\.cmd)? --noEmit(?: --pretty false)?$/i,
   /^node --check [\w./\\-]+$/i,
   /^node [\w./\\-]+ --smoke-test$/i,
+  /^node [\w./\\-]+ --api-smoke-section=(?:all|fast|coding|debug|integrations|publish|core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote)(?:,(?:core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote))*$/i,
   /^node [\w./\\-]+ --mcp-smoke-server$/i
 ];
 const PROCESS_COMMAND_PATTERNS = [
@@ -1013,6 +1037,24 @@ async function listFiles(dir = currentWorkspace, base = "") {
     files.push({ path: toPosix(path.join(base, entry.name)), size: stat.size });
   }
   return files.sort((a, b) => a.path.localeCompare(b.path)).slice(0, 400);
+}
+
+async function listPromptReferenceFiles(dir = currentWorkspace, base = "") {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      files.push(...await listPromptReferenceFiles(path.join(dir, entry.name), path.join(base, entry.name)));
+      continue;
+    }
+    if (!entry.isFile() || !isTextFile(entry.name)) continue;
+    const full = path.join(dir, entry.name);
+    const stat = await fs.stat(full);
+    if (stat.size > MAX_PROMPT_REFERENCE_FILE_BYTES) continue;
+    files.push({ path: toPosix(path.join(base, entry.name)), size: stat.size });
+  }
+  return files.sort((a, b) => a.path.localeCompare(b.path)).slice(0, 5000);
 }
 
 async function listSemanticFiles(dir = currentWorkspace, base = "") {
@@ -1983,6 +2025,44 @@ async function readWorkspaceFileRange(relativePath, startLine = 1, lineCount = 1
     .slice(start - 1, start - 1 + count)
     .map((line, index) => `${String(start + index).padStart(4, " ")}: ${line}`)
     .join("\n");
+}
+
+async function readWorkspaceSourceLocationContext(location = {}, contextLines = 6) {
+  const filePath = String(location.path || location.file || "").replaceAll("\\", "/");
+  const line = Math.max(1, Number(location.line) || 1);
+  const around = Math.min(40, Math.max(0, Number(contextLines) || 6));
+  const startLine = Math.max(1, line - around);
+  const lineCount = around * 2 + 1;
+  return {
+    path: filePath,
+    line,
+    column: Math.max(0, Number(location.column) || 0),
+    startLine,
+    lineCount,
+    context: await readWorkspaceFileRange(filePath, startLine, lineCount)
+  };
+}
+
+async function readWorkspaceSourceLocationContexts(locations = [], contextLines = 6, limit = 8) {
+  const max = Math.min(20, Math.max(1, Number(limit) || 8));
+  const seen = new Set();
+  const contexts = [];
+  for (const location of Array.isArray(locations) ? locations : []) {
+    const filePath = String(location?.path || location?.file || "").replaceAll("\\", "/");
+    const line = Math.max(1, Number(location?.line) || 1);
+    const column = Math.max(0, Number(location?.column) || 0);
+    const key = `${filePath.toLowerCase()}:${line}:${column}`;
+    if (!filePath || seen.has(key) || contexts.length >= max) continue;
+    seen.add(key);
+    const item = await readWorkspaceSourceLocationContext({ path: filePath, line, column }, contextLines).catch((error) => ({
+      path: filePath,
+      line,
+      column,
+      error: error.message || String(error)
+    }));
+    contexts.push(item);
+  }
+  return contexts;
 }
 
 async function searchFiles(query, limit = 20) {
@@ -3036,6 +3116,9 @@ async function buildCodeIntelligenceOverview({ limit = 24, includeDiagnostics = 
     includeDiagnostics ? buildSemanticDiagnostics({ limit: max, includeContext: false }) : Promise.resolve({ summary: { total: 0 }, diagnostics: [] }),
     buildDependencyGraph({ limit: Math.max(max * 2, 40), includeExternal: true })
   ]);
+  const files = await listFiles();
+  const scripts = await readPackageScripts();
+  const typecheck = await discoverTypecheckCommands({ scripts, files, limit: 8 });
   const entrypoints = (index.records || [])
     .filter((record) => (record.entrypoints || []).length > 0 || (record.routes || []).some((route) => route.method !== "FETCH"))
     .map((record) => ({
@@ -3079,6 +3162,8 @@ async function buildCodeIntelligenceOverview({ limit = 24, includeDiagnostics = 
   if ((graph.summary?.unresolved || 0) > 0) readiness.push({ status: "warning", message: "存在未解析本地导入，影响依赖图和影响面判断。" });
   if ((graph.summary?.cycles || 0) > 0) readiness.push({ status: "warning", message: "依赖图存在循环组件，改动时需要更保守的验证范围。" });
   if ((apiSurface.serverRoutes || []).length > 0 && (apiSurface.clientFetches || []).length === 0) readiness.push({ status: "info", message: "服务端 API 面已发现；前端 fetch 线索较少或集中在动态调用中。" });
+  if ((typecheck.tsconfigs?.length || typecheck.hasTsFiles) && !typecheck.commands?.length) readiness.push({ status: "warning", message: "检测到 TypeScript 配置或源码，但未发现可安全运行的类型检查命令。" });
+  if (typecheck.commands?.length) readiness.push({ status: "info", message: `已发现 ${typecheck.commands.length} 条 TypeScript 类型检查候选命令，可用于修复后验证。` });
   if (readiness.length === 0) readiness.push({ status: "ok", message: "本地语义索引、依赖图和诊断结果未发现明显阻塞。" });
   return {
     generatedAt: new Date().toISOString(),
@@ -3095,7 +3180,10 @@ async function buildCodeIntelligenceOverview({ limit = 24, includeDiagnostics = 
       dependencyNodes: graph.summary?.nodes || 0,
       dependencyEdges: graph.summary?.edges || 0,
       cycles: graph.summary?.cycles || 0,
-      unresolvedImports: graph.summary?.unresolved || 0
+      unresolvedImports: graph.summary?.unresolved || 0,
+      typecheckCommands: typecheck.commands?.length || 0,
+      tsconfigs: typecheck.tsconfigs?.length || 0,
+      hasTsFiles: Boolean(typecheck.hasTsFiles)
     },
     entrypoints,
     apiSurface,
@@ -3105,6 +3193,7 @@ async function buildCodeIntelligenceOverview({ limit = 24, includeDiagnostics = 
       summary: diagnostics.summary,
       items: (diagnostics.diagnostics || []).slice(0, max)
     },
+    typecheck,
     readiness,
     policy: {
       access: "local-read-only",
@@ -3150,6 +3239,124 @@ async function collectContext() {
     chunks.push({ path: file.path, content: clipped });
   }
   return { files, contextFiles: chunks, contextBytes: total };
+}
+
+function extractPromptReferenceTokens(prompt = "") {
+  const text = String(prompt || "");
+  if (!text.includes("@")) return [];
+  const tokens = [];
+  const pattern = /(^|[\s([{"'，。；：、])@([^\s，。；：、'"`<>()\[\]{}]+)/g;
+  let match;
+  while ((match = pattern.exec(text))) {
+    const raw = match[2].replace(/[.,;:!?，。；：！？、]+$/g, "");
+    if (!raw || raw.includes("@")) continue;
+    tokens.push(toPosix(raw.replace(/^\.?[\\/]/, "")));
+  }
+  return [...new Set(tokens)].slice(0, 24);
+}
+
+function promptReferenceSuggestionScore(token = "", filePath = "") {
+  const needle = toPosix(token).toLowerCase();
+  const candidate = toPosix(filePath).toLowerCase();
+  if (!needle || !candidate) return 0;
+  if (candidate === needle) return 1000;
+  const needleBase = path.posix.basename(needle);
+  const candidateBase = path.posix.basename(candidate);
+  const orderedMatchRatio = (source = "", target = "") => {
+    let index = 0;
+    for (const char of source) {
+      const next = target.indexOf(char, index);
+      if (next === -1) continue;
+      index = next + 1;
+    }
+    return source.length ? index / target.length : 0;
+  };
+  let score = 0;
+  if (candidateBase === needleBase) score += 520;
+  if (candidate.endsWith(`/${needle}`) || candidate.endsWith(needle)) score += 420;
+  if (candidateBase.includes(needleBase)) score += 260;
+  if (candidate.includes(needle)) score += 220;
+  if (path.posix.extname(candidateBase) === path.posix.extname(needleBase)) {
+    const compactNeedle = needleBase.replace(/[^a-z0-9]/g, "");
+    const compactCandidate = candidateBase.replace(/[^a-z0-9]/g, "");
+    if (orderedMatchRatio(compactNeedle, compactCandidate) >= 0.75) score += 180;
+  }
+  const needleParts = needle.split(/[\/._-]+/).filter(Boolean);
+  const candidateParts = new Set(candidate.split(/[\/._-]+/).filter(Boolean));
+  for (const part of needleParts) {
+    if (part.length >= 2 && candidateParts.has(part)) score += 45;
+  }
+  if (candidateBase[0] && needleBase[0] && candidateBase[0] === needleBase[0]) score += 20;
+  return score;
+}
+
+function suggestPromptReferencePaths(token = "", files = []) {
+  return (files || [])
+    .map((file) => ({
+      path: toPosix(file.path || ""),
+      size: file.size,
+      score: promptReferenceSuggestionScore(token, file.path || "")
+    }))
+    .filter((item) => item.path && item.score >= 80)
+    .sort((a, b) => b.score - a.score || a.path.length - b.path.length || a.path.localeCompare(b.path))
+    .slice(0, 3);
+}
+
+function extractPromptFileReferences(prompt = "", files = []) {
+  const tokens = extractPromptReferenceTokens(prompt);
+  if (!tokens.length) return { references: [], missing: [] };
+  const references = [];
+  const seen = new Set();
+  const matchedTokens = new Set();
+  for (const file of files) {
+    const normalized = toPosix(file.path);
+    const variants = [
+      normalized,
+      normalized.replaceAll("/", "\\"),
+      `./${normalized}`
+    ];
+    const matchedToken = tokens.find((token) => variants.some((variant) => token.toLowerCase() === toPosix(variant).toLowerCase()));
+    if (!matchedToken) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    matchedTokens.add(matchedToken);
+    references.push({ path: normalized, size: file.size });
+  }
+  const missing = tokens
+    .filter((token) => !matchedTokens.has(token))
+    .map((pathValue) => ({
+      path: pathValue,
+      reason: "未在当前工作区文件列表中找到匹配文件。",
+      suggestions: suggestPromptReferencePaths(pathValue, files)
+    }))
+    .slice(0, 12);
+  return { references: references.slice(0, 12), missing };
+}
+
+async function buildPromptReferenceContext(prompt = "", files = []) {
+  const { references, missing } = extractPromptFileReferences(prompt, files);
+  const context = [];
+  let total = 0;
+  const maxBytes = 120000;
+  for (const item of references) {
+    if (total >= maxBytes) break;
+    const content = await readWorkspaceFile(item.path).catch((error) => `REFERENCE_READ_ERROR: ${error.message}`);
+    const remaining = Math.max(0, maxBytes - total);
+    const clipped = content.slice(0, remaining);
+    total += Buffer.byteLength(clipped, "utf8");
+    context.push({
+      path: item.path,
+      size: item.size,
+      content: clipped,
+      clipped: clipped.length < content.length
+    });
+  }
+  return {
+    references,
+    missing,
+    context,
+    bytes: total
+  };
 }
 
 async function buildContextSnapshot({ deep = false } = {}) {
@@ -3234,9 +3441,17 @@ async function buildContextSnapshot({ deep = false } = {}) {
 
 async function writeJsonAtomic(filePath, value) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  await fs.writeFile(tempPath, JSON.stringify(value, null, 2), "utf8");
-  await fs.rename(tempPath, filePath);
+  const randomSuffix = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : crypto.randomBytes(8).toString("hex");
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${randomSuffix}.tmp`;
+  try {
+    await fs.writeFile(tempPath, JSON.stringify(value, null, 2), "utf8");
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function readJsonOrNull(filePath) {
@@ -3647,6 +3862,18 @@ function singleHunkPatch(filePatch, hunk) {
 
 function hunkLabel(hunk) {
   return `@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`;
+}
+
+function normalizeSelectedHunks(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => ({
+      path: String(item?.path || "").slice(0, 400),
+      selectedHunks: item?.selectedHunks === null ? null : Number(item?.selectedHunks || 0),
+      totalHunks: item?.totalHunks === null ? null : Number(item?.totalHunks || 0)
+    }))
+    .filter((item) => item.path)
+    .slice(0, 200);
 }
 
 async function analyzeUnifiedDiffApplication(diffText) {
@@ -4114,6 +4341,164 @@ async function readPackageScripts() {
   return pkg && typeof pkg.scripts === "object" && pkg.scripts ? pkg.scripts : {};
 }
 
+async function detectPackageManager() {
+  const candidates = [
+    { file: "pnpm-lock.yaml", manager: "pnpm" },
+    { file: "yarn.lock", manager: "yarn" },
+    { file: "package-lock.json", manager: "npm" },
+    { file: "npm-shrinkwrap.json", manager: "npm" }
+  ];
+  for (const candidate of candidates) {
+    const stat = await fs.stat(path.join(currentWorkspace, candidate.file)).catch(() => null);
+    if (stat?.isFile()) return candidate.manager;
+  }
+  return "npm";
+}
+
+function packageStartCommand(manager, scriptName) {
+  const name = String(scriptName || "").trim();
+  if (!name) return "";
+  if (manager === "npm") return name === "start" ? "npm start" : `npm run ${name}`;
+  if (manager === "pnpm") return `pnpm ${name}`;
+  if (manager === "yarn") return `yarn ${name}`;
+  return `npm run ${name}`;
+}
+
+function packageRunCommand(manager, scriptName) {
+  const name = String(scriptName || "").trim();
+  if (!name) return "";
+  if (manager === "npm") return name === "test" ? "npm test" : `npm run ${name}`;
+  if (manager === "pnpm") return `pnpm ${name}`;
+  if (manager === "yarn") return `yarn ${name}`;
+  return `npm run ${name}`;
+}
+
+async function discoverTypecheckCommands({ scripts = null, files = null, limit = 8 } = {}) {
+  const max = Math.min(20, Math.max(1, Number(limit) || 8));
+  const loadedScripts = scripts || await readPackageScripts();
+  const loadedFiles = files || await listFiles();
+  const manager = await detectPackageManager();
+  const tsconfigs = loadedFiles
+    .filter((file) => /^tsconfig(?:\.[\w.-]+)?\.json$/i.test(path.basename(file.path || "")))
+    .map((file) => file.path)
+    .slice(0, max);
+  const hasTsFiles = loadedFiles.some((file) => [".ts", ".tsx"].includes(path.extname(file.path || "").toLowerCase()));
+  const localCompilerCandidates = [
+    "node_modules/.bin/tsc.cmd",
+    "node_modules/.bin/tsc"
+  ];
+  const localCompiler = (await Promise.all(localCompilerCandidates.map(async (candidate) => {
+    const stat = await fs.stat(path.join(currentWorkspace, candidate)).catch(() => null);
+    return stat?.isFile() ? candidate : "";
+  }))).find(Boolean) || "";
+  const seen = new Set();
+  const commands = [];
+  const add = (command, reason = "", source = "detected") => {
+    const text = String(command || "").trim();
+    if (!text || seen.has(text)) return;
+    const policy = evaluateCommandPolicy(text);
+    if (!policy.allowed) return;
+    seen.add(text);
+    commands.push({ command: text, reason, source, policy });
+  };
+
+  for (const name of ["typecheck", "check", "build"]) {
+    if (!loadedScripts[name]) continue;
+    const expanded = extractSafeScriptCommands(loadedScripts[name]);
+    const typeLike = /tsc|vue-tsc|svelte-check|astro check|next lint|next build|tsserver|type-?check/i.test(loadedScripts[name]);
+    if (name === "typecheck" || typeLike) {
+      if (expanded.length) {
+        for (const command of expanded) add(command, `展开 package.json scripts.${name}: ${loadedScripts[name]}`, "package-script-expanded");
+      }
+      add(packageRunCommand(manager, name), `package.json scripts.${name}: ${loadedScripts[name]}`, "package-script");
+    }
+  }
+  if (tsconfigs.length || hasTsFiles) {
+    add(localCompiler ? `${localCompiler} --noEmit --pretty false` : "tsc --noEmit --pretty false", localCompiler ? "检测到本地 TypeScript 编译器，可执行 noEmit 类型检查。" : "检测到 TypeScript 配置或源码，可在 PATH 中存在 tsc 时执行 noEmit 类型检查。", localCompiler ? "local-compiler" : "path-compiler");
+  }
+
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    packageManager: manager,
+    tsconfigs,
+    hasTsFiles,
+    localCompiler,
+    scripts: Object.fromEntries(["typecheck", "check", "build"].filter((name) => loadedScripts[name]).map((name) => [name, loadedScripts[name]])),
+    commands: commands.slice(0, max),
+    policy: {
+      access: "local-read-only-typecheck-discovery",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      filtersByCommandPolicy: true
+    }
+  };
+}
+
+function extractSafeProcessScriptCommands(script) {
+  const parts = String(script || "")
+    .split(/\s+&&\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!parts.length) return [];
+  return parts.filter((part) => evaluateProcessPolicy(part).allowed);
+}
+
+async function discoverStartupCommands({ limit = 8 } = {}) {
+  const max = Math.min(20, Math.max(1, Number(limit) || 8));
+  const scripts = await readPackageScripts();
+  const manager = await detectPackageManager();
+  const seen = new Set();
+  const commands = [];
+  const add = (command, reason = "", source = "detected") => {
+    const text = String(command || "").trim();
+    if (!text || seen.has(text)) return;
+    const policy = evaluateProcessPolicy(text);
+    if (!policy.allowed) return;
+    seen.add(text);
+    commands.push({
+      command: text,
+      reason,
+      source,
+      policy,
+      probe: inferProcessProbe({ command: text, output: "" })
+    });
+  };
+
+  for (const name of START_SCRIPT_NAMES) {
+    if (scripts[name]) {
+      const expanded = extractSafeProcessScriptCommands(scripts[name]);
+      if (expanded.length) {
+        for (const command of expanded) {
+          add(command, `展开 package.json scripts.${name}: ${scripts[name]}`, "package-script-expanded");
+        }
+      }
+      add(packageStartCommand(manager, name), `package.json scripts.${name}: ${scripts[name]}`, "package-script");
+    }
+  }
+
+  const serverStat = await fs.stat(path.join(currentWorkspace, "server.js")).catch(() => null);
+  if (serverStat?.isFile()) add("node server.js", "检测到 server.js，可作为本地服务入口。", "entrypoint");
+
+  const appStat = await fs.stat(path.join(currentWorkspace, "app.js")).catch(() => null);
+  if (!commands.length && appStat?.isFile()) add("node app.js", "检测到 app.js，可尝试作为 Node 入口。", "entrypoint");
+
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    packageManager: manager,
+    scripts: Object.fromEntries(START_SCRIPT_NAMES.filter((name) => scripts[name]).map((name) => [name, scripts[name]])),
+    commands: commands.slice(0, max),
+    policy: {
+      access: "read-only-startup-discovery",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      startsProcesses: false,
+      filtersByProcessPolicy: true
+    }
+  };
+}
+
 function extractSafeScriptCommands(script) {
   const parts = String(script || "")
     .split(/\s+&&\s+/)
@@ -4125,7 +4510,7 @@ function extractSafeScriptCommands(script) {
 
 function packageScriptNameFromCommand(command) {
   const text = String(command || "").trim();
-  const match = /^(?:npm|pnpm|yarn)\s+(?:run\s+)?(check|test|lint|build)\b/i.exec(text);
+  const match = /^(?:npm|pnpm|yarn)\s+(?:run\s+)?(check|typecheck|test|lint|build)\b/i.exec(text);
   if (match) return match[1].toLowerCase();
   if (/^npm\s+test\b/i.test(text)) return "test";
   return "";
@@ -4143,6 +4528,8 @@ async function discoverCheckCommands(commands = []) {
   };
 
   const scripts = await readPackageScripts();
+  const files = await listFiles();
+  const typecheck = await discoverTypecheckCommands({ scripts, files, limit: 6 });
   for (const item of commands) {
     const command = item.command || item;
     const scriptName = packageScriptNameFromCommand(command);
@@ -4164,12 +4551,17 @@ async function discoverCheckCommands(commands = []) {
     }
   }
 
-  const files = await listFiles();
+  const localServerStat = await fs.stat(path.join(currentWorkspace, "server.js")).catch(() => null);
+  if (path.resolve(currentWorkspace) === APP_ROOT && localServerStat?.isFile()) {
+    for (const item of FOCUSED_API_SMOKE_CHECKS) add(item.command, item.reason);
+  }
+
   for (const file of files.slice(0, 40)) {
     if ([".js", ".mjs", ".cjs"].includes(path.extname(file.path).toLowerCase())) {
       add(`node --check ${file.path}`, "JavaScript 语法检查");
     }
   }
+  for (const item of typecheck.commands || []) add(item.command, item.reason || "TypeScript 类型检查");
 
   return checks.slice(0, 6);
 }
@@ -4198,6 +4590,189 @@ async function executeCommand(command) {
   });
 }
 
+function classifyCommandFailure(command = "", result = {}) {
+  const output = String(result.output || "");
+  const lower = output.toLowerCase();
+  const findings = [];
+  const add = (category, severity, message, evidence = [], nextAction = "") => {
+    findings.push({
+      category,
+      severity,
+      message,
+      evidence: (Array.isArray(evidence) ? evidence : [evidence]).map((item) => String(item || "").trim()).filter(Boolean).slice(0, 6),
+      nextAction
+    });
+  };
+  const sourceLocations = extractCommandSourceLocations([command, output].join("\n"));
+  const referencedFiles = [...new Set([
+    ...sourceLocations.map((item) => item.path),
+    ...(output.match(/(?:^|[\s("'`])((?:\.?[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+)(?::\d+)?/g) || [])
+      .map((item) => item.replace(/^[\s("'`]+/, "").replace(/:\d+$/, "").replaceAll("\\", "/"))
+      .filter(Boolean)
+  ])].slice(0, 12);
+  const stackLines = output.split(/\r?\n/)
+    .filter((line) => /\bat\s+.+:\d+:\d+|error:|exception|traceback|syntaxerror|typeerror|referenceerror/i.test(line))
+    .slice(0, 10);
+
+  if (result.exitCode === 124 || /timed out|timeout/i.test(output)) {
+    add("timeout", "error", "命令超时，可能是服务未退出、测试挂起或等待交互输入。", stackLines, "先缩小命令范围，或改用受管长任务启动后看 /api/process-health。");
+  }
+  if (/syntaxerror|unexpected token|missing \)|unterminated|string literal/i.test(output)) {
+    add("syntax", "error", "检测到语法错误。", stackLines, "优先读取报错文件和行号，使用 node --check 或对应编译器做最小验证。");
+  }
+  if (/cannot find module|module not found|err_module_not_found|could not resolve|failed to resolve|can't resolve/i.test(lower)) {
+    add("module-resolution", "error", "检测到模块或导入解析失败。", stackLines, "检查 package.json、相对路径大小写、扩展名和本地导出。");
+  }
+  if (/eaddrinuse|address already in use/i.test(output)) {
+    add("port-in-use", "error", "检测到端口占用。", stackLines, "改用 start.bat 自动换端口，或停止旧进程后重试。");
+  }
+  if (/eacces|permission denied|access is denied|operation not permitted/i.test(lower)) {
+    add("permission", "error", "检测到权限或访问被拒绝。", stackLines, "确认目标路径在工作区内，避免写系统目录或受保护文件。");
+  }
+  if (/enoent|no such file or directory|cannot find path|path not found/i.test(lower)) {
+    add("missing-file", "error", "检测到文件或路径不存在。", stackLines, "先确认命令工作目录和引用路径，再读取候选文件。");
+  }
+  if (/assertionerror|expect\(|expected .* received|test failed|failing tests?|failed tests?/i.test(lower)) {
+    add("test-failure", "error", "检测到测试断言失败。", stackLines, "优先读取失败测试和被测实现，保留测试语义修代码。");
+  }
+  if (/eslint|prettier|lint|stylelint/i.test(lower) && /error|warning|failed/i.test(lower)) {
+    add("lint", "warn", "检测到 lint 或格式检查问题。", stackLines, "优先按报错文件逐项修复，再运行同一检查命令。");
+  }
+  if (!findings.length && Number(result.exitCode) !== 0) {
+    add("unknown", "warn", "命令失败，但未匹配到已知错误类型。", stackLines.length ? stackLines : output.split(/\r?\n/).filter(Boolean).slice(0, 8), "先根据输出中的文件、行号或第一条错误读取相关代码。");
+  }
+  return {
+    command: String(command || "").slice(0, 400),
+    exitCode: result.exitCode ?? null,
+    category: findings[0]?.category || "none",
+    severity: findings[0]?.severity || "info",
+    summary: findings[0]?.message || "未发现失败信号。",
+    referencedFiles,
+    sourceLocations,
+    stackLines,
+    findings,
+    nextActions: findings.map((item) => item.nextAction).filter(Boolean).slice(0, 6)
+  };
+}
+
+function extractCommandSourceLocations(text = "") {
+  const source = String(text || "");
+  if (!source.trim()) return [];
+  const workspaceFiles = listWorkspaceFilesSync();
+  const byExact = new Map(workspaceFiles.map((file) => [file.path.toLowerCase(), file.path]));
+  const byBase = new Map();
+  for (const file of workspaceFiles) {
+    const base = path.basename(file.path).toLowerCase();
+    if (!byBase.has(base)) byBase.set(base, []);
+    byBase.get(base).push(file.path);
+  }
+  const locations = new Map();
+  const add = (rawPath, line, column, rawLine = "") => {
+    const normalized = String(rawPath || "").trim()
+      .replace(/^file:\/\//i, "")
+      .replace(/^\.?[\\/]/, "")
+      .replaceAll("\\", "/");
+    if (!normalized || !/\.[A-Za-z0-9]+$/.test(normalized)) return;
+    const exact = byExact.get(normalized.toLowerCase());
+    const baseMatches = byBase.get(path.basename(normalized).toLowerCase()) || [];
+    const resolved = exact || baseMatches.find((candidate) => candidate.toLowerCase().endsWith(normalized.toLowerCase())) || "";
+    if (!resolved) return;
+    const parsedLine = Math.max(1, Number.parseInt(line, 10) || 1);
+    const parsedColumn = Math.max(0, Number.parseInt(column, 10) || 0);
+    const key = `${resolved.toLowerCase()}:${parsedLine}:${parsedColumn}`;
+    if (locations.has(key)) return;
+    locations.set(key, {
+      path: resolved,
+      line: parsedLine,
+      column: parsedColumn,
+      text: String(rawLine || "").trim().slice(0, 400)
+    });
+  };
+
+  const patterns = [
+    /(?:^|[\s("'`])((?:\.?[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+):(\d+):(\d+)/g,
+    /(?:^|[\s("'`])((?:\.?[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+):(\d+)/g,
+    /\(([^()\r\n]+?\.[A-Za-z0-9_]+):(\d+):(\d+)\)/g
+  ];
+  const lines = source.split(/\r?\n/);
+  for (const lineText of lines) {
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      let match;
+      while ((match = pattern.exec(lineText))) {
+        add(match[1], match[2], match[3] || 0, lineText);
+      }
+    }
+  }
+  return [...locations.values()].slice(0, 16);
+}
+
+function commandItem(command = "", reason = "", extra = {}) {
+  return {
+    command: String(command || "").trim(),
+    reason: String(reason || "").trim(),
+    ...extra
+  };
+}
+
+function dedupeCommandItems(items = []) {
+  const seen = new Set();
+  return items
+    .map((item) => typeof item === "string" ? commandItem(item) : commandItem(item.command, item.reason, item))
+    .filter((item) => item.command)
+    .filter((item) => {
+      const key = item.command.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function buildFailureRecoveryChain(command = "", result = {}, diagnostics = null) {
+  const failureAnalysis = result.failureAnalysis || diagnostics?.commandFailure || classifyCommandFailure(command, result);
+  const diagnosticCommands = Array.isArray(diagnostics?.verificationPlan?.commands)
+    ? diagnostics.verificationPlan.commands
+    : [];
+  const commands = dedupeCommandItems([
+    commandItem(command, "复现最近一次失败，确认当前问题仍可稳定触发。", { stage: "reproduce" }),
+    ...diagnosticCommands.map((item) => commandItem(item.command || item, item.reason || "复用调试诊断推荐的验证命令。", { stage: "diagnose" })),
+    commandItem(command, "修复后第一时间重跑原失败命令，确认根因已消除。", { stage: "verify-original" }),
+    commandItem("node --check server.js", "复查后端入口语法，避免修复引入新的 JavaScript 语法错误。", { stage: "verify-syntax" }),
+    commandItem("node --check app.js", "复查前端入口语法，避免修复引入新的 JavaScript 语法错误。", { stage: "verify-syntax" }),
+    commandItem("node server.js --api-smoke-section=debug", "运行调试闭环 smoke，验证失败分类、诊断和修复链路仍可用。", { stage: "verify-debug" })
+  ]);
+  const runnableCommands = commands
+    .filter((item) => evaluateCommandPolicy(item.command).allowed)
+    .slice(0, 8);
+  const referencedFiles = [
+    ...(Array.isArray(failureAnalysis.referencedFiles) ? failureAnalysis.referencedFiles : []),
+    ...(Array.isArray(diagnostics?.referencedFiles) ? diagnostics.referencedFiles : [])
+  ].filter(Boolean);
+  const uniqueFiles = [...new Set(referencedFiles.map((file) => String(file).replaceAll("\\", "/")))].slice(0, 16);
+  const sourceLocations = Array.isArray(failureAnalysis.sourceLocations) ? failureAnalysis.sourceLocations.slice(0, 16) : [];
+  return {
+    status: result.exitCode === 0 ? "not_needed" : "needs_recovery",
+    category: failureAnalysis.category || "unknown",
+    summary: failureAnalysis.summary || "",
+    command: String(command || "").slice(0, 400),
+    referencedFiles: uniqueFiles,
+    sourceLocations,
+    nextActions: [
+      "先重跑原命令确认失败仍存在。",
+      uniqueFiles.length ? "引用相关文件并定位最小根因。" : "根据失败输出定位最小根因。",
+      "生成最小修复 diff 后先重跑原命令。",
+      "最后运行语法检查和调试 smoke。"
+    ],
+    commands: runnableCommands,
+    stages: [
+      { id: "reproduce", label: "复现", command, status: "pending" },
+      { id: "inspect", label: "定位", files: uniqueFiles, sourceLocations, status: uniqueFiles.length || sourceLocations.length ? "ready" : "needs-output" },
+      { id: "repair", label: "修复", action: "repair-command", status: "pending" },
+      { id: "verify", label: "复查", commands: runnableCommands.filter((item) => /verify/i.test(item.stage || "")), status: "pending" }
+    ]
+  };
+}
+
 async function executeUserCommand(command) {
   const policy = evaluateCommandPolicy(command);
   if (!policy.allowed) {
@@ -4215,7 +4790,36 @@ async function executeUserCommand(command) {
       output: policy.reason
     };
   }
-  return executeCommand(command);
+  const result = await executeCommand(command);
+  if (result.exitCode !== 0) {
+    result.failureAnalysis = classifyCommandFailure(command, result);
+    result.diagnostics = await buildDebugDiagnostics({
+      commands: [command],
+      includeTrace: false,
+      runChecks: false,
+      limit: 12
+    }).catch((error) => ({
+      status: "diagnostics_failed",
+      summary: { findings: 1, errors: 0, warnings: 1 },
+      findings: [{ severity: "warn", area: "debug", message: error.message, evidence: [] }],
+      nextActions: [],
+      policy: { executesCommands: false, error: true }
+    }));
+    if (result.diagnostics && typeof result.diagnostics === "object") {
+      result.diagnostics.commandFailure = result.failureAnalysis;
+      result.diagnostics.findings = [
+        ...(result.failureAnalysis.findings || []).map((item) => ({
+          severity: item.severity || "warn",
+          area: "command",
+          message: item.message || "",
+          evidence: item.evidence || []
+        })),
+        ...(result.diagnostics.findings || [])
+      ].slice(0, 20);
+    }
+    result.recoveryChain = buildFailureRecoveryChain(command, result, result.diagnostics);
+  }
+  return result;
 }
 
 function summarizeManagedProcess(entry) {
@@ -4405,11 +5009,17 @@ async function probeManagedProcess(entry) {
   const timer = setTimeout(() => controller.abort(), 1200);
   try {
     const response = await fetch(entry.probe.url, { signal: controller.signal });
+    const bodySample = await response.text()
+      .then((text) => String(text || "").slice(0, 4000))
+      .catch(() => "");
     entry.probe = {
       ...entry.probe,
       status: response.ok ? "healthy" : "unhealthy",
       ok: response.ok,
       statusCode: response.status,
+      statusText: response.statusText || "",
+      contentType: response.headers.get("content-type") || "",
+      bodySample,
       lastCheckedAt: new Date().toISOString(),
       lastError: ""
     };
@@ -4440,26 +5050,64 @@ function processHealthRulesPath() {
   return path.join(currentWorkspace, ".forge", "process-health-rules.json");
 }
 
+function normalizeHealthRuleTextList(value, aliases = [], limit = 8) {
+  const rawValues = [];
+  if (Array.isArray(value)) rawValues.push(...value);
+  else if (value) rawValues.push(value);
+  for (const alias of aliases) {
+    if (Array.isArray(alias)) rawValues.push(...alias);
+    else if (alias) rawValues.push(alias);
+  }
+  return rawValues
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function normalizeHealthRuleStatusList(value, aliases = []) {
+  const rawValues = [];
+  if (Array.isArray(value)) rawValues.push(...value);
+  else if (value !== undefined && value !== null) rawValues.push(value);
+  for (const alias of aliases) {
+    if (Array.isArray(alias)) rawValues.push(...alias);
+    else if (alias !== undefined && alias !== null) rawValues.push(alias);
+  }
+  return rawValues
+    .map((item) => Number(item))
+    .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599)
+    .slice(0, 12);
+}
+
 function normalizeProcessHealthRules(rawRules) {
   const source = Array.isArray(rawRules) ? rawRules : Array.isArray(rawRules?.rules) ? rawRules.rules : [];
   return source.slice(0, 40).map((rule, index) => {
-    const commandIncludes = Array.isArray(rule?.commandIncludes)
-      ? rule.commandIncludes
-      : [rule?.commandIncludes || rule?.command || ""];
-    const expectedStatus = Array.isArray(rule?.expectedStatus)
-      ? rule.expectedStatus
-      : [rule?.expectedStatus ?? rule?.statusCode ?? 200];
+    const rawExpectedStatus = rule?.expectedStatus ?? rule?.statusCode ?? rule?.probeStatus ?? rule?.expectedProbeStatus ?? 200;
+    const expectedStatus = normalizeHealthRuleStatusList(rawExpectedStatus);
+    const expectedOutputIncludes = normalizeHealthRuleTextList(
+      rule?.expectedOutputIncludes || rule?.outputIncludes,
+      [rule?.expectedBodyIncludes, rule?.bodyIncludes],
+      8
+    );
     return {
       name: String(rule?.name || `rule-${index + 1}`).trim().slice(0, 80),
-      commandIncludes: commandIncludes
-        .map((item) => String(item || "").trim())
-        .filter(Boolean)
-        .slice(0, 6),
-      expectedStatus: expectedStatus
-        .map((item) => Number(item))
-        .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599)
-        .slice(0, 12),
-      expectedBodyIncludes: String(rule?.expectedBodyIncludes || rule?.bodyIncludes || "").slice(0, 240),
+      commandIncludes: normalizeHealthRuleTextList(
+        rule?.commandIncludes,
+        [rule?.command],
+        6
+      ),
+      expectedStatus,
+      expectedOutputIncludes,
+      expectedBodyIncludes: expectedOutputIncludes[0] || "",
+      expectedProbeUrlIncludes: normalizeHealthRuleTextList(
+        rule?.expectedProbeUrlIncludes || rule?.probeUrlIncludes,
+        [rule?.expectedUrlIncludes, rule?.urlIncludes],
+        6
+      ),
+      expectedProbeBodyIncludes: normalizeHealthRuleTextList(
+        rule?.expectedProbeBodyIncludes || rule?.probeBodyIncludes,
+        [rule?.responseBodyIncludes, rule?.responseIncludes],
+        8
+      ),
       requireProbe: rule?.requireProbe !== false
     };
   }).filter((rule) => rule.name && rule.commandIncludes.length);
@@ -4485,20 +5133,42 @@ function evaluateProcessHealthRules(row, rules = []) {
   const matched = rules.filter((rule) => commandMatchesHealthRule(row.command, rule));
   const results = matched.map((rule) => {
     const failures = [];
-    if (rule.requireProbe && !row.probe) failures.push("missing-probe");
-    if (row.probe && rule.expectedStatus.length && !rule.expectedStatus.includes(Number(row.probe.statusCode))) {
-      failures.push(`status-${row.probe.statusCode || "missing"}`);
+    const probe = row.probe || null;
+    const outputTail = String(row.outputTail || "");
+    const probeBody = String(probe?.bodySample || probe?.body || probe?.textSample || "");
+    const probeUrl = String(probe?.url || "");
+    if (rule.requireProbe && !probe) failures.push("missing-probe");
+    if (probe && rule.expectedStatus.length && !rule.expectedStatus.includes(Number(probe.statusCode))) {
+      failures.push(`probe-status-${probe.statusCode || "missing"}`);
     }
-    if (rule.expectedBodyIncludes && !String(row.outputTail || "").includes(rule.expectedBodyIncludes)) {
-      failures.push("missing-output-evidence");
+    const missingOutput = (rule.expectedOutputIncludes || []).filter((needle) => !outputTail.includes(needle));
+    if (missingOutput.length) {
+      failures.push(`missing-output-evidence:${missingOutput.map((item) => item.slice(0, 40)).join("|")}`);
+    }
+    const missingProbeUrl = (rule.expectedProbeUrlIncludes || []).filter((needle) => !probeUrl.includes(needle));
+    if (missingProbeUrl.length) {
+      failures.push(`missing-probe-url:${missingProbeUrl.map((item) => item.slice(0, 40)).join("|")}`);
+    }
+    const missingProbeBody = (rule.expectedProbeBodyIncludes || []).filter((needle) => !probeBody.includes(needle));
+    if (missingProbeBody.length) {
+      failures.push(probe ? `missing-probe-body:${missingProbeBody.map((item) => item.slice(0, 40)).join("|")}` : "missing-probe-body:missing-probe");
     }
     return {
       name: rule.name,
       matched: true,
       ok: failures.length === 0,
       failures,
+      observed: {
+        statusCode: probe?.statusCode ?? null,
+        probeUrl,
+        hasProbeBody: Boolean(probeBody),
+        outputBytes: row.outputBytes || 0
+      },
       expectedStatus: rule.expectedStatus,
       expectedBodyIncludes: rule.expectedBodyIncludes,
+      expectedOutputIncludes: rule.expectedOutputIncludes,
+      expectedProbeUrlIncludes: rule.expectedProbeUrlIncludes,
+      expectedProbeBodyIncludes: rule.expectedProbeBodyIncludes,
       requireProbe: rule.requireProbe
     };
   });
@@ -6868,12 +7538,17 @@ async function findCiConfigs() {
 
 async function buildVerificationPlan({ commands = [], limit = 12 } = {}) {
   const max = Math.min(40, Math.max(1, Number(limit) || 12));
-  const [ci, discoveredChecks, tasks, diffEvidence, scripts] = await Promise.all([
+  const filesPromise = listFiles();
+  const [ci, tasks, diffEvidence, scripts, files] = await Promise.all([
     findCiConfigs(),
-    discoverCheckCommands(commands),
     listTaskLogs(8),
     getCurrentDiffEvidence({ includeDiff: false }),
-    readPackageScripts()
+    readPackageScripts(),
+    filesPromise
+  ]);
+  const [discoveredChecks, typecheck] = await Promise.all([
+    discoverCheckCommands(commands),
+    discoverTypecheckCommands({ scripts, files, limit: 8 })
   ]);
   const recentChecks = tasks.flatMap((task) => (task.checks || []).map((check) => ({
     taskId: task.id,
@@ -6902,6 +7577,14 @@ async function buildVerificationPlan({ commands = [], limit = 12 } = {}) {
       evidence: ci.map((item) => `${item.provider}:${item.path}`)
     },
     {
+      id: "typecheck",
+      label: "TypeScript typecheck",
+      status: typecheck.commands?.length ? "ready" : ((typecheck.tsconfigs?.length || typecheck.hasTsFiles) ? "missing" : "not-applicable"),
+      evidence: typecheck.commands?.length
+        ? typecheck.commands.map((item) => item.command)
+        : [...(typecheck.tsconfigs || []), typecheck.hasTsFiles ? "TypeScript source files detected" : ""].filter(Boolean)
+    },
+    {
       id: "recent-verification",
       label: "Recent verification evidence",
       status: recentChecks.length ? (failedRecentChecks.length ? "failing" : "passing") : "missing",
@@ -6916,6 +7599,7 @@ async function buildVerificationPlan({ commands = [], limit = 12 } = {}) {
   ];
   const blockers = [];
   if (!discoveredChecks.length) blockers.push("未发现可安全自动运行的本地检查命令。");
+  if ((typecheck.tsconfigs?.length || typecheck.hasTsFiles) && !typecheck.commands?.length) blockers.push("检测到 TypeScript 项目线索，但未发现可安全运行的类型检查命令。");
   if (!ci.length) blockers.push("未发现 CI 配置文件。");
   if (failedRecentChecks.length) blockers.push(`${failedRecentChecks.length} 个最近检查失败。`);
   return {
@@ -6927,12 +7611,16 @@ async function buildVerificationPlan({ commands = [], limit = 12 } = {}) {
       ready: gates.filter((item) => item.status === "ready" || item.status === "passing" || item.status === "clean").length,
       blockers: blockers.length,
       commands: discoveredChecks.length,
+      typecheckCommands: typecheck.commands?.length || 0,
+      tsconfigs: typecheck.tsconfigs?.length || 0,
+      hasTsFiles: Boolean(typecheck.hasTsFiles),
       ciConfigs: ci.length,
       recentChecks: recentChecks.length,
       changedFiles: diffEvidence.git?.changedFiles?.length || 0
     },
     gates,
     commands: discoveredChecks.slice(0, max),
+    typecheck,
     ci,
     scriptChecks,
     recentChecks,
@@ -7036,6 +7724,288 @@ async function buildCiStatus({ deep = false, persist = false, limit = 20 } = {})
     };
   }
   return artifact;
+}
+
+function summarizeDebugFindings({ verificationPlan, ciStatus, processHealth, trace, semanticDiagnostics, checksResult }) {
+  const findings = [];
+  const add = (severity, area, message, evidence = []) => {
+    if (!message) return;
+    findings.push({
+      severity,
+      area,
+      message,
+      evidence: Array.isArray(evidence) ? evidence.filter(Boolean).slice(0, 8) : [String(evidence)]
+    });
+  };
+
+  for (const blocker of verificationPlan?.blockers || []) {
+    add("warn", "verification", blocker, verificationPlan?.commands?.map((item) => item.command) || []);
+  }
+  for (const blocker of ciStatus?.blockers || []) {
+    add("warn", "ci", blocker, ciStatus?.ci?.map((item) => item.path) || []);
+  }
+  for (const row of processHealth?.rows || []) {
+    if (!row.ok || row.health === "failed" || row.rules?.failed) {
+      add(
+        row.active ? "error" : "warn",
+        "process",
+        `${row.command || row.id} 状态异常：${row.health || row.status || "unknown"}`,
+        [
+          row.probe?.url,
+          row.probe?.status ? `HTTP ${row.probe.status}` : "",
+          row.rules?.failed ? "health rule failed" : "",
+          row.outputTail ? row.outputTail.slice(-800) : ""
+        ]
+      );
+    }
+  }
+  if (trace) {
+    const exceptions = trace.summary?.exceptions || 0;
+    const failedNetwork = (trace.network || []).filter((item) => item.status >= 400 || item.failed).length;
+    const consoleErrors = (trace.console || []).filter((item) => /error|assert/i.test(item.type || item.level || "")).length;
+    if (!trace.ok) add("error", "browser", "页面 Trace 采集异常。", [trace.error || trace.reason || trace.finalUrl || trace.url]);
+    if (exceptions) add("error", "browser", `${exceptions} 个浏览器运行时异常。`, (trace.exceptions || []).map((item) => item.text || item.description || item.url));
+    if (consoleErrors) add("warn", "browser", `${consoleErrors} 条 console error/assert。`, (trace.console || []).map((item) => item.text || item.message).slice(0, 6));
+    if (failedNetwork) add("warn", "browser", `${failedNetwork} 个网络请求失败或返回 4xx/5xx。`, (trace.network || []).filter((item) => item.status >= 400 || item.failed).map((item) => `${item.status || "FAIL"} ${item.url}`).slice(0, 6));
+  }
+  const semanticIssueCount = countSemanticDiagnosticIssues(semanticDiagnostics);
+  if (semanticIssueCount) {
+    const diagnostics = semanticDiagnostics.diagnostics || semanticDiagnostics.items || [];
+    add("warn", "code", `${semanticIssueCount} 个语义诊断项需要关注。`, diagnostics.map((item) => `${item.category || item.kind || item.type || "issue"} ${item.path || ""}:${item.line || ""}`));
+  }
+  if (checksResult && !checksResult.skipped && !checksResult.ok) {
+    const failed = (checksResult.checks || []).find((item) => item.exitCode !== 0);
+    add("error", "checks", `安全检查失败：${failed?.command || "unknown"}`, [failed?.output || ""]);
+  }
+
+  return findings;
+}
+
+function countSemanticDiagnosticIssues(semanticDiagnostics) {
+  const summary = semanticDiagnostics?.summary || {};
+  const summaryCount = Number(summary.issues ?? summary.total ?? summary.count ?? 0);
+  if (Number.isFinite(summaryCount) && summaryCount > 0) return summaryCount;
+  return (semanticDiagnostics?.diagnostics || semanticDiagnostics?.items || []).length;
+}
+
+function buildDebugNextActions({ verificationPlan, processHealth, trace, findings, checksResult }) {
+  const actions = [];
+  const addAction = (action) => {
+    const normalized = {
+      id: String(action.id || `debug-action-${actions.length + 1}`).slice(0, 80),
+      label: String(action.label || action.id || "下一步").slice(0, 80),
+      priority: Number.isFinite(Number(action.priority)) ? Number(action.priority) : 50,
+      kind: String(action.kind || (action.command ? "command" : "inspect")).slice(0, 40),
+      command: String(action.command || "").trim(),
+      target: String(action.target || "").slice(0, 500),
+      description: String(action.description || "").slice(0, 500),
+      evidence: (Array.isArray(action.evidence) ? action.evidence : [action.evidence])
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+        .slice(0, 6)
+    };
+    if (!actions.some((item) => item.id === normalized.id || (normalized.command && item.command === normalized.command))) {
+      actions.push(normalized);
+    }
+  };
+  const debugSmoke = (verificationPlan?.commands || []).find((item) => String(item.command || "").includes("--api-smoke-section=debug"));
+  if (debugSmoke) {
+    addAction({
+      id: "run-debug-smoke",
+      label: "运行调试 smoke",
+      priority: findings.some((item) => item.area === "browser" || item.area === "process") ? 95 : 75,
+      kind: "command",
+      command: debugSmoke.command,
+      description: "优先跑调试分段 smoke，快速验证浏览器、诊断、运行时和门禁链路。",
+      evidence: [debugSmoke.reason || "verification plan", `${findings.length} findings`]
+    });
+  }
+  if (verificationPlan?.commands?.length) {
+    addAction({
+      id: "run-safe-checks",
+      label: "运行安全检查",
+      priority: checksResult?.skipped ? 90 : 70,
+      kind: "command",
+      command: verificationPlan.commands[0].command,
+      description: "先执行首个本地安全检查，失败后可交给修复代理生成 diff。",
+      evidence: [verificationPlan.commands[0].reason || "discovered safe check", verificationPlan.status || ""]
+    });
+  }
+  const failedProcess = (processHealth?.rows || []).find((row) => !row.ok || row.health === "failed" || row.rules?.failed);
+  if (failedProcess?.logPath || failedProcess?.outputTail) {
+    const failedRules = (failedProcess.rules?.results || [])
+      .filter((item) => !item.ok)
+      .flatMap((item) => item.failures || [])
+      .slice(0, 4);
+    addAction({
+      id: "inspect-process-log",
+      label: "查看进程日志",
+      priority: failedProcess.rules?.failed ? 98 : 88,
+      kind: "inspect",
+      command: failedProcess.command || "",
+      target: failedProcess.logPath || failedProcess.artifactPath || failedProcess.id || "",
+      description: `优先排查 ${failedProcess.command || failedProcess.id} 的输出尾部、健康探针和规则失败原因。`,
+      evidence: [
+        `health=${failedProcess.health || "unknown"}`,
+        failedProcess.probe?.url || "",
+        ...failedRules
+      ]
+    });
+  }
+  if (trace && ((trace.summary?.exceptions || 0) || (trace.console || []).length)) {
+    const failedNetwork = (trace.network || []).filter((item) => item.failed || item.status >= 400).slice(0, 4);
+    addAction({
+      id: "inspect-browser-trace",
+      label: "查看页面 Trace",
+      priority: (trace.summary?.exceptions || 0) ? 96 : 84,
+      kind: "inspect",
+      command: "",
+      target: trace.artifactPath || trace.finalUrl || trace.url || "",
+      description: "打开 Trace 详情，按 runtime exception、console error、失败请求定位前端问题。",
+      evidence: [
+        `${trace.summary?.exceptions || 0} exceptions`,
+        `${(trace.console || []).length} console entries`,
+        ...failedNetwork.map((item) => `${item.status || "FAIL"} ${item.url || ""}`)
+      ]
+    });
+  }
+  if (findings.some((item) => item.area === "code")) {
+    addAction({
+      id: "inspect-code-diagnostics",
+      label: "查看语义诊断",
+      priority: 82,
+      kind: "inspect",
+      command: "",
+      description: "从重复声明、未解析导入、重复路由或 API 调用缺口开始排查。",
+      evidence: findings.filter((item) => item.area === "code").flatMap((item) => item.evidence || []).slice(0, 6)
+    });
+  }
+  if (checksResult?.skipped) {
+    addAction({
+      id: "add-check-script",
+      label: "补检查脚本",
+      priority: verificationPlan?.commands?.length ? 55 : 78,
+      kind: "repair",
+      command: "",
+      target: "package.json",
+      description: "当前未发现可自动运行的安全检查命令，建议在 package.json 增加 check/test/lint。",
+      evidence: [checksResult.summary || "checks skipped"]
+    });
+  }
+  return actions
+    .sort((a, b) => (b.priority || 0) - (a.priority || 0))
+    .slice(0, 8);
+}
+
+async function buildDebugDiagnostics({
+  url: targetUrl = "",
+  commands = [],
+  includeTrace = false,
+  runChecks = false,
+  waitMs = 1500,
+  limit = 20
+} = {}) {
+  const max = Math.min(60, Math.max(1, Number(limit) || 20));
+  const requestedCommands = Array.isArray(commands) ? commands : [];
+  const [verificationPlan, ciStatus, processHealth, semanticDiagnostics, codeOverview] = await Promise.all([
+    buildVerificationPlan({ commands: requestedCommands, limit: max }),
+    buildCiStatus({ limit: max, persist: false }),
+    buildManagedProcessHealth({ limit: max }),
+    buildSemanticDiagnostics({ limit: max, includeContext: false }).catch((error) => ({
+      summary: { issues: 1 },
+      diagnostics: [{ kind: "semantic-diagnostics-error", message: error.message }]
+    })),
+    buildCodeIntelligenceOverview({ limit: Math.min(max, 24), includeDiagnostics: false }).catch((error) => ({
+      error: error.message
+    }))
+  ]);
+
+  const checkCommands = verificationPlan.commands || [];
+  const checksResult = runChecks ? await runCheckCommands(checkCommands) : {
+    ok: false,
+    skipped: true,
+    checks: [],
+    summary: "默认只读诊断未运行检查命令；点击运行建议命令或传入 runChecks=true。"
+  };
+  const trace = includeTrace && String(targetUrl || "").trim()
+    ? await captureBrowserTrace(targetUrl, { waitMs: Number(waitMs) || 1500 }).catch((error) => ({
+      ok: false,
+      url: targetUrl,
+      error: error.message,
+      summary: { console: 0, exceptions: 1, network: 0 },
+      console: [],
+      exceptions: [{ text: error.message }],
+      network: []
+    }))
+    : null;
+  const findings = summarizeDebugFindings({
+    verificationPlan,
+    ciStatus,
+    processHealth,
+    trace,
+    semanticDiagnostics,
+    checksResult
+  });
+  const severityRank = { error: 3, warn: 2, info: 1 };
+  findings.sort((a, b) => (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0));
+  const status = findings.some((item) => item.severity === "error")
+    ? "failing"
+    : findings.some((item) => item.severity === "warn")
+      ? "needs_attention"
+      : "ready";
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status,
+    summary: {
+      findings: findings.length,
+      errors: findings.filter((item) => item.severity === "error").length,
+      warnings: findings.filter((item) => item.severity === "warn").length,
+      safeCommands: checkCommands.length,
+      checksRun: Boolean(runChecks),
+      processRows: processHealth.rows?.length || 0,
+      traceCaptured: Boolean(trace),
+      semanticIssues: countSemanticDiagnosticIssues(semanticDiagnostics)
+    },
+    findings,
+    nextActions: buildDebugNextActions({ verificationPlan, processHealth, trace, findings, checksResult }),
+    verificationPlan: {
+      status: verificationPlan.status,
+      summary: verificationPlan.summary,
+      commands: checkCommands,
+      blockers: verificationPlan.blockers,
+      gates: verificationPlan.gates
+    },
+    ciStatus: {
+      status: ciStatus.status,
+      provider: ciStatus.provider,
+      summary: ciStatus.summary,
+      blockers: ciStatus.blockers,
+      ci: ciStatus.ci
+    },
+    processHealth,
+    browserTrace: trace,
+    semanticDiagnostics: {
+      summary: semanticDiagnostics.summary,
+      diagnostics: (semanticDiagnostics.diagnostics || semanticDiagnostics.items || []).slice(0, max)
+    },
+    codeOverview: {
+      summary: codeOverview.summary || null,
+      entrypoints: codeOverview.entrypoints || [],
+      apiSurface: codeOverview.apiSurface || codeOverview.routes || [],
+      hotspots: codeOverview.hotspots || []
+    },
+    checksResult,
+    policy: {
+      access: "local-debug-read-mostly",
+      scope: "currentWorkspace",
+      executesCommands: Boolean(runChecks),
+      commandExecutionRequiresRunChecks: true,
+      capturesBrowserTrace: Boolean(includeTrace && targetUrl),
+      pushes: false,
+      createsRemotePr: false
+    }
+  };
 }
 
 function parseJsonOutput(output = "", fallback = null) {
@@ -7902,6 +8872,38 @@ async function writeTaskLog(record) {
   return task;
 }
 
+function normalizeRepairContext(context = null) {
+  if (!context || typeof context !== "object") return null;
+  return {
+    id: String(context.id || "").slice(0, 120),
+    source: String(context.source || "").slice(0, 80),
+    status: String(context.status || "").slice(0, 80),
+    startedAt: String(context.startedAt || "").slice(0, 80),
+    prompt: String(context.prompt || "").slice(0, 2000),
+    command: String(context.command || "").slice(0, 1000),
+    failure: context.failure ? {
+      exitCode: Number(context.failure.exitCode ?? 1),
+      blocked: Boolean(context.failure.blocked),
+      outputSummary: String(context.failure.outputSummary || "").slice(0, 1000),
+      output: String(context.failure.output || "").slice(0, 8000),
+      policy: context.failure.policy || null
+    } : null,
+    diagnostics: context.diagnostics ? {
+      status: String(context.diagnostics.status || "").slice(0, 80),
+      summary: context.diagnostics.summary || null,
+      findingCount: Number(context.diagnostics.findingCount || 0),
+      nextActions: Array.isArray(context.diagnostics.nextActions) ? context.diagnostics.nextActions.slice(0, 8) : []
+    } : null,
+    repair: context.repair ? {
+      reply: String(context.repair.reply || "").slice(0, 2000),
+      hasDiff: Boolean(context.repair.hasDiff),
+      files: Array.isArray(context.repair.files) ? context.repair.files.slice(0, 20).map((item) => String(item).slice(0, 300)) : [],
+      commandCount: Number(context.repair.commandCount || 0),
+      reviewCount: Number(context.repair.reviewCount || 0)
+    } : null
+  };
+}
+
 function normalizeThreadTitle(title = "") {
   const text = String(title || "").trim().replace(/\s+/g, " ");
   return text.slice(0, 80) || "新会话";
@@ -8088,6 +9090,67 @@ async function writeGoalState(patch = {}) {
   return state;
 }
 
+function buildGoalRecoverySummary({ goal = null, tasks = [], capabilities = null, contextRollup = null } = {}) {
+  const currentGoal = goal || defaultGoalState();
+  const recentTask = Array.isArray(tasks) ? tasks[0] : null;
+  const recommended = capabilities?.recommendedNext || null;
+  const pendingProposal = currentGoal.pendingProposal || null;
+  const verification = currentGoal.lastVerification || null;
+  const changedFiles = Array.isArray(recentTask?.changedFiles) ? recentTask.changedFiles.slice(0, 12) : [];
+  const selectedHunks = Array.isArray(recentTask?.selectedHunks) ? recentTask.selectedHunks.slice(0, 8) : [];
+  const failedCommands = Array.isArray(recentTask?.failedCommands)
+    ? recentTask.failedCommands.slice(0, 8)
+    : (Array.isArray(recentTask?.checks) ? recentTask.checks.filter((check) => Number(check.exitCode) !== 0).map((check) => check.command).filter(Boolean).slice(0, 8) : []);
+  const verificationCommands = Array.isArray(recentTask?.verificationCommands)
+    ? recentTask.verificationCommands.slice(0, 8)
+    : (Array.isArray(recentTask?.checks) ? recentTask.checks.map((check) => check.command).filter(Boolean).slice(0, 8) : []);
+  const lastFailedCommand = recentTask?.repairContext?.command || failedCommands[0] || "";
+  const cues = [
+    pendingProposal?.id ? `待审批：${pendingProposal.type || "proposal"} ${pendingProposal.id}` : "",
+    recentTask?.id ? `最近任务：${recentTask.status || "unknown"} ${recentTask.id}` : "",
+    verification ? `验证：${verification.skipped ? "跳过" : verification.ok ? "通过" : "失败"} · ${verification.checkCount || 0} 项` : "",
+    lastFailedCommand ? `最近失败命令：${lastFailedCommand}` : "",
+    changedFiles.length ? `变更文件：${changedFiles.slice(0, 3).join("、")}${changedFiles.length > 3 ? ` 等 ${changedFiles.length} 个` : ""}` : "",
+    selectedHunks.length ? `已选 hunk：${selectedHunks.reduce((sum, item) => sum + Number(item.selectedHunks || 0), 0)} 个` : "",
+    recommended?.capability?.area ? `推荐缺口：${recommended.capability.area} (${recommended.capability.status || "partial"})` : "",
+    contextRollup?.summary?.entries ? `滚动摘要：${contextRollup.summary.entries} 条` : ""
+  ].filter(Boolean);
+  const blockers = [
+    pendingProposal?.id ? "先复核并批准或放弃待审批 diff。" : "",
+    verification && !verification.ok && !verification.skipped ? "上次验证失败，继续前优先读取失败命令和相关文件。" : "",
+    recommended?.capability?.next ? recommended.capability.next : ""
+  ].filter(Boolean).slice(0, 5);
+  const nextActions = [
+    currentGoal.nextStep || "",
+    pendingProposal?.diff ? "检查恢复的 diff 是否仍适用；需要时用逐 hunk 部分应用。" : "",
+    lastFailedCommand ? `复现失败命令：${lastFailedCommand}` : "",
+    verificationCommands.length ? `复查命令：${verificationCommands[0]}` : "",
+    recommended?.capability?.area ? `补齐推荐能力：${recommended.capability.area}` : ""
+  ].filter(Boolean).slice(0, 6);
+  return {
+    status: currentGoal.status || "idle",
+    phase: currentGoal.phase || "idle",
+    objective: currentGoal.objective || "",
+    updatedAt: currentGoal.updatedAt || "",
+    pendingProposalId: pendingProposal?.id || "",
+    lastTaskId: currentGoal.lastTaskId || recentTask?.id || "",
+    recommendedGap: recommended?.capability ? {
+      area: recommended.capability.area || "",
+      status: recommended.capability.status || "",
+      reason: recommended.reason || "",
+      next: recommended.capability.next || ""
+    } : null,
+    lastFailedCommand,
+    changedFiles,
+    selectedHunks,
+    failedCommands,
+    verificationCommands,
+    cues,
+    blockers,
+    nextActions
+  };
+}
+
 async function listTaskLogs(limit = 20) {
   await fs.mkdir(TASK_LOG_DIR, { recursive: true });
   const entries = await fs.readdir(TASK_LOG_DIR, { withFileTypes: true });
@@ -8102,7 +9165,21 @@ async function listTaskLogs(limit = 20) {
       createdAt: task.createdAt || "",
       status: task.status || "unknown",
       changedFiles: task.changedFiles || [],
-      checksOk: Boolean(task.checksOk)
+      selectedHunks: Array.isArray(task.selectedHunks) ? task.selectedHunks : [],
+      checksOk: Boolean(task.checksOk),
+      checks: Array.isArray(task.checks) ? task.checks.slice(0, 8).map((check) => ({
+        command: check.command || "",
+        reason: check.reason || "",
+        exitCode: check.exitCode ?? null,
+        output: String(check.output || "").slice(0, 1200)
+      })) : [],
+      failedCommands: Array.isArray(task.checks) ? task.checks.filter((check) => Number(check.exitCode) !== 0).map((check) => check.command).filter(Boolean).slice(0, 8) : [],
+      verificationCommands: Array.isArray(task.checks) ? task.checks.map((check) => check.command).filter(Boolean).slice(0, 8) : [],
+      repairContext: task.repairContext?.command ? {
+        command: task.repairContext.command,
+        source: task.repairContext.source || "",
+        status: task.repairContext.status || ""
+      } : null
     });
   }
   return tasks.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, limit);
@@ -8377,6 +9454,65 @@ async function writeEscalationArtifact(approval, policy, reason = "") {
     path: full,
     relativePath: toPosix(path.relative(APP_ROOT, full)),
     status: artifact.status
+  };
+}
+
+function approvalEscalationPolicy(approval = {}) {
+  if (approval.type === "process") return evaluateProcessPolicy(approval.command || "");
+  if (approval.type === "remote_publish_plan") {
+    return {
+      allowed: false,
+      risk: "high",
+      reason: "远端发布、PR 创建或评论回写需要外部平台凭据和人工授权。",
+      command: approval.command || "remote publish plan"
+    };
+  }
+  if (approval.type === "mcp_tool_call" || approval.type === "extension_tool_call") {
+    return {
+      allowed: false,
+      risk: approval.policy?.risk || "medium",
+      reason: approval.reason || approval.policy?.reason || "工具调用需要在审批后由受控执行器处理。",
+      command: approval.command || approval.type
+    };
+  }
+  return evaluateCommandPolicy(approval.command || "");
+}
+
+async function createApprovalEscalationArtifact(id, { reason = "" } = {}) {
+  const approval = await readApprovalRequest(id);
+  const policy = approvalEscalationPolicy(approval);
+  const escalationReason = reason || [
+    approval.status === "approved" ? "审批已批准，但本地策略仍不直接执行该动作。" : "审批尚未批准或仍被阻塞。",
+    "生成外部受控沙箱升级证据包，用于人工确认、外部执行和回填结果。"
+  ].join(" ");
+  const escalation = await writeEscalationArtifact(approval, policy, escalationReason);
+  const updated = {
+    ...approval,
+    escalation,
+    execution: {
+      ...(approval.execution || {}),
+      allowedByApproval: approval.status === "approved",
+      executed: false,
+      blocked: true,
+      policy,
+      escalation,
+      reason: "已生成升级证据包；本地未执行被拦截命令或远端写入。",
+      checkedAt: new Date().toISOString()
+    }
+  };
+  await fs.writeFile(path.join(APPROVAL_DIR, `${id}.json`), JSON.stringify(updated, null, 2), "utf8");
+  return {
+    id: updated.id,
+    status: updated.status,
+    type: updated.type || "command",
+    escalation,
+    execution: updated.execution,
+    policy: {
+      access: "external-escalation-artifact-only",
+      executesCommands: false,
+      writesRemote: false,
+      requiresExternalApproval: true
+    }
   };
 }
 
@@ -8910,6 +10046,94 @@ async function createHandoffDraft(prompt = "", { deep = false } = {}) {
   };
 }
 
+function buildCapabilityComparison(capabilities = []) {
+  const byArea = new Map((Array.isArray(capabilities) ? capabilities : []).map((item) => [item.area, item]));
+  const requirementDefs = [
+    {
+      id: "context",
+      title: "读懂项目上下文",
+      goal: "写代码前能快速定位文件、符号、引用、依赖和会话背景。",
+      areas: ["上下文索引", "会话线程管理", "可恢复状态"]
+    },
+    {
+      id: "safe-edit",
+      title: "安全改代码",
+      goal: "生成 diff 后可审批写入、冲突预检、部分应用、回滚和隔离任务。",
+      areas: ["审批写入与回滚", "Git 隔离", "权限与命令策略"]
+    },
+    {
+      id: "debug-loop",
+      title: "运行与调试闭环",
+      goal: "能发现启动命令、管理长任务、跑验证、读失败证据并进入可验证修复。",
+      areas: ["验证与修复闭环", "长任务管理", "浏览器自动化与视觉回归", "真实浏览器交互与截图", "浏览器 DOM 交互", "像素级视觉断言"]
+    },
+    {
+      id: "review-ship",
+      title: "审查与交付",
+      goal: "能产出审查证据、PR readiness、交付草稿和远端发布前置检查。",
+      areas: ["代码审查证据", "交付草稿", "远端 PR 与 CI 集成", "真实远端发布与平台同步"]
+    },
+    {
+      id: "tool-ecosystem",
+      title: "工具与多模态",
+      goal: "能接入本地工具、MCP、扩展、浏览器自动化、资产检查和模型运行层。",
+      areas: ["工具生态", "外部工具与浏览器自动化", "多模态与浏览器执行", "模型运行层"]
+    }
+  ];
+  const requirements = requirementDefs.map((definition) => {
+    const matched = definition.areas.map((area) => byArea.get(area)).filter(Boolean);
+    const gaps = matched
+      .filter((item) => item.status !== "implemented")
+      .map((item) => ({
+        area: item.area,
+        status: item.status,
+        next: item.next || "",
+        evidence: (item.evidence || []).slice(0, 6)
+      }));
+    const status = !matched.length || gaps.some((item) => item.status === "missing")
+      ? "missing"
+      : gaps.length
+        ? "partial"
+        : "implemented";
+    return {
+      ...definition,
+      status,
+      evidence: matched.flatMap((item) => item.evidence || []).slice(0, 12),
+      gaps,
+      nextAction: gaps[0]?.next || "当前需求链路已有本地证据覆盖；继续用 smoke 和真实任务验证体验。"
+    };
+  });
+  const summary = requirements.reduce((acc, item) => {
+    acc[item.status] = (acc[item.status] || 0) + 1;
+    return acc;
+  }, {});
+  const outstandingGaps = (Array.isArray(capabilities) ? capabilities : [])
+    .filter((item) => item && item.status !== "implemented")
+    .map((item) => {
+      const externalDependency = /(远端|真实 PR|push|provider|云端|凭据|认证|扩展市场|签名链|跨站点|账单直连|系统级沙箱)/i.test(`${item.area || ""} ${item.next || ""}`);
+      return {
+        area: item.area,
+        status: item.status,
+        externalDependency,
+        evidence: (item.evidence || []).slice(0, 8),
+        next: item.next || ""
+      };
+    });
+  return {
+    status: summary.missing ? "missing" : summary.partial ? "partial" : "implemented",
+    summary,
+    requirements,
+    outstandingGaps,
+    localActionableGaps: outstandingGaps.filter((item) => !item.externalDependency),
+    externalBlockedGaps: outstandingGaps.filter((item) => item.externalDependency),
+    definitionOfDone: [
+      "上下文、编辑、运行调试、审查交付和工具生态五条主链路均有本地可验证证据。",
+      "所有 partial/missing 项都有明确下一步、证据来源和是否依赖外部授权的标记。",
+      "用户能从任一缺口直接进入提示词、验证命令或修复代理。"
+    ]
+  };
+}
+
 async function buildCapabilityAudit({ light = false } = {}) {
   const git = light
     ? { available: false, branch: "", root: "", status: [], changedFiles: [], remotes: [], upstream: "", skipped: "light capability audit" }
@@ -8931,19 +10155,19 @@ async function buildCapabilityAudit({ light = false } = {}) {
       area: "上下文索引",
       status: "implemented",
       evidence: ["repo_map", "read_file_range", "search_files", "/api/semantic-index", "/api/code-intelligence", "/api/symbol-outline", "/api/semantic-definition", "/api/semantic-search", "/api/semantic-references", "/api/dependency-graph", ".forge/state/semantic-index.json"],
-      next: "已补本地语义索引、代码智能概览、零依赖符号大纲、定义查询、语义检索、符号引用跳转和导入依赖图；可继续接入真实 LSP/TypeScript compiler API。"
+      next: "已补本地语义索引、代码智能概览、零依赖符号大纲、定义查询、语义检索、符号引用跳转、导入依赖图和 TypeScript 类型检查发现；可继续接入真实 LSP/TypeScript compiler API。"
     },
     {
       area: "审批写入与回滚",
       status: "implemented",
       evidence: ["/api/apply", "/api/rollback", "/api/diff-conflicts", "/api/conflict-resolution-draft", ".forge/checkpoints", "apply conflict preflight", "allowPartial partial apply", "partial hunk apply", "conflict marker preview", "resolution pending proposal"],
-      next: "已补写入前冲突预检、默认零写入失败保护、显式文件级/hunk 级部分应用、只读 CURRENT/PROPOSED 冲突预览、冲突解决草稿 pendingProposal 和 checkpoint 回滚；可继续增强逐 hunk 交互式编辑界面。"
+      next: "已补写入前冲突预检、默认零写入失败保护、显式文件级/hunk 级部分应用、前端逐 hunk 勾选、只读 CURRENT/PROPOSED 冲突预览、冲突解决草稿 pendingProposal 和 checkpoint 回滚；可继续增强多文件冲突批量解决体验。"
     },
     {
       area: "验证与修复闭环",
       status: "implemented",
-      evidence: ["discoverCheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status"],
-      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、CI 配置、最近验证证据、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
+      evidence: ["discoverCheckCommands", "discoverTypecheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status"],
+      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、TypeScript 类型检查发现、CI 配置、最近验证证据、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
     },
     {
       area: "代码审查证据",
@@ -8972,14 +10196,14 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "可恢复状态",
       status: "implemented",
-      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", goal.phase || "idle"],
-      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact 和语义索引持久化；可继续增加更细粒度的摘要裁剪策略。"
+      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", "/api/health recoverySummary", "lastFailedCommand", "verificationCommands", goal.phase || "idle"],
+      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact、语义索引持久化、刷新后的 recoverySummary 下一步线索、最近失败命令、变更文件、选中 hunk 和可重跑验证命令；可继续增加更细粒度的摘要裁剪策略。"
     },
     {
       area: "长任务管理",
       status: "implemented",
       evidence: ["/api/processes", "/api/process-health", "/api/process-search", ".forge/process-logs", ".forge/process-health-rules.json", `${managedProcessCount} 个受管进程`, "独立健康探针汇总", "可配置健康规则匹配"],
-      next: "已补受管进程输出搜索、独立健康探针、可配置健康规则、日志 artifact 持久化和历史回放；可继续增加更多服务健康规则类型。"
+      next: "已补启动命令发现/脚本展开/发现并启动、启动后自动识别页面 URL、受管进程输出搜索、独立健康探针、可配置健康规则、日志 artifact 持久化和历史回放；可继续增加更多服务健康规则类型。"
     },
     {
       area: "交付草稿",
@@ -9080,12 +10304,67 @@ async function buildCapabilityAudit({ light = false } = {}) {
     acc[item.status] = (acc[item.status] || 0) + 1;
     return acc;
   }, {});
+  const recommendedNext = selectCapabilityRecommendation(capabilities);
+  const comparison = buildCapabilityComparison(capabilities);
   return {
     generatedAt: new Date().toISOString(),
     workspace: currentWorkspace,
     summary,
+    recommendedNext,
+    comparison,
     capabilities,
     recentEvidence: { tasks, threads, reviews, approvals, extensions: extensions.summary, mcp: mcp.summary, assets: assets.summary, goal }
+  };
+}
+
+function selectCapabilityRecommendation(capabilities = []) {
+  const impactRank = new Map([
+    ["验证与修复闭环", 120],
+    ["可恢复状态", 115],
+    ["长任务管理", 110],
+    ["外部工具与浏览器自动化", 105],
+    ["浏览器自动化与视觉回归", 100],
+    ["真实浏览器交互与截图", 98],
+    ["浏览器 DOM 交互", 96],
+    ["代码审查证据", 94],
+    ["上下文索引", 92],
+    ["权限与命令策略", 90],
+    ["工具生态", 88],
+    ["模型运行层", 84],
+    ["远端 PR 与 CI 集成", 82],
+    ["真实远端发布与平台同步", 78],
+    ["多模态与浏览器执行", 74]
+  ]);
+  const scored = capabilities
+    .filter((item) => item && item.status !== "implemented")
+    .map((item) => {
+      const statusScore = item.status === "missing" ? 1000 : item.status === "partial" ? 500 : 100;
+      const impact = impactRank.get(item.area) || 50;
+      return {
+        capability: item,
+        score: statusScore + impact,
+        reason: [
+          item.status === "missing" ? "缺失能力优先补齐" : "部分实现能力优先闭环",
+          "按真实写代码、调试程序的日常影响排序",
+          item.next || ""
+        ].filter(Boolean).join("；")
+      };
+    })
+    .sort((a, b) => b.score - a.score || String(a.capability.area || "").localeCompare(String(b.capability.area || ""), "zh-Hans-CN"));
+  const top = scored[0] || null;
+  if (!top) {
+    return {
+      status: "complete",
+      reason: "当前能力矩阵没有未完成项。",
+      capability: null
+    };
+  }
+  return {
+    status: top.capability.status || "partial",
+    area: top.capability.area || "",
+    score: top.score,
+    reason: top.reason,
+    capability: top.capability
   };
 }
 
@@ -9377,6 +10656,24 @@ function getAgentTools() {
         parameters: {
           type: "object",
           properties: {
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "debug_diagnostics",
+        description: "聚合当前工作区调试诊断：验证门禁、CI 线索、受管进程健康、语义诊断和可选本地页面 Trace；默认不执行检查命令。",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+            commands: { type: "array", items: { type: "string" } },
+            includeTrace: { type: "boolean" },
+            runChecks: { type: "boolean" },
+            waitMs: { type: "number" },
             limit: { type: "number" }
           }
         }
@@ -10902,6 +12199,16 @@ async function runReadTool(name, args) {
       limit: Number(args.limit || 20)
     }));
   }
+  if (name === "debug_diagnostics") {
+    return JSON.stringify(await buildDebugDiagnostics({
+      url: String(args.url || ""),
+      commands: Array.isArray(args.commands) ? args.commands : [],
+      includeTrace: Boolean(args.includeTrace),
+      runChecks: Boolean(args.runChecks),
+      waitMs: Number(args.waitMs || 1500),
+      limit: Number(args.limit || 20)
+    }));
+  }
   if (name === "merge_gate") {
     return JSON.stringify(await buildMergeGateStatus({
       prompt: String(args.prompt || ""),
@@ -11153,7 +12460,32 @@ async function callDeepSeekMessages(messages, tools, options = {}) {
   throw new Error(`模型请求失败：${fallbacks.map((item) => `${item.model}: ${item.error}`).join(" | ")}`);
 }
 
-async function generateRepairDiff({ prompt, applied, checks }) {
+function summarizeDiagnosticsForRepair(diagnostics) {
+  if (!diagnostics) return "";
+  const findings = (diagnostics.findings || [])
+    .slice(0, 10)
+    .map((item) => `- [${item.severity || "info"}] ${item.area || "debug"}: ${item.message || ""}${item.evidence?.length ? ` | ${item.evidence.join(" · ").slice(0, 1000)}` : ""}`)
+    .join("\n");
+  const commands = (diagnostics.verificationPlan?.commands || [])
+    .slice(0, 8)
+    .map((item) => `- ${item.command}${item.reason ? ` (${item.reason})` : ""}`)
+    .join("\n");
+  const semantic = (diagnostics.semanticDiagnostics?.diagnostics || [])
+    .slice(0, 8)
+    .map((item) => `- ${item.severity || "info"} ${item.category || item.kind || "issue"} ${item.path || ""}:${item.line || ""} ${item.title || item.message || ""}`)
+    .join("\n");
+  return [
+    `状态：${diagnostics.status || "unknown"}`,
+    `摘要：${JSON.stringify(diagnostics.summary || {})}`,
+    findings ? `发现项：\n${findings}` : "",
+    commands ? `建议检查命令：\n${commands}` : "",
+    semantic ? `语义诊断：\n${semantic}` : "",
+    diagnostics.processHealth?.summary ? `进程健康：${JSON.stringify(diagnostics.processHealth.summary)}` : "",
+    diagnostics.browserTrace?.summary ? `页面 Trace：${JSON.stringify(diagnostics.browserTrace.summary)}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+async function generateRepairDiff({ prompt, applied, checks, diagnostics = null }) {
   if (!checks.some((item) => item.exitCode !== 0)) {
     return { reply: "检查通过，无需修复。", plan: [], diff: "", review: [], commands: [] };
   }
@@ -11195,6 +12527,9 @@ async function generateRepairDiff({ prompt, applied, checks }) {
           item.output || "(无输出)"
         ].join("\n")).join("\n\n"),
         "",
+        "自动调试诊断：",
+        summarizeDiagnosticsForRepair(diagnostics) || "(未提供诊断证据)",
+        "",
         "已写入文件内容：",
         changedFiles.map((file) => `--- ${file.path}\n${file.content}`).join("\n\n")
       ].join("\n")
@@ -11207,10 +12542,20 @@ async function generateRepairDiff({ prompt, applied, checks }) {
   return { ...payload, patches };
 }
 
-async function repairFromFailedCommand({ prompt = "", command = "", result = null }) {
+async function repairFromFailedCommand({ prompt = "", command = "", result = null, diagnostics = null }) {
   if (!result || result.exitCode === 0) {
     return { reply: "命令通过，无需修复。", plan: [], diff: "", review: [], commands: [], patches: [] };
   }
+  const repairDiagnostics = diagnostics || result.diagnostics || await buildDebugDiagnostics({
+    commands: [command],
+    includeTrace: false,
+    runChecks: false,
+    limit: 12
+  }).catch((error) => ({
+    status: "diagnostics_failed",
+    summary: { findings: 1, errors: 0, warnings: 1 },
+    findings: [{ severity: "warn", area: "debug", message: error.message, evidence: [] }]
+  }));
   return await generateRepairDiff({
     prompt,
     applied: [],
@@ -11219,12 +12564,130 @@ async function repairFromFailedCommand({ prompt = "", command = "", result = nul
       reason: "手动运行检查失败",
       exitCode: result.exitCode,
       output: result.output || ""
-    }]
+    }],
+    diagnostics: repairDiagnostics
   });
+}
+
+function normalizeAgentDebugContext(debugContext = null) {
+  if (!debugContext || typeof debugContext !== "object") return null;
+  const referencedFiles = Array.isArray(debugContext.referencedFiles)
+    ? [...new Set(debugContext.referencedFiles
+        .map((item) => toPosix(String(item || "").replace(/^\.?[\\/]/, "")))
+        .filter(Boolean))]
+        .slice(0, 16)
+    : [];
+  const findings = Array.isArray(debugContext.findings)
+    ? debugContext.findings.slice(0, 10).map((item) => ({
+        severity: String(item?.severity || "info").slice(0, 24),
+        area: String(item?.area || "debug").slice(0, 80),
+        message: String(item?.message || "").slice(0, 800),
+        evidence: Array.isArray(item?.evidence) ? item.evidence.slice(0, 6).map((entry) => String(entry).slice(0, 500)) : []
+      }))
+    : [];
+  const nextActions = Array.isArray(debugContext.nextActions)
+    ? debugContext.nextActions.slice(0, 8).map((item) => {
+        if (item && typeof item === "object") {
+          return {
+            id: String(item.id || "").slice(0, 120),
+            label: String(item.label || "").slice(0, 120),
+            priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : null,
+            kind: String(item.kind || "").slice(0, 80),
+            target: String(item.target || "").slice(0, 500),
+            command: String(item.command || "").slice(0, 400),
+            description: String(item.description || "").slice(0, 800),
+            evidence: Array.isArray(item.evidence) ? item.evidence.slice(0, 6).map((entry) => String(entry).slice(0, 500)) : []
+          };
+        }
+        return { description: String(item || "").slice(0, 800), evidence: [] };
+      })
+    : [];
+  const commands = Array.isArray(debugContext.verificationPlan?.commands)
+    ? debugContext.verificationPlan.commands.slice(0, 8).map((item) => ({
+        command: String(item?.command || item || "").slice(0, 400),
+        reason: String(item?.reason || "").slice(0, 400),
+        status: String(item?.status || "").slice(0, 80)
+      })).filter((item) => item.command)
+    : [];
+  const processRows = Array.isArray(debugContext.processHealth?.rows)
+    ? debugContext.processHealth.rows.slice(0, 8).map((row) => ({
+        id: String(row?.id || "").slice(0, 120),
+        status: String(row?.status || "").slice(0, 80),
+        command: String(row?.command || "").slice(0, 400),
+        probe: row?.probe || null,
+        rules: row?.rules || null
+      }))
+    : [];
+  const trace = debugContext.browserTrace && typeof debugContext.browserTrace === "object"
+    ? {
+        ok: Boolean(debugContext.browserTrace.ok),
+        url: String(debugContext.browserTrace.url || "").slice(0, 500),
+        finalUrl: String(debugContext.browserTrace.finalUrl || "").slice(0, 500),
+        summary: debugContext.browserTrace.summary || {},
+        console: Array.isArray(debugContext.browserTrace.console) ? debugContext.browserTrace.console.slice(0, 8) : [],
+        exceptions: Array.isArray(debugContext.browserTrace.exceptions) ? debugContext.browserTrace.exceptions.slice(0, 8) : [],
+        network: Array.isArray(debugContext.browserTrace.network) ? debugContext.browserTrace.network.slice(0, 8) : []
+      }
+    : null;
+  const normalized = {
+    source: String(debugContext.source || "lastDebugDiagnostics").slice(0, 80),
+    generatedAt: String(debugContext.generatedAt || "").slice(0, 80),
+    status: String(debugContext.status || "").slice(0, 80),
+    summary: debugContext.summary || {},
+    referencedFiles,
+    findings,
+    nextActions,
+    verificationPlan: debugContext.verificationPlan ? {
+      status: String(debugContext.verificationPlan.status || "").slice(0, 80),
+      commands
+    } : null,
+    processHealth: debugContext.processHealth ? {
+      summary: debugContext.processHealth.summary || {},
+      rows: processRows
+    } : null,
+    browserTrace: trace
+  };
+  const hasEvidence = referencedFiles.length || findings.length || nextActions.length || commands.length || processRows.length || trace;
+  return hasEvidence ? normalized : null;
+}
+
+async function buildDebugReferencedFileContext(debugContext = null, files = []) {
+  const referenced = Array.isArray(debugContext?.referencedFiles) ? debugContext.referencedFiles : [];
+  if (!referenced.length) return { context: [], missing: [], bytes: 0 };
+  const fileMap = new Map((files || []).map((file) => [toPosix(file.path).toLowerCase(), file]));
+  const context = [];
+  const missing = [];
+  let total = 0;
+  const maxBytes = 90000;
+  for (const requested of referenced.slice(0, 16)) {
+    const normalized = toPosix(requested);
+    const file = fileMap.get(normalized.toLowerCase());
+    if (!file) {
+      missing.push({ path: normalized, reason: "调试诊断引用的文件不在当前工作区文件列表中。" });
+      continue;
+    }
+    if (total >= maxBytes) break;
+    const content = await readWorkspaceFile(file.path).catch((error) => `DEBUG_REFERENCE_READ_ERROR: ${error.message}`);
+    const remaining = Math.max(0, maxBytes - total);
+    const clipped = content.slice(0, remaining);
+    total += Buffer.byteLength(clipped, "utf8");
+    context.push({
+      path: file.path,
+      size: file.size,
+      content: clipped,
+      clipped: clipped.length < content.length,
+      source: "debugContext.referencedFiles"
+    });
+  }
+  return { context, missing, bytes: total };
 }
 
 async function runAgentLoop(prompt, options = {}) {
   const files = await listFiles();
+  const promptReferenceFiles = await listPromptReferenceFiles();
+  const promptReferences = await buildPromptReferenceContext(prompt, promptReferenceFiles);
+  const debugContext = normalizeAgentDebugContext(options.debugContext);
+  const debugReferences = debugContext ? await buildDebugReferencedFileContext(debugContext, promptReferenceFiles) : { context: [], missing: [], bytes: 0 };
   const toolLog = [];
   const tools = getAgentTools();
   const onProviderToken = typeof options.onProviderToken === "function" ? options.onProviderToken : null;
@@ -11235,6 +12698,8 @@ async function runAgentLoop(prompt, options = {}) {
       content: [
         "你是 Forge Code 的编码代理。你必须先通过工具读取/搜索相关文件，再给出可审阅修改。",
         "你只能使用工具读取上下文，不能猜测文件内容。优先用 repo_map 建立仓库地图，再用 search_files/read_file_range/read_file 精确读取。",
+        "用户需求中形如 @path/to/file 的引用是用户显式指定的重点上下文；这些文件会预读给你，你必须优先围绕它们排查和修改。",
+        "如果 promptReferences.missing 非空，说明用户写了未命中的 @file；你需要在 reply/review 中提醒用户路径未命中，不能假装已经读取。",
         "不要直接要求用户复制文件。",
         "最终回复必须是 JSON 对象：{\"reply\":\"中文摘要\",\"plan\":[\"步骤\"],\"diff\":\"unified diff\",\"review\":[{\"severity\":\"info|warning|error\",\"message\":\"审查发现\",\"file\":\"相对路径\",\"line\":\"行号\"}],\"commands\":[{\"command\":\"命令\",\"reason\":\"原因\"}]}",
         "diff 必须是标准 unified diff，使用 --- path 和 +++ path 文件头；路径必须是工作区相对路径，不要以 / 开头，不要使用绝对路径。",
@@ -11247,7 +12712,45 @@ async function runAgentLoop(prompt, options = {}) {
     },
     {
       role: "user",
-      content: `用户需求：${prompt}\n\n工作区文件摘要：\n${files.slice(0, 180).map((file) => `${file.path} (${file.size} bytes)`).join("\n")}`
+      content: [
+        `用户需求：${prompt}`,
+        "",
+        promptReferences.context.length
+          ? [
+              "用户显式引用文件上下文：",
+              ...promptReferences.context.map((item) => [
+                `--- ${item.path} (${item.size} bytes${item.clipped ? ", clipped" : ""})`,
+                item.content
+              ].join("\n"))
+            ].join("\n\n")
+          : "用户显式引用文件上下文：(无)",
+        promptReferences.missing.length
+          ? `未命中的 @file 引用：\n${promptReferences.missing.map((item) => `- @${item.path}: ${item.reason}`).join("\n")}`
+          : "未命中的 @file 引用：(无)",
+        "",
+        debugReferences.context.length
+          ? [
+              "上一轮调试诊断相关文件上下文：",
+              ...debugReferences.context.map((item) => [
+                `--- ${item.path} (${item.size} bytes${item.clipped ? ", clipped" : ""})`,
+                item.content
+              ].join("\n"))
+            ].join("\n\n")
+          : "上一轮调试诊断相关文件上下文：(无)",
+        debugReferences.missing.length
+          ? `调试诊断未命中文件：\n${debugReferences.missing.map((item) => `- @${item.path}: ${item.reason}`).join("\n")}`
+          : "调试诊断未命中文件：(无)",
+        "",
+        debugContext
+          ? [
+              "上一轮调试诊断上下文：",
+              JSON.stringify(debugContext, null, 2)
+            ].join("\n")
+          : "上一轮调试诊断上下文：(无)",
+        "",
+        "工作区文件摘要：",
+        files.slice(0, 180).map((file) => `${file.path} (${file.size} bytes)`).join("\n")
+      ].join("\n")
     }
   ];
 
@@ -11273,7 +12776,7 @@ async function runAgentLoop(prompt, options = {}) {
       const finalPayload = normalizeAgentPayload(finalMessage.content);
       const patches = finalPayload.diff ? await previewUnifiedDiff(finalPayload.diff) : [];
       const checks = await discoverCheckCommands(finalPayload.commands);
-      return { ...finalPayload, patches, commands: checks, toolLog, providerTokenStreaming };
+      return { ...finalPayload, patches, commands: checks, toolLog, providerTokenStreaming, promptReferences, debugContext, debugReferences };
     }
     for (const call of toolCalls) {
       const name = call.function?.name;
@@ -11304,7 +12807,7 @@ async function runAgentLoop(prompt, options = {}) {
   const finalPayload = normalizeAgentPayload(finalMessage.content);
   const patches = finalPayload.diff ? await previewUnifiedDiff(finalPayload.diff) : [];
   const checks = await discoverCheckCommands(finalPayload.commands);
-  return { ...finalPayload, patches, commands: checks, toolLog, providerTokenStreaming: Boolean(finalMessage._providerTokenStreaming) };
+    return { ...finalPayload, patches, commands: checks, toolLog, providerTokenStreaming: Boolean(finalMessage._providerTokenStreaming), promptReferences, debugContext, debugReferences };
 }
 
 async function persistAgentResult(prompt, result) {
@@ -11333,6 +12836,7 @@ function attachModelEvidence(result) {
   const providerTokenStreaming = Boolean(result.providerTokenStreaming);
   return {
     ...result,
+    promptReferences: summarizePromptReferences(result.promptReferences),
     model: currentModelName(),
     modelRuntime: {
       ...modelRuntime,
@@ -11346,6 +12850,21 @@ function attachModelEvidence(result) {
       providerTokenStreaming,
       exposesApiKey: false
     }
+  };
+}
+
+function summarizePromptReferences(promptReferences = {}) {
+  const context = Array.isArray(promptReferences.context) ? promptReferences.context : [];
+  return {
+    references: Array.isArray(promptReferences.references) ? promptReferences.references : [],
+    missing: Array.isArray(promptReferences.missing) ? promptReferences.missing : [],
+    bytes: Number(promptReferences.bytes || 0),
+    context: context.map((item) => ({
+      path: item.path,
+      size: item.size,
+      clipped: Boolean(item.clipped),
+      contentBytes: Buffer.byteLength(String(item.content || ""), "utf8")
+    }))
   };
 }
 
@@ -11397,6 +12916,7 @@ async function handleApi(req, res) {
         readGoalState(),
         buildCapabilityAudit({ light: !deep })
       ]);
+      const recoverySummary = buildGoalRecoverySummary({ goal, tasks, capabilities, contextRollup });
       return send(res, 200, {
         ok: true,
         deep,
@@ -11424,6 +12944,7 @@ async function handleApi(req, res) {
         contextCompact: await readContextCompaction(),
         contextRollup,
         goal,
+        recoverySummary,
         capabilities
       });
     }
@@ -11525,6 +13046,27 @@ async function handleApi(req, res) {
       return send(res, 200, { status: await buildCiStatus({
         deep: Boolean(payload.deep),
         persist: Boolean(payload.persist),
+        limit: Number(payload.limit || 20)
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/debug-diagnostics") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            url: url.searchParams.get("url") || "",
+            includeTrace: url.searchParams.get("includeTrace") === "1",
+            runChecks: url.searchParams.get("runChecks") === "1",
+            waitMs: Number(url.searchParams.get("waitMs") || 1500),
+            limit: Number(url.searchParams.get("limit") || 20),
+            commands: []
+          };
+      return send(res, 200, { diagnostics: await buildDebugDiagnostics({
+        url: String(payload.url || ""),
+        commands: Array.isArray(payload.commands) ? payload.commands : [],
+        includeTrace: Boolean(payload.includeTrace),
+        runChecks: Boolean(payload.runChecks),
+        waitMs: Number(payload.waitMs || 1500),
         limit: Number(payload.limit || 20)
       }) });
     }
@@ -11832,6 +13374,11 @@ async function handleApi(req, res) {
       return send(res, 200, await executeApprovedRequest(id));
     }
 
+    if (req.method === "POST" && url.pathname === "/api/approval-escalation") {
+      const { id = "", reason = "" } = await readJson(req);
+      return send(res, 200, await createApprovalEscalationArtifact(id, { reason }));
+    }
+
     if (req.method === "POST" && url.pathname === "/api/workspace") {
       const { workspace } = await readJson(req);
       return send(res, 200, await setWorkspace(workspace));
@@ -11887,6 +13434,12 @@ async function handleApi(req, res) {
 
     if (req.method === "GET" && url.pathname === "/api/processes") {
       return send(res, 200, { processes: await listManagedProcesses({ probe: true }) });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/process-startup-commands") {
+      return send(res, 200, await discoverStartupCommands({
+        limit: Number(url.searchParams.get("limit") || 8)
+      }));
     }
 
     if (req.method === "GET" && url.pathname === "/api/process-health") {
@@ -11946,8 +13499,62 @@ async function handleApi(req, res) {
 
     if (req.method === "GET" && url.pathname === "/api/file") {
       const relativePath = url.searchParams.get("path") || "";
+      const startLine = url.searchParams.get("startLine");
+      const lineCount = url.searchParams.get("lineCount");
+      if (startLine || lineCount) {
+        const content = await readWorkspaceFileRange(relativePath, Number(startLine || 1), Number(lineCount || 120));
+        return send(res, 200, {
+          path: relativePath,
+          startLine: Math.max(1, Number(startLine) || 1),
+          lineCount: Math.min(400, Math.max(1, Number(lineCount) || 120)),
+          content,
+          ranged: true
+        });
+      }
       const content = await readWorkspaceFile(relativePath);
       return send(res, 200, { path: relativePath, content });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/source-context") {
+      const { locations = [], contextLines = 6, limit = 8 } = await readJson(req);
+      const contexts = await readWorkspaceSourceLocationContexts(locations, contextLines, limit);
+      return send(res, 200, {
+        contexts,
+        summary: {
+          requested: Array.isArray(locations) ? locations.length : 0,
+          returned: contexts.length,
+          errors: contexts.filter((item) => item.error).length
+        },
+        policy: {
+          access: "read-only",
+          scope: "currentWorkspace",
+          executesCommands: false
+        }
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/prompt-references") {
+      const { prompt = "" } = await readJson(req);
+      const files = await listPromptReferenceFiles();
+      const preview = await buildPromptReferenceContext(String(prompt || ""), files);
+      return send(res, 200, {
+        policy: {
+          access: "read-only",
+          scope: "currentWorkspace",
+          executesCommands: false,
+          exposesApiKey: false
+        },
+        tokens: extractPromptReferenceTokens(prompt),
+        references: preview.references,
+        missing: preview.missing,
+        bytes: preview.bytes,
+        context: preview.context.map((item) => ({
+          path: item.path,
+          size: item.size,
+          clipped: Boolean(item.clipped),
+          contentBytes: Buffer.byteLength(String(item.content || ""), "utf8")
+        }))
+      });
     }
 
     if (req.method === "GET" && url.pathname === "/api/checkpoints") {
@@ -11955,7 +13562,7 @@ async function handleApi(req, res) {
     }
 
     if (req.method === "POST" && url.pathname === "/api/agent") {
-      const { prompt } = await readJson(req);
+      const { prompt, debugContext = null } = await readJson(req);
       if (!prompt || typeof prompt !== "string") throw new Error("缺少 prompt。");
       await writeGoalState({
         objective: prompt,
@@ -11964,7 +13571,7 @@ async function handleApi(req, res) {
         lastPrompt: prompt,
         nextStep: "等待代理生成计划、diff、审查发现和建议命令。"
       });
-      const result = await runAgentLoop(prompt);
+      const result = await runAgentLoop(prompt, { debugContext });
       await persistAgentResult(prompt, result);
       return send(res, 200, attachModelEvidence(result));
     }
@@ -11973,8 +13580,9 @@ async function handleApi(req, res) {
       beginSse(res);
       const startedAt = new Date().toISOString();
       try {
-        const { prompt } = await readJson(req);
+        const { prompt, debugContext = null } = await readJson(req);
         if (!prompt || typeof prompt !== "string") throw new Error("缺少 prompt。");
+        const normalizedDebugContext = normalizeAgentDebugContext(debugContext);
         writeSse(res, "start", {
           ok: true,
           startedAt,
@@ -11993,12 +13601,19 @@ async function handleApi(req, res) {
         });
         writeSse(res, "goal", { status: "running", phase: "agent_running" });
         const files = await listFiles();
+        const promptReferenceFiles = await listPromptReferenceFiles();
+        const promptReferencePreview = await buildPromptReferenceContext(prompt, promptReferenceFiles);
         writeSse(res, "context", {
           fileCount: files.length,
-          contextLimitBytes: CONTEXT_LIMIT_BYTES
+          contextLimitBytes: CONTEXT_LIMIT_BYTES,
+          referencedFiles: promptReferencePreview.references,
+          missingReferences: promptReferencePreview.missing,
+          referencedBytes: promptReferencePreview.bytes,
+          debugContextAttached: Boolean(normalizedDebugContext)
         });
         let tokenCount = 0;
         const result = await runAgentLoop(prompt, {
+          debugContext: normalizedDebugContext,
           onProviderToken: (token) => {
             tokenCount += 1;
             writeSse(res, "token", {
@@ -12032,8 +13647,10 @@ async function handleApi(req, res) {
     }
 
     if (req.method === "POST" && url.pathname === "/api/apply") {
-      const { diff, prompt = "", commands = [], allowPartial = false, skipChecks = false, skipGit = false } = await readJson(req);
+      const { diff, prompt = "", commands = [], allowPartial = false, skipChecks = false, skipGit = false, repairContext = null, selectedHunks = [] } = await readJson(req);
       if (!diff || typeof diff !== "string") throw new Error("缺少 diff。");
+      const normalizedRepairContext = normalizeRepairContext(repairContext);
+      const selectedHunkSummary = normalizeSelectedHunks(selectedHunks);
       const analysis = await analyzeUnifiedDiffApplication(diff);
       if (analysis.conflicts.length && !allowPartial) {
         return send(res, 200, {
@@ -12048,6 +13665,7 @@ async function handleApi(req, res) {
           },
           conflicts: analysis.conflicts,
           analysis,
+          selectedHunks: selectedHunkSummary,
           policy: {
             writesFiles: false,
             createsCheckpoint: false,
@@ -12073,6 +13691,7 @@ async function handleApi(req, res) {
           },
           conflicts: analysis.conflicts,
           analysis,
+          selectedHunks: selectedHunkSummary,
           policy: {
             writesFiles: false,
             createsCheckpoint: false,
@@ -12139,16 +13758,34 @@ async function handleApi(req, res) {
             ? "repair_suggested"
             : "failed";
       const finalStatus = analysis.conflicts.length ? `partial_${status}` : status;
+      const taskRepairContext = normalizedRepairContext ? {
+        ...normalizedRepairContext,
+        status: finalStatus,
+        apply: {
+          status: finalStatus,
+          checkpointId: checkpoint.id,
+          changedFiles: applied.map((item) => item.path),
+          selectedHunks: selectedHunkSummary
+        },
+        verification: {
+          ok: verification.ok,
+          skipped: verification.skipped,
+          checkCount: verification.checks.length,
+          failedCommands: verification.checks.filter((check) => check.exitCode !== 0).map((check) => check.command).slice(0, 8)
+        }
+      } : null;
       const task = await writeTaskLog({
         prompt,
         status: finalStatus,
         checkpointId: checkpoint.id,
         changedFiles: applied.map((item) => item.path),
+        selectedHunks: selectedHunkSummary,
         conflicts: analysis.conflicts,
         checksOk: verification.ok && !verification.skipped,
         checks: verification.checks,
         repairDiff: repair?.diff || "",
         repairReview: repair?.review || [],
+        repairContext: taskRepairContext,
         repairError,
         git
       });
@@ -12191,10 +13828,12 @@ async function handleApi(req, res) {
         checkpoint,
         verification,
         repair,
+        repairContext: taskRepairContext,
         repairError,
         git,
         task,
         conflicts: analysis.conflicts,
+        selectedHunks: selectedHunkSummary,
         analysis: {
           generatedAt: analysis.generatedAt,
           summary: analysis.summary,
@@ -12208,6 +13847,7 @@ async function handleApi(req, res) {
           skipChecks: Boolean(skipChecks),
           skipGit: Boolean(skipGit),
           supportsPartialHunks: true,
+          selectedHunks: selectedHunkSummary.length,
           blockedBeforeWrite: false
         }
       });
@@ -12226,9 +13866,9 @@ async function handleApi(req, res) {
     }
 
     if (req.method === "POST" && url.pathname === "/api/repair-command") {
-      const { prompt = "", command = "", result = null } = await readJson(req);
+      const { prompt = "", command = "", result = null, diagnostics = null } = await readJson(req);
       if (!command || typeof command !== "string") throw new Error("缺少 command。");
-      return send(res, 200, await repairFromFailedCommand({ prompt, command, result }));
+      return send(res, 200, await repairFromFailedCommand({ prompt, command, result, diagnostics }));
     }
 
     if (req.method === "GET" && url.pathname === "/api/diff") {
@@ -12359,13 +13999,17 @@ async function handleApi(req, res) {
   }
 }
 
-const server = http.createServer((req, res) => {
+function createAppServer() {
+  return http.createServer((req, res) => {
   if (req.url?.startsWith("/api/")) {
     handleApi(req, res);
     return;
   }
   handleStatic(req, res);
-});
+  });
+}
+
+const server = createAppServer();
 
 async function runSmokeTest() {
   const context = await collectContext();
@@ -12388,63 +14032,63 @@ async function runSmokeTest() {
 }
 
 async function requestJson(baseUrl, route, options = {}) {
-  let response;
   const controller = new AbortController();
   const timeoutMs = Number(options.timeoutMs) || 30000;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    response = await fetch(`${baseUrl}${route}`, {
+    const response = await fetch(`${baseUrl}${route}`, {
       headers: { "Content-Type": "application/json", ...(options.headers || {}) },
       ...options,
       signal: options.signal || controller.signal
     });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(`${route} failed: ${response.status} ${data.error || ""}`);
+    }
+    return data;
   } catch (error) {
-    throw new Error(`${route} failed before response after ${timeoutMs}ms: ${error.message}`);
+    const timedOut = controller.signal.aborted && !options.signal?.aborted;
+    throw new Error(`${route} failed after ${timeoutMs}ms${timedOut ? " (timeout)" : ""}: ${error.message}`);
   } finally {
     clearTimeout(timer);
   }
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(`${route} failed: ${response.status} ${data.error || ""}`);
-  }
-  return data;
 }
 
 async function requestSse(baseUrl, route, options = {}) {
-  let response;
   const controller = new AbortController();
   const timeoutMs = Number(options.timeoutMs) || 30000;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    response = await fetch(`${baseUrl}${route}`, {
+    const response = await fetch(`${baseUrl}${route}`, {
       headers: { "Content-Type": "application/json", ...(options.headers || {}) },
       ...options,
       signal: options.signal || controller.signal
     });
+    const contentType = response.headers.get("content-type") || "";
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`${route} SSE failed: ${response.status} ${text.slice(0, 500)}`);
+    }
+    const events = text.split(/\n\n+/)
+      .map((chunk) => {
+        const event = (chunk.match(/^event:\s*(.+)$/m)?.[1] || "").trim();
+        const dataText = (chunk.match(/^data:\s*(.+)$/m)?.[1] || "{}").trim();
+        let data = {};
+        try {
+          data = JSON.parse(dataText);
+        } catch {
+          data = { raw: dataText };
+        }
+        return event ? { event, data } : null;
+      })
+      .filter(Boolean);
+    return { ok: response.ok, contentType, text, events };
   } catch (error) {
-    throw new Error(`${route} SSE failed before response after ${timeoutMs}ms: ${error.message}`);
+    const timedOut = controller.signal.aborted && !options.signal?.aborted;
+    throw new Error(`${route} SSE failed after ${timeoutMs}ms${timedOut ? " (timeout)" : ""}: ${error.message}`);
   } finally {
     clearTimeout(timer);
   }
-  const contentType = response.headers.get("content-type") || "";
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`${route} SSE failed: ${response.status} ${text.slice(0, 500)}`);
-  }
-  const events = text.split(/\n\n+/)
-    .map((chunk) => {
-      const event = (chunk.match(/^event:\s*(.+)$/m)?.[1] || "").trim();
-      const dataText = (chunk.match(/^data:\s*(.+)$/m)?.[1] || "{}").trim();
-      let data = {};
-      try {
-        data = JSON.parse(dataText);
-      } catch {
-        data = { raw: dataText };
-      }
-      return event ? { event, data } : null;
-    })
-    .filter(Boolean);
-  return { ok: response.ok, contentType, text, events };
 }
 
 function runMcpSmokeServer() {
@@ -12571,19 +14215,465 @@ function assertIncludes(source, needle, message) {
   assertSmoke(source.includes(needle), message || `missing ${needle}`);
 }
 
+async function closeSmokeServer(serverInstance) {
+  if (!serverInstance?.listening) return;
+  await new Promise((resolve) => {
+    serverInstance.close(() => resolve());
+  });
+}
+
+const API_SMOKE_SECTION_ALIASES = {
+  all: ["core", "browser", "semantic", "model", "extensions", "mcp", "assets", "apply", "runtime", "context", "gates", "remote"],
+  fast: ["core", "semantic", "model", "apply", "context", "gates"],
+  coding: ["core", "semantic", "apply", "runtime", "context", "gates"],
+  debug: ["core", "browser", "semantic", "runtime", "gates"],
+  integrations: ["extensions", "mcp", "assets"],
+  publish: ["gates", "remote"]
+};
+
+const API_SMOKE_SECTION_SET = new Set([
+  "core",
+  "browser",
+  "semantic",
+  "model",
+  "extensions",
+  "mcp",
+  "assets",
+  "apply",
+  "runtime",
+  "context",
+  "gates",
+  "remote"
+]);
+
+function getCliOption(name, fallback = "") {
+  const prefix = `${name}=`;
+  const inline = process.argv.find((item) => item.startsWith(prefix));
+  if (inline) return inline.slice(prefix.length);
+  const index = process.argv.indexOf(name);
+  if (index >= 0 && process.argv[index + 1] && !process.argv[index + 1].startsWith("--")) return process.argv[index + 1];
+  return fallback;
+}
+
+function parseApiSmokeSections(value = process.env.API_SMOKE_SECTION || process.env.API_SMOKE_SECTIONS || "") {
+  const raw = String(value || "fast")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  const requested = raw.length ? raw : ["fast"];
+  const sections = [];
+  for (const item of requested) {
+    const expanded = API_SMOKE_SECTION_ALIASES[item] || [item];
+    for (const section of expanded) {
+      if (!API_SMOKE_SECTION_SET.has(section)) {
+        throw new Error(`Unknown API smoke section: ${section}. Available: ${[...API_SMOKE_SECTION_SET].join(", ")}. Aliases: ${Object.keys(API_SMOKE_SECTION_ALIASES).join(", ")}`);
+      }
+      if (!sections.includes(section)) sections.push(section);
+    }
+  }
+  return sections;
+}
+
+async function runApiSmokeSectionTest(sectionValue = "") {
+  const sections = parseApiSmokeSections(sectionValue);
+  const sectionSet = new Set(sections);
+  const shouldRun = (name) => sectionSet.has(name);
+  const smokeStep = (name) => {
+    if (process.env.API_SMOKE_PROGRESS === "1") console.error(`[api-smoke:${sections.join(",")}] ${name}`);
+  };
+  const originalWorkspace = currentWorkspace;
+  currentWorkspace = APP_ROOT;
+  const sectionServer = createAppServer();
+  smokeStep("listen");
+  await new Promise((resolve, reject) => {
+    sectionServer.once("error", reject);
+    sectionServer.listen(0, "127.0.0.1", resolve);
+  });
+  const address = sectionServer.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const cleanup = {
+    extensionFixtureDir: "",
+    mcpFixturePath: "",
+    mcpOriginalFixture: null,
+    applyFixtureAPath: "",
+    applyFixtureBPath: "",
+    processFixturePath: "",
+    processId: "",
+    processLogPaths: [],
+    threadPath: "",
+    forkThreadPath: "",
+    handoffPath: "",
+    remotePublishDir: "",
+    remoteCiArtifactPath: ""
+  };
+  const checked = [];
+  try {
+    if (shouldRun("core")) {
+      smokeStep("core");
+      const health = await requestJson(baseUrl, "/api/health");
+      assertSmoke(health.ok === true, "health did not return ok=true");
+      assertSmoke(Array.isArray(health.queue), "health did not include queue");
+      assertSmoke(Array.isArray(health.approvals), "health did not include approvals");
+      const files = await requestJson(baseUrl, "/api/files");
+      assertSmoke(Array.isArray(files.files), "files did not include file list");
+      const capabilities = await requestJson(baseUrl, "/api/capabilities");
+      assertSmoke(capabilities.capabilities.some((item) => item.area === "可恢复状态"), "capabilities missing resumable state");
+      const tools = await requestJson(baseUrl, "/api/tools");
+      assertSmoke(tools.tools.some((item) => item.name === "repo_map"), "tools missing repo_map");
+      checked.push("health", "files", "capabilities", "tools");
+    }
+
+    if (shouldRun("browser")) {
+      smokeStep("browser");
+      const browserCheck = await requestJson(baseUrl, "/api/browser-check", {
+        method: "POST",
+        timeoutMs: 90000,
+        body: JSON.stringify({ url: `${baseUrl}/` })
+      });
+      assertSmoke(browserCheck.ok === true, "browser check did not return ok=true");
+      const browserAudit = await requestJson(baseUrl, "/api/browser-audit", {
+        method: "POST",
+        body: JSON.stringify({ url: `${baseUrl}/` })
+      });
+      assertSmoke(browserAudit.policy?.staticHtmlAudit === true, "browser audit missing static policy");
+      const debugDiagnostics = await requestJson(baseUrl, "/api/debug-diagnostics", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({ url: `${baseUrl}/`, includeTrace: false, runChecks: false, limit: 8 })
+      });
+      assertSmoke(Array.isArray(debugDiagnostics.diagnostics?.findings), "debug diagnostics missing findings");
+      assertSmoke(
+        debugDiagnostics.diagnostics?.verificationPlan?.commands?.some((item) => String(item.command || "").includes("--api-smoke-section=debug")),
+        "debug diagnostics verification plan missing debug smoke command"
+      );
+      assertSmoke(
+        debugDiagnostics.diagnostics?.nextActions?.some((item) => item.id === "run-debug-smoke"),
+        "debug diagnostics missing run-debug-smoke next action"
+      );
+      const debugNextAction = debugDiagnostics.diagnostics?.nextActions?.find((item) => item.id === "run-debug-smoke");
+      assertSmoke(Number.isFinite(Number(debugNextAction?.priority)), "debug diagnostics next action missing priority");
+      assertSmoke(debugNextAction?.kind === "command", "debug diagnostics next action missing kind");
+      assertSmoke(Array.isArray(debugNextAction?.evidence), "debug diagnostics next action missing evidence");
+      checked.push("browser-check", "browser-audit", "debug-diagnostics");
+    }
+
+    if (shouldRun("semantic")) {
+      smokeStep("semantic");
+      const semanticIndex = await requestJson(baseUrl, "/api/semantic-index", { method: "POST" });
+      assertSmoke(semanticIndex.index?.indexedFiles >= 1, "semantic index missing indexed files");
+      const symbolOutline = await requestJson(baseUrl, "/api/symbol-outline", {
+        method: "POST",
+        body: JSON.stringify({ query: "buildSemanticIndex", path: "server.js", limit: 10, includeContext: true })
+      });
+      assertSmoke(symbolOutline.summary?.matched >= 1, "symbol outline missing query match");
+      const semanticSearch = await requestJson(baseUrl, "/api/semantic-search", {
+        method: "POST",
+        body: JSON.stringify({ query: "buildSemanticIndex", kind: "declaration", limit: 10 })
+      });
+      assertSmoke(semanticSearch.matchCount >= 1, "semantic search did not find declaration");
+      const semanticDiagnostics = await requestJson(baseUrl, "/api/semantic-diagnostics", {
+        method: "POST",
+        body: JSON.stringify({ limit: 20, includeContext: true })
+      });
+      assertSmoke(Array.isArray(semanticDiagnostics.diagnostics), "semantic diagnostics missing diagnostics list");
+      checked.push("semantic-index", "symbol-outline", "semantic-search", "semantic-diagnostics");
+    }
+
+    if (shouldRun("model")) {
+      smokeStep("model");
+      const modelPolicy = await requestJson(baseUrl, "/api/model-policy", {
+        method: "POST",
+        body: JSON.stringify({ includeRecent: true })
+      });
+      assertSmoke(modelPolicy.policy?.policy?.exposesApiKey === false, "model policy should not expose API key");
+      const modelBudget = await requestJson(baseUrl, "/api/model-budget", {
+        method: "POST",
+        body: JSON.stringify({ limits: { requestLimit: 0 } })
+      });
+      assertSmoke(modelBudget.budget?.status === "blocked", "model budget override should block");
+      const modelCost = await requestJson(baseUrl, "/api/model-cost");
+      assertSmoke(typeof modelCost.cost?.estimatedCost === "number", "model cost missing numeric estimate");
+      const modelBilling = await requestJson(baseUrl, "/api/model-billing", {
+        method: "POST",
+        body: JSON.stringify({ raw: JSON.stringify({ currency: "USD", period: "api-smoke-section", total: 0, invoices: [] }) })
+      });
+      assertSmoke(modelBilling.billing?.configured === true, "model billing dry-run should be configured");
+      checked.push("model-policy", "model-budget", "model-cost", "model-billing");
+    }
+
+    if (shouldRun("extensions")) {
+      smokeStep("extensions");
+      cleanup.extensionFixtureDir = path.join(EXTENSION_DIR, "skills", "api-smoke-section-skill");
+      await fs.mkdir(cleanup.extensionFixtureDir, { recursive: true });
+      const signedExtensionManifest = {
+        name: "api-smoke-section-skill",
+        type: "skill",
+        version: "0.0.0",
+        description: "Focused API smoke extension fixture",
+        capabilities: ["smoke-test"],
+        tools: [{
+          name: "smoke_probe",
+          description: "Fixture tool declaration",
+          mapsTo: "repo_map",
+          parameters: { type: "object", properties: {} }
+        }],
+        policy: { access: "read-only", scope: "currentWorkspace", requiresApproval: true },
+        trust: { signatureAlgorithm: "ed25519", signedBy: "api-smoke-local" }
+      };
+      const extensionKeyPair = crypto.generateKeyPairSync("ed25519");
+      signedExtensionManifest.trust.publicKeyPem = extensionKeyPair.publicKey.export({ type: "spki", format: "pem" });
+      signedExtensionManifest.trust.signature = crypto.sign(null, extensionSignaturePayload(signedExtensionManifest), extensionKeyPair.privateKey).toString("base64");
+      await fs.writeFile(path.join(cleanup.extensionFixtureDir, "manifest.json"), JSON.stringify(signedExtensionManifest, null, 2));
+      const extensions = await requestJson(baseUrl, "/api/extensions");
+      assertSmoke(extensions.extensions.some((item) => item.name === "api-smoke-section-skill"), "extensions missing focused fixture");
+      const extensionTrust = await requestJson(baseUrl, "/api/extension-trust?limit=10");
+      assertSmoke(extensionTrust.trust?.summary?.signatureVerified >= 1, "extension trust missing verified signature summary");
+      checked.push("extensions", "extension-trust");
+    }
+
+    if (shouldRun("mcp")) {
+      smokeStep("mcp");
+      cleanup.mcpFixturePath = path.join(MCP_DIR, "servers.json");
+      await fs.mkdir(MCP_DIR, { recursive: true });
+      const originalMcpFixture = await fs.readFile(cleanup.mcpFixturePath, "utf8").catch(() => null);
+      if (originalMcpFixture !== null && !originalMcpFixture.includes('"api-smoke-section-mcp"')) {
+        cleanup.mcpOriginalFixture = originalMcpFixture;
+      }
+      await fs.writeFile(cleanup.mcpFixturePath, JSON.stringify({
+        mcpServers: {
+          "api-smoke-section-mcp": {
+            command: process.execPath,
+            args: [path.join(APP_ROOT, "server.js"), "--mcp-smoke-server"],
+            env: { API_SMOKE_MCP: "1" }
+          }
+        }
+      }, null, 2));
+      const mcp = await requestJson(baseUrl, "/api/mcp");
+      assertSmoke(mcp.servers.some((item) => item.name === "api-smoke-section-mcp"), "MCP endpoint missing focused fixture");
+      const mcpProbe = await requestJson(baseUrl, "/api/mcp?probe=1", { timeoutMs: 120000 });
+      const probedMcp = mcpProbe.servers.find((item) => item.name === "api-smoke-section-mcp");
+      assertSmoke(probedMcp?.probe?.status === "probed", "MCP probe did not complete handshake");
+      checked.push("mcp", "mcp-probe");
+    }
+
+    if (shouldRun("assets")) {
+      smokeStep("assets");
+      const assetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${Date.now()}.png`);
+      cleanup.assetFixturePath = assetFixturePath;
+      await fs.writeFile(assetFixturePath, createSmokePngBuffer({ r: 0, g: 128, b: 255, a: 255 }));
+      const assetFixtureName = toPosix(path.relative(currentWorkspace, assetFixturePath));
+      const assets = await requestJson(baseUrl, "/api/assets");
+      assertSmoke(assets.policy?.access === "metadata-and-inspection", "assets endpoint missing inspection policy");
+      const imageInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(assetFixtureName)}`);
+      assertSmoke(imageInspection.image?.format === "png", "asset inspection did not read png header");
+      checked.push("assets", "asset-inspect");
+    }
+
+    if (shouldRun("apply")) {
+      smokeStep("apply");
+      cleanup.applyFixtureAPath = path.join(currentWorkspace, `.forge-apply-section-a-${Date.now()}.txt`);
+      cleanup.applyFixtureBPath = path.join(currentWorkspace, `.forge-apply-section-b-${Date.now()}.txt`);
+      await fs.writeFile(cleanup.applyFixtureAPath, "alpha\n", "utf8");
+      await fs.writeFile(cleanup.applyFixtureBPath, "bravo\n", "utf8");
+      const applyFixtureAName = toPosix(path.relative(currentWorkspace, cleanup.applyFixtureAPath));
+      const applyFixtureBName = toPosix(path.relative(currentWorkspace, cleanup.applyFixtureBPath));
+      const conflictingDiff = [
+        `diff --git a/${applyFixtureAName} b/${applyFixtureAName}`,
+        `--- a/${applyFixtureAName}`,
+        `+++ b/${applyFixtureAName}`,
+        "@@ -1 +1 @@",
+        "-alpha",
+        "+alpha changed",
+        `diff --git a/${applyFixtureBName} b/${applyFixtureBName}`,
+        `--- a/${applyFixtureBName}`,
+        `+++ b/${applyFixtureBName}`,
+        "@@ -1 +1 @@",
+        "-wrong",
+        "+bravo changed",
+        ""
+      ].join("\n");
+      const blockedApply = await requestJson(baseUrl, "/api/apply", {
+        method: "POST",
+        body: JSON.stringify({ diff: conflictingDiff, prompt: "api smoke section conflicting apply" })
+      });
+      assertSmoke(blockedApply.status === "conflict", "conflicting apply should be blocked before write");
+      const conflictPreview = await requestJson(baseUrl, "/api/diff-conflicts", {
+        method: "POST",
+        body: JSON.stringify({ diff: conflictingDiff })
+      });
+      assertSmoke(conflictPreview.summary?.conflictHunks >= 1, "diff conflict preview missing conflict hunk count");
+      const partialApply = await requestJson(baseUrl, "/api/apply", {
+        method: "POST",
+        body: JSON.stringify({
+          diff: conflictingDiff,
+          prompt: "api smoke section partial apply",
+          allowPartial: true,
+          skipChecks: true,
+          skipGit: true,
+          selectedHunks: [{ path: applyFixtureAName, selectedHunks: 1, totalHunks: 1 }]
+        })
+      });
+      assertSmoke(partialApply.status?.startsWith("partial_"), "partial apply missing partial status");
+      assertSmoke(partialApply.selectedHunks?.[0]?.path === applyFixtureAName, "partial apply missing selected hunk audit");
+      assertSmoke(partialApply.policy?.selectedHunks === 1, "partial apply missing selected hunk policy count");
+      checked.push("apply", "diff-conflicts", "partial-apply");
+    }
+
+    if (shouldRun("runtime")) {
+      smokeStep("runtime");
+      await fs.mkdir(QUEUE_DIR, { recursive: true });
+      const queueSmokeGroup = `api-smoke-section-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const queued = await requestJson(baseUrl, "/api/queue", {
+        method: "POST",
+        body: JSON.stringify({ prompt: "api smoke section queued task", priority: 3, retryLimit: 1, isolationGroup: queueSmokeGroup })
+      });
+      cleanup.queuePath = path.join(QUEUE_DIR, `${queued.id}.json`);
+      assertSmoke(queued.id && queued.status === "queued", "queue create failed");
+      const active = await requestJson(baseUrl, "/api/queue", {
+        method: "PATCH",
+        body: JSON.stringify({ id: queued.id, status: "active" })
+      });
+      assertSmoke(active.status === "active", "queue activate failed");
+      const blockedCommand = await requestJson(baseUrl, "/api/command", {
+        method: "POST",
+        body: JSON.stringify({ command: "curl http://example.com" })
+      });
+      assertSmoke(blockedCommand.blocked === true, "command policy did not block network command");
+      const processes = await requestJson(baseUrl, "/api/processes");
+      assertSmoke(Array.isArray(processes.processes), "process endpoint did not include process list");
+      checked.push("queue", "command-policy", "processes");
+    }
+
+    if (shouldRun("context")) {
+      smokeStep("context");
+      const contextSnapshot = await requestJson(baseUrl, "/api/context-snapshot", { method: "POST" });
+      assertSmoke(contextSnapshot.snapshot?.workspace === APP_ROOT, "context snapshot missing workspace");
+      const contextCompact = await requestJson(baseUrl, "/api/context-compact", { method: "POST" });
+      assertSmoke(contextCompact.compact?.summary?.length >= 1, "context compact missing summary");
+      const contextRollup = await requestJson(baseUrl, "/api/context-rollup", {
+        method: "POST",
+        body: JSON.stringify({ limit: 12 })
+      });
+      assertSmoke(Array.isArray(contextRollup.rollup?.entries), "context rollup missing entries");
+      const createdThread = await requestJson(baseUrl, "/api/thread", {
+        method: "POST",
+        body: JSON.stringify({ title: "api smoke section thread", messages: [{ role: "agent", text: "thread smoke started" }] })
+      });
+      cleanup.threadPath = path.join(THREAD_DIR, `${createdThread.thread.id}.json`);
+      assertSmoke(createdThread.thread?.id?.startsWith("thread-"), "thread create missing id");
+      checked.push("context-snapshot", "context-compact", "context-rollup", "thread");
+    }
+
+    if (shouldRun("gates")) {
+      smokeStep("gates");
+      const verificationPlan = await requestJson(baseUrl, "/api/verification-plan", {
+        method: "POST",
+        body: JSON.stringify({ limit: 10, commands: ["node --check server.js"] })
+      });
+      assertSmoke(Array.isArray(verificationPlan.plan?.gates), "verification plan missing gates");
+      assertSmoke(verificationPlan.plan?.gates?.some((gate) => gate.id === "typecheck"), "verification plan missing typecheck gate");
+      assertSmoke(verificationPlan.plan?.typecheck && Array.isArray(verificationPlan.plan.typecheck.commands), "verification plan missing typecheck discovery");
+      assertSmoke(typeof verificationPlan.plan?.summary?.typecheckCommands === "number", "verification plan missing typecheck command summary");
+      assertSmoke(
+        verificationPlan.plan?.commands?.some((item) => String(item.command || "").includes("--api-smoke-section=fast")),
+        "verification plan missing fast API smoke command"
+      );
+      const ciStatus = await requestJson(baseUrl, "/api/ci-status", {
+        method: "POST",
+        body: JSON.stringify({ limit: 10, persist: true })
+      });
+      assertSmoke(Array.isArray(ciStatus.status?.localChecks), "CI status missing local checks");
+      if (ciStatus.status?.artifact?.path) cleanup.remoteCiArtifactPath = path.join(APP_ROOT, ciStatus.status.artifact.path);
+      const mergeGate = await requestJson(baseUrl, "/api/merge-gate", {
+        method: "POST",
+        body: JSON.stringify({ prompt: "api smoke section merge gate", limit: 10 })
+      });
+      assertSmoke(Array.isArray(mergeGate.gate?.gates), "merge gate missing gates");
+      const permissionMatrix = await requestJson(baseUrl, "/api/permission-matrix", {
+        method: "POST",
+        body: JSON.stringify({ limit: 10 })
+      });
+      assertSmoke(permissionMatrix.matrix?.summary?.providers >= 3, "permission matrix missing provider summary");
+      checked.push("verification-plan", "ci-status", "merge-gate", "permission-matrix");
+    }
+
+    if (shouldRun("remote")) {
+      smokeStep("remote");
+      const prReadiness = await requestJson(baseUrl, "/api/pr-readiness", {
+        method: "POST",
+        body: JSON.stringify({ prompt: "api smoke section PR readiness" })
+      });
+      assertSmoke(prReadiness.policy?.pushes === false, "PR readiness should not push to remote");
+      const remotePublishPlan = await requestJson(baseUrl, "/api/remote-publish-plan", {
+        method: "POST",
+        body: JSON.stringify({ prompt: "api smoke section remote publish plan" })
+      });
+      cleanup.remotePublishDir = remotePublishPlan.package?.dir || "";
+      assertSmoke(remotePublishPlan.approval?.id, "remote publish plan missing approval request");
+      const remotePublishPreflight = await requestJson(baseUrl, "/api/remote-publish-preflight", {
+        method: "POST",
+        body: JSON.stringify({ id: remotePublishPlan.package.id, limit: 5 })
+      });
+      assertSmoke(remotePublishPreflight.preflight?.policy?.pushes === false, "remote publish preflight should not push");
+      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight");
+    }
+
+    console.log(JSON.stringify({
+      ok: true,
+      apiSmoke: true,
+      focused: true,
+      sections,
+      checked
+    }));
+  } finally {
+    if (cleanup.processId) await stopManagedProcess(cleanup.processId).catch(() => {});
+    if (cleanup.processFixturePath) await fs.rm(cleanup.processFixturePath, { force: true }).catch(() => {});
+    for (const processPath of cleanup.processLogPaths || []) await fs.rm(processPath, { force: true }).catch(() => {});
+    if (cleanup.extensionFixtureDir) await fs.rm(cleanup.extensionFixtureDir, { recursive: true, force: true }).catch(() => {});
+    if (cleanup.mcpFixturePath && cleanup.mcpOriginalFixture !== null) {
+      await fs.mkdir(path.dirname(cleanup.mcpFixturePath), { recursive: true });
+      await fs.writeFile(cleanup.mcpFixturePath, cleanup.mcpOriginalFixture, "utf8").catch(() => {});
+    } else if (cleanup.mcpFixturePath) {
+      await fs.rm(cleanup.mcpFixturePath, { force: true }).catch(() => {});
+    }
+    if (cleanup.assetFixturePath) await fs.rm(cleanup.assetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.applyFixtureAPath) await fs.rm(cleanup.applyFixtureAPath, { force: true }).catch(() => {});
+    if (cleanup.applyFixtureBPath) await fs.rm(cleanup.applyFixtureBPath, { force: true }).catch(() => {});
+    if (cleanup.queuePath) await fs.rm(cleanup.queuePath, { force: true }).catch(() => {});
+    if (cleanup.threadPath) await fs.rm(cleanup.threadPath, { force: true }).catch(() => {});
+    if (cleanup.forkThreadPath) await fs.rm(cleanup.forkThreadPath, { force: true }).catch(() => {});
+    if (cleanup.handoffPath) await fs.rm(cleanup.handoffPath, { force: true }).catch(() => {});
+    if (cleanup.remotePublishDir) await fs.rm(cleanup.remotePublishDir, { recursive: true, force: true }).catch(() => {});
+    if (cleanup.remoteCiArtifactPath) await fs.rm(cleanup.remoteCiArtifactPath, { force: true }).catch(() => {});
+    currentWorkspace = originalWorkspace;
+    await closeSmokeServer(sectionServer);
+  }
+}
+
 async function runUiSmokeTest() {
-  const [html, app, css] = await Promise.all([
+  const [html, app, css, serverSource] = await Promise.all([
     fs.readFile(path.join(APP_ROOT, "index.html"), "utf8"),
     fs.readFile(path.join(APP_ROOT, "app.js"), "utf8"),
-    fs.readFile(path.join(APP_ROOT, "styles.css"), "utf8")
+    fs.readFile(path.join(APP_ROOT, "styles.css"), "utf8"),
+    fs.readFile(path.join(APP_ROOT, "server.js"), "utf8")
   ]);
   const htmlIds = [
     "promptForm",
+    "manualCommandForm",
+    "manualCommandInput",
+    "manualCommandRunBtn",
+    "manualCommandStageBtn",
+    "commandHistoryList",
+    "referencePreview",
     "approveBtn",
     "approvePartialBtn",
+    "toggleAllDiffBtn",
+    "copyAllDiffBtn",
     "reviewBtn",
     "prReadinessBtn",
     "mergeGateBtn",
+    "debugDiagnosticsBtn",
+    "debugRunChecks",
     "remotePublishPlanBtn",
     "remotePublishPackagesBtn",
     "remotePublishPreflightBtn",
@@ -12616,9 +14706,13 @@ async function runUiSmokeTest() {
     "mcpCatalogList",
     "assetCatalogList",
     "approvalList",
+    "debugDiagnosticsPanel",
     "queueList",
     "queueIsolationBtn",
     "processForm",
+    "processDiscoverBtn",
+    "processStartDiscoveredBtn",
+    "processStartDebugBtn",
     "processSearchForm",
     "processSearchInput",
     "processSearchBtn",
@@ -12645,31 +14739,215 @@ async function runUiSmokeTest() {
   }
   const appHooks = [
     "function renderCapabilities",
+    "function renderCapabilityComparison",
+    "function buildCapabilityGapListContext",
+    "function appendCapabilityGapListToPrompt",
+    "function runCapabilityGapListRepair",
+    "写代码/调试覆盖",
+    "Codex 对标需求",
+    "本地补齐",
+    "授权清单",
+    "本地能力缺口补齐",
+    "外部阻塞授权清单",
+    "capability-scorecard",
+    "recommendedNext",
+    "function selectCapabilityRecommendation",
+    "function buildCapabilityGapContext",
+    "function appendCapabilityGapToPrompt",
+    "function runCapabilityGapRepair",
+    "async function stageCapabilityVerificationCommands",
+    "推荐下一步",
+    "推荐能力差距",
+    "验证命令",
+    "能力补齐验证命令已放入面板",
+    "能力补齐验证上下文",
+    "能力差距已加入提示词",
+    "已启动能力差距补齐",
     "function renderToolCatalog",
     "function renderExtensionCatalog",
     "function renderMcpCatalog",
+    "function buildCatalogEvidenceContext",
+    "function appendCatalogEvidenceToPrompt",
+    "function runCatalogEvidenceRepair",
+    "function buildMcpResourceEvidenceContext",
+    "function appendMcpResourceEvidenceToPrompt",
+    "function runMcpResourceEvidenceRepair",
+    "function appendMcpResourceEvidenceCard",
+    "MCP 资源证据已加入提示词",
+    "已启动 MCP 资源处理",
+    "目录证据已加入提示词",
+    "已启动目录证据修复",
     "function renderAssetCatalog",
+    "function buildAssetEvidenceContext",
+    "function appendAssetEvidenceToPrompt",
+    "function runAssetEvidenceRepair",
+    "function appendAssetFailureEvidence",
+    "资产证据已加入提示词",
+    "已启动资产证据处理",
+    "已引用资产文件",
     "function renderThreads",
     "function renderMessages",
+    "function buildThreadPromptContext",
+    "function appendThreadContextToPrompt",
+    "function runThreadContinuation",
+    "function appendThreadFailureEvidence",
+    "会话上下文已加入提示词",
+    "已启动会话继续",
     "function startNewThread",
     "function refreshThreads",
     "function renderGoal",
+    "function recommendedCapabilityFromState",
+    "function buildGoalContinuationPrompt",
+    "lastRecoverySummary",
+    "恢复摘要",
+    "goal-recovery-summary",
+    "function appendGoalContinuationToPrompt",
+    "function runGoalContinuation",
+    "data-goal-action",
+    "可恢复状态已加入提示词",
+    "已启动可恢复状态继续",
+    "继续目标",
     "function restorePendingProposal",
+    "function buildQueuePromptContext",
+    "function appendQueueContextToPrompt",
+    "function runQueueContinuation",
+    "async function stageQueueVerificationCommands",
+    "队列任务已加入提示词",
+    "队列任务验证命令已放入面板",
+    "队列任务验证上下文",
+    "已启动队列任务继续",
+    "队列隔离报告已读取",
+    "读取队列隔离失败证据",
     "function renderApprovals",
+    "function renderFiles",
+    "function referenceFileInPrompt",
+    "function appendFileReadFailureEvidence",
+    "function renderReferencePreview",
+    "function localPromptReferencePreview",
+    "function suggestReferencePaths",
+    "apply-reference-suggestion",
+    "function scheduleReferencePreview",
+    "function buildMissingReferenceContext",
+    "function appendMissingReferencesToPrompt",
+    "function runMissingReferenceRepair",
+    "未命中文件引用已加入提示词",
+    "已启动引用修复",
     "function renderProcesses",
     "function renderProcessSearch",
+    "function buildProcessEvidenceContext",
+    "function appendProcessEvidenceToPrompt",
+    "function runProcessEvidenceRepair",
+    "function appendProcessFailureEvidence",
+    "function runProcessBrowserEvidence",
+    "async function startManagedProcessCommand",
+    "async function waitForManagedProcessProbe",
+    "async function discoverStartupCommand",
+    "启动命令已发现",
+    "启动页面 URL 已识别",
+    "启动页面 URL 未识别",
+    "发现并启动",
+    "发现并调试",
+    "发现并调试完成",
+    "发现并调试未找到页面 URL",
+    "发现并调试失败",
+    "process-discover-start-debug",
+    "discover-start-debug",
+    "发现并启动失败",
+    "启动命令发现失败",
+    "进程页面一键调试",
+    "process-browser-debug",
+    "进程页面检查",
+    "进程页面 Trace",
+    "进程证据已加入提示词",
+    "已启动进程证据修复",
+    "停止进程失败",
+    "读取进程输出失败",
+    "function buildTaskPromptContext",
+    "function appendTaskContextToPrompt",
+    "function runTaskContinuation",
+    "async function stageTaskVerificationCommands",
+    "部分应用 hunk",
+    "失败命令",
+    "可重跑验证命令",
+    "function buildTaskVerificationPrompt",
+    "function appendTaskVerificationPromptToPrompt",
+    "function runTaskVerificationFix",
+    "function referenceTaskFilesInPrompt",
+    "function appendTaskFailureEvidence",
+    "任务证据已加入提示词",
+    "历史任务验证命令已放入面板",
+    "历史任务验证上下文",
+    "任务验证提示已加入提示词",
+    "已启动任务验证修复",
+    "已启动任务证据继续",
+    "已引用任务文件",
+    "function buildApprovalPromptContext",
+    "function appendApprovalContextToPrompt",
+    "function runApprovalSafeAlternative",
+    "function appendApprovalEscalationEvidence",
+    "function createApprovalEscalationEvidence",
+    "function appendApprovalPlanCard",
+    "function appendApprovalExecutionCard",
+    "升级证据",
+    "审批升级证据包",
+    "function buildActionFailureContext",
+    "function appendActionFailureEvidence",
+    "动作失败证据已加入提示词",
+    "已启动动作失败诊断修复",
+    "刷新工作台失败证据",
+    "任务入队失败证据",
+    "审批上下文已加入提示词",
+    "已启动审批安全替代",
+    "直接替代",
     "/api/agent-stream",
+    "/api/prompt-references",
     "/api/model-policy",
     "/api/model-usage",
     "/api/model-budget",
     "/api/model-cost",
     "/api/model-cost-policy",
     "/api/model-billing",
+    "function buildModelEvidencePrompt",
+    "function appendModelEvidenceCard",
+    "function runModelEvidenceRepair",
+    "function buildModelVerificationPrompt",
+    "function appendModelVerificationPromptToPrompt",
+    "function runModelVerificationFix",
+    "function buildModelFailureEvidence",
+    "function appendModelFailureEvidence",
+    "function buildAgentFailureContext",
+    "function appendAgentFailureEvidence",
+    "模型证据已加入提示词",
+    "已启动模型证据优化",
+    "模型验证提示已加入提示词",
+    "已启动模型验证修复",
+    "代理失败证据已加入提示词",
+    "代理失败相关文件已引用",
+    "代理失败验证提示已加入提示词",
+    "已启动代理失败验证修复",
+    "调试诊断相关文件",
+    "已启动代理失败诊断修复",
+    "function buildApplyFailureContext",
+    "function appendApplyFailureEvidence",
+    "写入失败证据已加入提示词",
+    "已启动写入失败诊断修复",
+    "function buildWorkspaceSafetyFailureContext",
+    "function appendWorkspaceSafetyFailureEvidence",
+    "工作区安全失败证据已加入提示词",
+    "已启动工作区安全失败诊断修复",
     "/api/context-snapshot",
     "/api/context-compact",
     "/api/context-rollup",
+    "function buildContextEvidencePrompt",
+    "function appendContextEvidenceCard",
+    "function appendContextFailureEvidence",
+    "上下文摘要已加入提示词",
+    "上下文压缩已加入提示词",
+    "上下文滚动摘要已加入提示词",
+    "已启动上下文继续",
     "/api/verification-plan",
     "/api/ci-status",
+    "/api/debug-diagnostics",
     "/api/merge-gate",
     "/api/policy-audit",
     "/api/permission-matrix",
@@ -12690,16 +14968,281 @@ async function runUiSmokeTest() {
     "/api/remote-publish-packages",
     "/api/remote-publish-package",
     "/api/remote-publish-preflight",
+    "function buildBrowserEvidenceContext",
+    "browserTrace",
+    "browserCheck",
+    "function appendBrowserEvidenceToPrompt",
+    "function runBrowserEvidenceRepair",
+    "function buildBrowserVerificationPrompt",
+    "function appendBrowserVerificationPromptToPrompt",
+    "function runBrowserVerificationFix",
+    "function runBrowserEvidenceFollowup",
+    "browser-followup-trace-failure",
+    "function referenceBrowserEvidenceFilesInPrompt",
+    "function appendBrowserFailureEvidence",
+    "浏览器证据已加入提示词",
+    "已启动浏览器证据修复",
+    "浏览器证据验证提示已加入提示词",
+    "已启动浏览器证据验证修复",
+    "已引用浏览器证据文件",
     "function renderBrowserCheck",
     "function renderBrowserBaseline",
     "function renderBrowserScreenshot",
+    "function renderBrowserAudit",
     "function renderBrowserDom",
     "function renderBrowserTrace",
     "function renderBrowserInteract",
     "function renderBrowserSession",
     "function renderBrowserVisual",
+    "function buildSemanticEvidenceContext",
+    "function appendSemanticEvidenceToPrompt",
+    "function referenceSemanticEvidenceFilesInPrompt",
+    "function runSemanticEvidenceRepair",
+    "function buildSemanticVerificationPrompt",
+    "function appendSemanticVerificationPromptToPrompt",
+    "function runSemanticVerificationFix",
+    "function appendSemanticFailureEvidence",
+    "语义证据已加入提示词",
+    "已启动语义证据修复",
+    "语义诊断验证提示已加入提示词",
+    "已启动语义诊断验证修复",
+    "已引用语义证据文件",
+    "function buildGateEvidenceContext",
+    "function appendGateEvidenceToPrompt",
+    "function buildGateVerificationPrompt",
+    "function appendGateVerificationPromptToPrompt",
+    "function runGateVerificationFix",
+    "function stageGateEvidenceCommands",
+    "function runGateEvidenceRepair",
+    "function gateEvidenceArtifactFiles",
+    "function referenceGateEvidenceFilesInPrompt",
+    "function buildGateFailureEvidence",
+    "function appendGateFailureEvidence",
+    "门禁证据已加入提示词",
+    "门禁验证提示已加入提示词",
+    "已启动门禁验证修复",
+    "已启动门禁证据修复",
+    "已引用门禁证据文件",
+    "门禁检查命令已放入面板",
+    "调试验证计划运行失败证据",
+    "远端发布审批计划已生成",
+    "远端发布包索引已读取",
+    "远端发布预检已生成",
+    "function renderDebugDiagnostics",
+    "function renderLastFailedCommandCard",
+    "function splitPatchHunks",
+    "function collectSelectedDiff",
+    "data-diff-hunk-index",
+    "select-file-hunks",
+    "clear-file-hunks",
+    "function restoreCommandDebugState",
+    "function saveCommandDebugState",
+    "commandDebugRestoredScope",
+    "已恢复最近失败命令",
+    "function createRepairEvidenceChain",
+    "function updateRepairEvidenceChain",
+    "修复证据链已创建",
+    "recommendedAction",
+    "commandRun",
+    "推荐动作已加入恢复证据链",
+    "推荐动作通过并已沉淀恢复证据",
+    "推荐动作失败已沉淀恢复证据",
+    "修复验证证据链",
+    "repairContext",
+    "function failedCommandItems",
+    "function buildAgentDebugContext",
+    "function buildDebugFixPrompt",
+    "debugContext.referencedFiles",
+    "function buildReviewFixPrompt",
+    "function buildReviewArtifactPromptContext",
+    "function appendReviewArtifactContextToPrompt",
+    "function runReviewArtifactRepair",
+    "function buildReviewArtifactVerificationPrompt",
+    "function appendReviewArtifactVerificationPromptToPrompt",
+    "function runReviewArtifactVerificationFix",
+    "function appendReviewArtifactFailureEvidence",
+    "function buildReviewCommentsContext",
+    "function appendReviewCommentsToPrompt",
+    "function runReviewCommentsRepair",
+    "function buildReviewCommentsVerificationPrompt",
+    "function appendReviewCommentsVerificationPromptToPrompt",
+    "function runReviewCommentsVerificationFix",
+    "function appendReviewCommentsCard",
+    "审查证据已加入提示词",
+    "已启动历史审查修复",
+    "审查验证提示已加入提示词",
+    "已启动审查验证修复",
+    "PR 评论草稿已加入提示词",
+    "已启动 PR 评论修复",
+    "PR 评论验证提示已加入提示词",
+    "已启动 PR 评论验证修复",
+    "function submitPromptForm",
+    "function shouldSubmitPromptFromKey",
+    "function handlePromptInputKeydown",
+    "function resizePromptInput",
+    "thread-rename-form",
+    "function renderThreads",
+    "function buildDebugBundle",
+    "function debugEvidenceReferencedFiles",
+    "function referenceDebugEvidenceFilesInPrompt",
+    "已引用调试诊断文件",
+    "function buildDebugPromptContext",
+    "function appendDebugContextToPrompt",
+    "function buildCommandTranscript",
+    "function formatCommandRecoveryChain",
+    "function formatCommandSourceLocations",
+    "function commandSourceLocations",
+    "function fetchCommandSourceContexts",
+    "function buildCommandSourceContextPrompt",
+    "function runCommandSourceContextFix",
+    "sourceLocations",
+    "/api/source-context",
+    "function appendCommandTranscriptToPrompt",
+    "function buildCommandVerificationPrompt",
+    "function appendCommandVerificationPromptToPrompt",
+    "function runCommandVerificationFix",
+    "function runLastFailedCommandVerificationFix",
+    "function extractReferencedFilesFromCommandRun",
+    "function referenceCommandFilesInPrompt",
+    "function appendCommandReferencedFilesEvidence",
+    "data-last-failed-action=\"reference-files\"",
+    "data-last-failed-action=\"source-context\"",
+    "data-last-failed-action=\"source-context-prompt\"",
+    "data-last-failed-action=\"source-context-fix\"",
+    "data-last-failed-action=\"stage-recovery\"",
+    "data-last-failed-action=\"run-recovery\"",
+    "data-last-failed-meta=\"recovery-chain\"",
+    "失败恢复链",
+    "可重跑验证命令",
+    "可恢复状态验证命令已放入面板",
+    "function appendDebugEvidence",
+    "function stageDebugActionCommand",
+    "async function runRecommendedDebugAction",
+    "function stageManualCommand",
+    "function renderCommandHistory",
+    "function handleManualCommandInputKeydown",
+    "function applyManualCommandHistoryNavigation",
+    "function rememberCommand",
+    "function updateCommandHistoryItem",
+    "function clearUnpinnedCommandHistory",
+    "function stageRepairVerificationCommands",
+    "function smokeSectionCommandItems",
+    "async function runSmokeSectionCommands",
+    "手动验证命令已加入面板",
+    "最近命令已填入",
+    "最近命令已固定",
+    "最近命令已清理",
+    "修复后验证命令已放入命令面板",
+    "失败命令修复验证命令已放入命令面板",
+    "快捷检查命令已发现",
+    "快捷检查命令",
+    "已加入下一步验证命令",
+    "已复制下一步验证命令",
+    "function verificationPlanCommands",
+    "async function runVerificationPlanCommands",
+    "function normalizeCommandItems",
+    "function buildCommandBatchPromptContext",
+    "function appendCommandBatchEvidenceToPrompt",
+    "function commandBatchReferencedFiles",
+    "function referenceCommandBatchFilesInPrompt",
+    "function commandBatchNeedsRepair",
+    "function runCommandBatchEvidenceRepair",
+    "function renderCommandToolbar",
+    "async function runCommandBatch",
+    "function summarizeDiffPatch",
+    "function summarizeDiffPatches",
+    "function setAllDiffFilesCollapsed",
+    "自动检查结果",
+    "function combinedPendingDiff",
+    "async function runSuggestedCommand",
+    "function updateCommandRunState",
+    "function renderCommandRowStatus",
+    "async function copyText",
+    "function copyFailureSummary",
+    "function copyLogBody",
+    "lastCopyStatus",
+    "copy-command",
+    "copy-output",
+    "prompt-command",
+    "reference-command-files",
+    "prompt-bundle",
+    "run-recommended",
+    "运行推荐动作",
+    "开始运行推荐动作",
+    "priority",
+    "kind",
+    "target",
+    "debug-action-meta",
+    "fix-last-failed",
+    "修复失败命令",
+    "暂无失败命令可修复",
+    "reference-batch-files",
+    "prompt-batch-evidence",
+    "run-batch-evidence",
+    "copy-all-commands",
+    "run-fast-smoke",
+    "run-debug-smoke",
+    "快速 smoke",
+    "调试 smoke",
+    "run-all-commands",
+    "rerun-failed-commands",
+    "重跑失败",
+    "没有失败命令可重跑",
+    "已复制命令",
+    "已复制命令输出",
+    "已复制全部命令",
+    "已引用批量命令文件",
+    "批量命令证据已加入提示词",
+    "已启动批量命令证据修复",
+    "优先读取相关文件",
+    "批量命令无需修复",
+    "批量命令摘要",
+    "最近失败命令已复制",
+    "最近失败命令输出已复制",
+    "命令记录已加入提示词",
+    "失败命令验证提示已加入提示词",
+    "已启动失败命令验证修复",
+    "verification-prompt",
+    "verification-fix",
+    "已引用命令输出文件",
+    "失败命令相关文件已识别",
+    "诊断上下文已加入提示词",
+    "生成修复提示",
+    "运行验证计划",
+    "开始运行验证计划",
+    "验证计划命令全部通过",
+    "自动检查失败，已生成修复候选",
+    "修复 diff、计划和建议命令已放入预览区",
+    "已生成审查修复提示",
+    "已启动审查修复",
+    "最近失败命令",
+    "data-last-failed-meta=\"category\"",
+    "data-last-failed-meta=\"next-action\"",
+    "已启动最近失败命令修复",
+    "已生成带诊断的修复提示",
+    "直接修复",
+    "已生成并启动诊断修复",
+    "已复制全部 diff",
+    "copy-file-diff",
+    "toggle-file-diff",
+    "reference-file-from-diff",
+    "已引用 diff 文件",
+    "read-file-from-diff",
+    "读取 diff 原文件",
+    "toggleAllDiffBtn",
+    "引用文件：",
+    "function collectConflictResolutionsFromPanel",
+    "function buildConflictResolutionContext",
+    "function appendConflictResolutionToPrompt",
+    "function runConflictResolutionRepair",
+    "冲突证据已加入提示词",
+    "已启动冲突修复",
     "function renderConflictResolution",
     "function createConflictResolutionDraftFromPanel",
+    "function buildHandoffPromptContext",
+    "function appendHandoffEvidenceCard",
+    "交付草稿已加入提示词",
+    "已启动交付草稿继续",
     "/api/health",
     "/api/threads",
     "/api/thread?id=",
@@ -12708,6 +15251,7 @@ async function runUiSmokeTest() {
     "/api/tools",
     "/api/extensions",
     "/api/extension-trust",
+    "扩展 Trust 审计已生成",
     "/api/extension-tool-call",
     "/api/mcp",
     "/api/mcp?probe=1",
@@ -12727,9 +15271,11 @@ async function runUiSmokeTest() {
     "/api/approval?id=",
     "/api/approval",
     "/api/approval-execute",
+    "/api/approval-escalation",
     "/api/review-comments",
     "/api/queue-isolation",
     "/api/processes",
+    "/api/process-startup-commands",
     "/api/process-health",
     "/api/process-search",
     "/api/process-history"
@@ -12739,13 +15285,67 @@ async function runUiSmokeTest() {
   }
   const cssClasses = [
     ".capability-list",
+    ".capability-summary",
+    ".capability-scorecard",
+    ".capability-score-actions",
+    ".capability-requirement",
+    ".capability-recommendation",
     ".capability-row",
     ".goal-state",
+    ".goal-actions",
+    ".goal-recovery-summary",
+    ".file-row [data-action=\"reference\"]",
+    ".reference-preview",
+    "#toggleAllDiffBtn",
+    "#copyAllDiffBtn",
+    ".diff-file-stats",
+    ".diff-hunk-selector",
+    ".diff-hunk-choice",
+    ".diff-file.collapsed",
+    ".debug-diagnostics",
+    ".debug-diagnostics-controls",
+    ".debug-last-failed-command",
+    ".debug-last-failed-analysis",
+    ".debug-last-failed-actions",
+    ".debug-evidence-list",
+    ".debug-finding",
+    ".review-actions",
+    ".command-list-toolbar",
+    ".manual-command-form",
+    ".command-history-toolbar",
+    ".command-history-row",
+    ".command-history-row.pinned",
+    ".command-row button",
+    ".check-row.running",
     ".process-form",
+    ".task-row-actions",
+    ".approval-row-actions",
+    ".queue-row-actions",
     ".queue-row"
   ];
   for (const className of cssClasses) {
     assertIncludes(css, className, `styles.css missing ${className}`);
+  }
+  const serverHooks = [
+    "function extractPromptReferenceTokens",
+    "function extractPromptFileReferences",
+    "function suggestPromptReferencePaths",
+    "async function buildPromptReferenceContext",
+    "function summarizePromptReferences",
+    "function normalizeAgentDebugContext",
+    "async function buildDebugReferencedFileContext",
+    "用户显式引用文件上下文",
+    "上一轮调试诊断相关文件上下文",
+    "上一轮调试诊断上下文",
+    "missingReferences",
+    "debugContextAttached",
+    "/api/prompt-references",
+    "未命中的 @file 引用",
+    "referencedFiles",
+    "promptReferences"
+  ];
+  for (const hook of serverHooks) {
+    assertIncludes(serverSource, hook, `server.js missing ${hook}`);
   }
   console.log(JSON.stringify({
     ok: true,
@@ -12753,7 +15353,8 @@ async function runUiSmokeTest() {
     checked: {
       htmlIds,
       appHooks,
-      cssClasses
+      cssClasses,
+      serverHooks
     }
   }));
 }
@@ -12972,8 +15573,11 @@ async function runApiSmokeTest() {
     remotePublishDir: "",
     remoteCiArtifactPath: "",
     escalationPath: "",
+    explicitEscalationPath: "",
     processEscalationPath: "",
     processFixturePath: "",
+    commandFailureFixturePath: "",
+    commandFailureFixturePaths: [],
     extensionFixtureDir: "",
     mcpFixturePath: "",
     mcpOriginalFixture: null,
@@ -13071,16 +15675,19 @@ async function runApiSmokeTest() {
     assertSmoke(Array.isArray(browserAudit.audit?.issues), "browser audit missing issues");
 
     smokeStep("browser-baseline");
+    const browserBaselineUrl = `${baseUrl}/?forge_api_smoke_baseline=${Date.now()}`;
+    cleanup.browserBaselinePath = path.join(APP_ROOT, ".forge", "browser-baselines", `${browserBaselineId(browserBaselineUrl)}.json`);
+    await fs.rm(cleanup.browserBaselinePath, { force: true }).catch(() => {});
     const browserBaseline = await requestJson(baseUrl, "/api/browser-baseline", {
       method: "POST",
-      body: JSON.stringify({ url: `${baseUrl}/`, name: "api smoke app shell" })
+      body: JSON.stringify({ url: browserBaselineUrl, name: "api smoke app shell" })
     });
     assertSmoke(browserBaseline.ok === true, "browser baseline did not create cleanly");
     assertSmoke(browserBaseline.updated === true, "browser baseline did not save initial fingerprint");
     cleanup.browserBaselinePath = path.join(APP_ROOT, browserBaseline.baselinePath);
     const browserBaselineMatch = await requestJson(baseUrl, "/api/browser-baseline", {
       method: "POST",
-      body: JSON.stringify({ url: `${baseUrl}/` })
+      body: JSON.stringify({ url: browserBaselineUrl })
     });
     assertSmoke(browserBaselineMatch.status === "matched", "browser baseline did not match saved fingerprint");
     assertSmoke(browserBaselineMatch.diffs.length === 0, "browser baseline reported unexpected diffs");
@@ -13127,6 +15734,89 @@ async function runApiSmokeTest() {
     assertSmoke(Array.isArray(browserTrace.network), "browser trace missing network list");
     assertSmoke(browserTrace.summary?.network >= 1, "browser trace did not capture network evidence");
     cleanup.browserTracePath = path.join(APP_ROOT, browserTrace.artifactPath);
+
+    smokeStep("debug-diagnostics");
+    const debugDiagnostics = await requestJson(baseUrl, "/api/debug-diagnostics", {
+      method: "POST",
+      timeoutMs: 120000,
+      body: JSON.stringify({ url: `${baseUrl}/`, includeTrace: true, runChecks: false, limit: 8 })
+    });
+    assertSmoke(debugDiagnostics.diagnostics?.policy?.executesCommands === false, "debug diagnostics should be read-only by default");
+    assertSmoke(debugDiagnostics.diagnostics?.summary?.traceCaptured === true, "debug diagnostics missing browser trace");
+    assertSmoke(Array.isArray(debugDiagnostics.diagnostics?.findings), "debug diagnostics missing findings array");
+    assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item) => Number.isFinite(Number(item.priority))), "debug diagnostics actions missing priorities");
+    assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item) => item.kind), "debug diagnostics actions missing kind");
+    assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item, index, list) => index === 0 || Number(list[index - 1].priority) >= Number(item.priority)), "debug diagnostics actions are not priority sorted");
+
+    smokeStep("command-failure-diagnostics");
+    cleanup.commandFailureFixturePath = path.join(currentWorkspace, `.forge-command-failure-smoke-${Date.now()}.js`);
+    await fs.writeFile(cleanup.commandFailureFixturePath, "function brokenCommandFailureFixture() {\n  return ;\n", "utf8");
+    cleanup.commandFailureFixturePaths.push(cleanup.commandFailureFixturePath);
+    const commandFailureFixtureName = toPosix(path.relative(currentWorkspace, cleanup.commandFailureFixturePath));
+    const failedCommand = await requestJson(baseUrl, "/api/command", {
+      method: "POST",
+      timeoutMs: 120000,
+      body: JSON.stringify({ command: `node --check ${commandFailureFixtureName}` })
+    });
+    assertSmoke(failedCommand.exitCode !== 0, "failing command smoke unexpectedly passed");
+    assertSmoke(failedCommand.diagnostics, "failing command did not attach diagnostics");
+    assertSmoke(failedCommand.diagnostics?.policy?.executesCommands === false, "failing command diagnostics should not run extra checks");
+    assertSmoke(Array.isArray(failedCommand.diagnostics?.findings), "failing command diagnostics missing findings");
+    assertSmoke(typeof failedCommand.diagnostics?.summary?.findings === "number", "failing command diagnostics missing summary count");
+    assertSmoke(String(failedCommand.output || "").includes("SyntaxError"), "failing command output missing syntax error evidence");
+    assertSmoke(failedCommand.failureAnalysis?.category === "syntax", "failing command missing syntax failure classification");
+    assertSmoke(failedCommand.failureAnalysis?.summary?.includes("语法"), "failing command classification missing readable summary");
+    assertSmoke(failedCommand.failureAnalysis?.sourceLocations?.some((item) => item.path === commandFailureFixtureName && item.line >= 1), "failing command missing source location evidence");
+    assertSmoke(failedCommand.recoveryChain?.status === "needs_recovery", "failing command missing recovery chain");
+    assertSmoke(failedCommand.recoveryChain?.sourceLocations?.some((item) => item.path === commandFailureFixtureName), "failing command recovery chain missing source locations");
+    assertSmoke(failedCommand.recoveryChain?.commands?.some((item) => item.stage === "reproduce"), "failing command recovery chain missing reproduce command");
+    assertSmoke(failedCommand.recoveryChain?.commands?.some((item) => item.stage === "verify-debug"), "failing command recovery chain missing debug verification command");
+    assertSmoke(failedCommand.recoveryChain?.nextActions?.length >= 1, "failing command recovery chain missing next actions");
+    assertSmoke(failedCommand.diagnostics?.commandFailure?.category === "syntax", "failing command diagnostics missing command failure classification");
+    assertSmoke(failedCommand.diagnostics?.findings?.some((item) => item.area === "command"), "failing command diagnostics missing command finding");
+    const commandSourceContext = await requestJson(baseUrl, "/api/source-context", {
+      method: "POST",
+      body: JSON.stringify({ locations: failedCommand.failureAnalysis.sourceLocations, contextLines: 2, limit: 4 })
+    });
+    assertSmoke(commandSourceContext.contexts?.some((item) => item.path === commandFailureFixtureName && String(item.context || "").includes("brokenCommandFailureFixture")), "source context missing failed command code");
+    assertSmoke(commandSourceContext.policy?.executesCommands === false, "source context should be read-only");
+
+    const commandFailureCases = [
+      {
+        name: "module-resolution",
+        body: "import './missing-command-failure-fixture.js';\n",
+        assertOutput: /ERR_MODULE_NOT_FOUND|Cannot find module|module not found/i
+      },
+      {
+        name: "missing-file",
+        body: "const fs = require('node:fs');\nfs.readFileSync('./missing-command-failure-fixture.txt', 'utf8');\n",
+        assertOutput: /ENOENT|no such file or directory/i
+      },
+      {
+        name: "port-in-use",
+        body: "const http = require('node:http');\nconst first = http.createServer((req, res) => res.end('first'));\nfirst.listen(0, '127.0.0.1', () => {\n  const address = first.address();\n  http.createServer((req, res) => res.end('second')).listen(address.port, '127.0.0.1');\n});\nsetTimeout(() => {}, 2000);\n",
+        assertOutput: /EADDRINUSE|address already in use/i
+      }
+    ];
+    for (const testCase of commandFailureCases) {
+      const fixturePath = path.join(currentWorkspace, `.forge-command-failure-${testCase.name}-${Date.now()}.js`);
+      cleanup.commandFailureFixturePaths.push(fixturePath);
+      await fs.writeFile(fixturePath, testCase.body, "utf8");
+      const fixtureName = toPosix(path.relative(currentWorkspace, fixturePath));
+      const commandFailure = await requestJson(baseUrl, "/api/command", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({ command: `node ${fixtureName} --smoke-test` })
+      });
+      assertSmoke(commandFailure.exitCode !== 0, `${testCase.name} command failure unexpectedly passed`);
+      assertSmoke(testCase.assertOutput.test(String(commandFailure.output || "")), `${testCase.name} command failure missing expected output evidence`);
+      assertSmoke(commandFailure.failureAnalysis?.category === testCase.name, `${testCase.name} command failure classification mismatch`);
+      assertSmoke(commandFailure.diagnostics?.commandFailure?.category === testCase.name, `${testCase.name} diagnostics missing command failure classification`);
+      assertSmoke(commandFailure.diagnostics?.findings?.some((item) => item.area === "command" && item.message?.includes(commandFailure.failureAnalysis.summary)), `${testCase.name} diagnostics missing command finding`);
+      assertSmoke(commandFailure.failureAnalysis?.nextActions?.length >= 1, `${testCase.name} command failure missing next action`);
+      assertSmoke(commandFailure.recoveryChain?.category === testCase.name, `${testCase.name} recovery chain category mismatch`);
+      assertSmoke(commandFailure.recoveryChain?.commands?.length >= 2, `${testCase.name} recovery chain missing commands`);
+    }
 
     smokeStep("browser-interact");
     const browserInteract = await requestJson(baseUrl, "/api/browser-interact", {
@@ -13235,6 +15925,7 @@ async function runApiSmokeTest() {
     cleanup.browserSessionPath = path.join(APP_ROOT, browserSession.artifactPath);
 
     smokeStep("browser-visual");
+    smokeStep("browser-visual:baseline");
     const browserVisual = await requestJson(baseUrl, "/api/browser-visual", {
       method: "POST",
       body: JSON.stringify({
@@ -13251,6 +15942,7 @@ async function runApiSmokeTest() {
     cleanup.browserVisualBaselinePath = path.join(APP_ROOT, browserVisual.baselinePath);
     cleanup.browserVisualMetaPath = path.join(APP_ROOT, browserVisual.metaPath);
     cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserVisual.currentPath));
+    smokeStep("browser-visual:match");
     const browserVisualMatch = await requestJson(baseUrl, "/api/browser-visual", {
       method: "POST",
       body: JSON.stringify({
@@ -13266,6 +15958,7 @@ async function runApiSmokeTest() {
     assertSmoke(browserVisualMatch.hasBaseline === true, "browser visual comparison missing saved baseline");
     assertSmoke(browserVisualMatch.comparison?.totalPixels > 0, "browser visual comparison missing pixel totals");
     cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserVisualMatch.currentPath));
+    smokeStep("browser-visual:selector");
     const browserSelectorVisual = await requestJson(baseUrl, "/api/browser-visual", {
       method: "POST",
       timeoutMs: 150000,
@@ -13307,6 +16000,7 @@ async function runApiSmokeTest() {
     }, null, 2), "utf8");
     await fs.writeFile(visualDiffCurrentPath, createSmokePngBuffer({ r: 0, g: 0, b: 255, a: 255 }));
     cleanup.browserVisualScreenshotPaths.push(visualDiffCurrentPath);
+    smokeStep("browser-visual:diff");
     const browserVisualDiff = await requestJson(baseUrl, "/api/browser-visual", {
       method: "POST",
       body: JSON.stringify({
@@ -13326,18 +16020,22 @@ async function runApiSmokeTest() {
     assertSmoke(browserVisualDiff.comparison?.mismatchedPixels >= 1, "browser visual diff did not count mismatched pixels");
     cleanup.browserVisualDiffPath = path.join(APP_ROOT, browserVisualDiff.diffPath);
 
+    smokeStep("files");
     const files = await requestJson(baseUrl, "/api/files");
     assertSmoke(Array.isArray(files.files), "files did not include file list");
     assertSmoke(files.repoMap && typeof files.repoMap === "object", "files did not include repoMap");
 
+    smokeStep("semantic-index");
     const semanticIndex = await requestJson(baseUrl, "/api/semantic-index", { method: "POST" });
     assertSmoke(semanticIndex.index?.indexedFiles >= 1, "semantic index missing indexed files");
     assertSmoke(semanticIndex.index?.summary?.declarations >= 1, "semantic index missing declarations");
     assertSmoke(Array.isArray(semanticIndex.index?.imports), "semantic index missing imports");
     assertSmoke(semanticIndex.index?.summary?.symbolOutline >= 1, "semantic index missing symbol outline");
     assertSmoke(semanticIndex.index?.symbolOutline?.some((item) => item.name === "buildSemanticIndex" && item.endLine >= item.line), "semantic index missing buildSemanticIndex outline span");
+    smokeStep("semantic-index-read");
     const semanticIndexRead = await requestJson(baseUrl, "/api/semantic-index");
     assertSmoke(semanticIndexRead.index?.generatedAt, "semantic index did not persist");
+    smokeStep("code-intelligence");
     const codeIntelligence = await requestJson(baseUrl, "/api/code-intelligence", {
       method: "POST",
       body: JSON.stringify({ limit: 20, includeDiagnostics: true })
@@ -13347,31 +16045,38 @@ async function runApiSmokeTest() {
     assertSmoke(Array.isArray(codeIntelligence.overview?.entrypoints), "code intelligence missing entrypoints");
     assertSmoke(Array.isArray(codeIntelligence.overview?.symbolSurface?.largestSymbols), "code intelligence missing largest symbols");
     assertSmoke(Array.isArray(codeIntelligence.overview?.dependencySurface?.hotspots), "code intelligence missing dependency hotspots");
+    assertSmoke(codeIntelligence.overview?.typecheck && Array.isArray(codeIntelligence.overview.typecheck.commands), "code intelligence missing typecheck discovery");
+    assertSmoke(typeof codeIntelligence.overview?.summary?.typecheckCommands === "number", "code intelligence missing typecheck summary");
     assertSmoke(Array.isArray(codeIntelligence.overview?.readiness), "code intelligence missing readiness");
+    smokeStep("symbol-outline");
     const symbolOutline = await requestJson(baseUrl, "/api/symbol-outline", {
       method: "POST",
       body: JSON.stringify({ query: "buildSemanticIndex", path: "server.js", limit: 10, includeContext: true })
     });
     assertSmoke(symbolOutline.summary?.matched >= 1, "symbol outline missing query match");
     assertSmoke(symbolOutline.symbols.some((item) => item.name === "buildSemanticIndex" && item.context?.includes("buildSemanticIndex")), "symbol outline missing context");
+    smokeStep("semantic-definition");
     const semanticDefinition = await requestJson(baseUrl, "/api/semantic-definition", {
       method: "POST",
       body: JSON.stringify({ symbol: "buildSemanticIndex", path: "server.js", contextLines: 2 })
     });
     assertSmoke(semanticDefinition.matchCount >= 1, "semantic definition missing symbol match");
     assertSmoke(semanticDefinition.definitions.some((item) => item.name === "buildSemanticIndex" && item.context?.includes("buildSemanticIndex")), "semantic definition missing definition context");
+    smokeStep("semantic-search");
     const semanticSearch = await requestJson(baseUrl, "/api/semantic-search", {
       method: "POST",
       body: JSON.stringify({ query: "buildSemanticIndex", kind: "declaration", limit: 10 })
     });
     assertSmoke(semanticSearch.matchCount >= 1, "semantic search did not find declaration");
     assertSmoke(semanticSearch.matches.some((item) => item.path === "server.js"), "semantic search missing server.js match");
+    smokeStep("semantic-references");
     const semanticReferences = await requestJson(baseUrl, "/api/semantic-references", {
       method: "POST",
       body: JSON.stringify({ symbol: "buildSemanticIndex", limit: 20, contextLines: 3 })
     });
     assertSmoke(semanticReferences.matchCount >= 1, "semantic references did not find symbol");
     assertSmoke(semanticReferences.declarations.some((item) => item.path === "server.js" && item.context.includes("buildSemanticIndex")), "semantic references missing declaration context");
+    smokeStep("semantic-diagnostics");
     const semanticDiagnostics = await requestJson(baseUrl, "/api/semantic-diagnostics", {
       method: "POST",
       body: JSON.stringify({ limit: 40, includeContext: true })
@@ -13379,6 +16084,7 @@ async function runApiSmokeTest() {
     assertSmoke(semanticDiagnostics.summary && typeof semanticDiagnostics.summary.total === "number", "semantic diagnostics missing summary");
     assertSmoke(Array.isArray(semanticDiagnostics.diagnostics), "semantic diagnostics missing diagnostics list");
     assertSmoke(semanticDiagnostics.checked?.indexedFiles >= 1, "semantic diagnostics missing checked evidence");
+    smokeStep("semantic-impact");
     const semanticImpact = await requestJson(baseUrl, "/api/semantic-impact", {
       method: "POST",
       body: JSON.stringify({ paths: ["server.js"], limit: 20, includeContext: true })
@@ -13387,6 +16093,7 @@ async function runApiSmokeTest() {
     assertSmoke(semanticImpact.targetSummaries.some((item) => item.path === "server.js" && item.indexed === true), "semantic impact missing indexed server.js target");
     assertSmoke(Array.isArray(semanticImpact.dependents), "semantic impact missing dependents list");
     assertSmoke(Array.isArray(semanticImpact.callers), "semantic impact missing callers list");
+    smokeStep("dependency-graph");
     const dependencyGraph = await requestJson(baseUrl, "/api/dependency-graph", {
       method: "POST",
       body: JSON.stringify({ paths: ["server.js"], limit: 40, includeExternal: true })
@@ -13395,6 +16102,7 @@ async function runApiSmokeTest() {
     assertSmoke(Array.isArray(dependencyGraph.edges), "dependency graph missing edges");
     assertSmoke(Array.isArray(dependencyGraph.unresolved), "dependency graph missing unresolved list");
     assertSmoke(dependencyGraph.targetSummaries.some((item) => item.path === "server.js" && item.indexed === true), "dependency graph missing server.js target");
+    smokeStep("model-policy");
     const modelPolicy = await requestJson(baseUrl, "/api/model-policy", {
       method: "POST",
       body: JSON.stringify({ includeRecent: true })
@@ -13408,12 +16116,14 @@ async function runApiSmokeTest() {
     assertSmoke(typeof modelPolicy.policy?.runtime?.usage?.requestCount === "number", "model policy missing usage summary");
     assertSmoke(modelPolicy.policy?.budgetStatus?.policy?.enforcedBeforeProviderRequest === true, "model policy missing budget preflight status");
     assertSmoke(modelPolicy.policy?.guardrails.some((item) => item.name === "model-budget-preflight" && item.status === "implemented"), "model policy missing budget preflight guardrail");
+    smokeStep("model-usage");
     const modelUsage = await requestJson(baseUrl, "/api/model-usage");
     assertSmoke(modelUsage.usage?.policy?.exposesApiKey === false, "model usage should not expose API key");
     assertSmoke(modelUsage.usage?.policy?.executesModelCall === false, "model usage should not execute model calls");
     assertSmoke(typeof modelUsage.usage?.summary?.requestCount === "number", "model usage missing request count");
     assertSmoke(Array.isArray(modelUsage.usage?.recent), "model usage missing recent calls");
     assertSmoke(modelUsage.usage?.endpoint?.host, "model usage missing endpoint host");
+    smokeStep("model-budget");
     const modelBudget = await requestJson(baseUrl, "/api/model-budget", {
       method: "POST",
       body: JSON.stringify({ limits: { requestLimit: 0 } })
@@ -13423,11 +16133,13 @@ async function runApiSmokeTest() {
     assertSmoke(modelBudget.budget?.policy?.executesModelCall === false, "model budget should not execute model calls");
     assertSmoke(modelBudget.budget?.policy?.enforcedBeforeProviderRequest === true, "model budget missing preflight enforcement policy");
     assertSmoke(modelBudget.budget?.checks.some((item) => item.name === "request-limit" && item.blocked === true), "model budget missing blocked request-limit check");
+    smokeStep("model-cost");
     const modelCost = await requestJson(baseUrl, "/api/model-cost");
     assertSmoke(modelCost.cost?.policy?.executesModelCall === false, "model cost should not execute model calls");
     assertSmoke(modelCost.cost?.policy?.bundledPrices === false, "model cost should not use bundled provider prices");
     assertSmoke(Array.isArray(modelCost.cost?.rows), "model cost missing rows");
     assertSmoke(typeof modelCost.cost?.estimatedCost === "number", "model cost missing numeric estimate");
+    smokeStep("model-cost-policy");
     const modelCostPolicy = await requestJson(baseUrl, "/api/model-cost-policy", {
       method: "POST",
       body: JSON.stringify({ raw: JSON.stringify({ currency: "USD", models: { default: { promptPer1M: 1, completionPer1M: 2 } } }) })
@@ -13435,6 +16147,7 @@ async function runApiSmokeTest() {
     assertSmoke(modelCostPolicy.policy?.policy?.writesEnvironment === false, "model cost policy should not write environment");
     assertSmoke(modelCostPolicy.policy?.valid === true, "model cost policy dry-run should parse");
     assertSmoke(modelCostPolicy.policy?.parsed?.models?.default?.promptPer1M === 1, "model cost policy did not parse default prompt rate");
+    smokeStep("model-billing");
     const modelBilling = await requestJson(baseUrl, "/api/model-billing", {
       method: "POST",
       body: JSON.stringify({ raw: JSON.stringify({ currency: "USD", period: "api-smoke", total: 0, invoices: [{ id: "smoke", amount: 0, currency: "USD" }] }) })
@@ -13444,11 +16157,17 @@ async function runApiSmokeTest() {
     assertSmoke(modelBilling.billing?.policy?.executesModelCall === false, "model billing should not execute model calls");
     assertSmoke(typeof modelBilling.billing?.variance === "number" || modelBilling.billing?.variance === null, "model billing missing variance field");
 
+    smokeStep("capabilities");
     const capabilities = await requestJson(baseUrl, "/api/capabilities");
     assertSmoke(capabilities.capabilities.some((item) => item.area === "可恢复状态"), "capabilities endpoint missing resumable state");
     assertSmoke(capabilities.capabilities.some((item) => item.area === "模型运行层"), "capabilities endpoint missing model runtime layer");
     assertSmoke(capabilities.capabilities.some((item) => item.status !== "implemented"), "capabilities endpoint should expose remaining gaps");
+    assertSmoke(capabilities.recommendedNext?.capability?.area, "capabilities endpoint missing recommended next gap");
+    assertSmoke(capabilities.recommendedNext?.reason, "capabilities endpoint missing recommendation reason");
+    assertSmoke(capabilities.comparison?.requirements?.some((item) => item.id === "debug-loop"), "capabilities endpoint missing code/debug comparison");
+    assertSmoke(Array.isArray(capabilities.comparison?.outstandingGaps), "capabilities endpoint missing outstanding gap list");
 
+    smokeStep("tools");
     const tools = await requestJson(baseUrl, "/api/tools");
     assertSmoke(tools.tools.some((item) => item.name === "repo_map"), "tools endpoint missing repo_map");
     assertSmoke(tools.tools.some((item) => item.name === "diff_conflicts"), "tools endpoint missing diff_conflicts");
@@ -13461,6 +16180,7 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "context_rollup"), "tools endpoint missing context_rollup");
     assertSmoke(tools.tools.some((item) => item.name === "verification_plan"), "tools endpoint missing verification_plan");
     assertSmoke(tools.tools.some((item) => item.name === "ci_status"), "tools endpoint missing ci_status");
+    assertSmoke(tools.tools.some((item) => item.name === "debug_diagnostics"), "tools endpoint missing debug_diagnostics");
     assertSmoke(tools.tools.some((item) => item.name === "merge_gate"), "tools endpoint missing merge_gate");
     assertSmoke(tools.tools.some((item) => item.name === "mcp_resource"), "tools endpoint missing mcp_resource");
     assertSmoke(tools.tools.some((item) => item.name === "remote_publish_packages"), "tools endpoint missing remote_publish_packages");
@@ -13480,6 +16200,7 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "semantic_diagnostics"), "tools endpoint missing semantic_diagnostics");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_impact"), "tools endpoint missing semantic_impact");
     assertSmoke(tools.tools.some((item) => item.name === "dependency_graph"), "tools endpoint missing dependency_graph");
+    smokeStep("extension-fixture");
     cleanup.extensionFixtureDir = path.join(EXTENSION_DIR, "skills", "api-smoke-skill");
     await fs.mkdir(cleanup.extensionFixtureDir, { recursive: true });
     const signedExtensionManifest = {
@@ -13504,20 +16225,24 @@ async function runApiSmokeTest() {
     signedExtensionManifest.trust.publicKeyPem = extensionKeyPair.publicKey.export({ type: "spki", format: "pem" });
     signedExtensionManifest.trust.signature = crypto.sign(null, extensionSignaturePayload(signedExtensionManifest), extensionKeyPair.privateKey).toString("base64");
     await fs.writeFile(path.join(cleanup.extensionFixtureDir, "manifest.json"), JSON.stringify(signedExtensionManifest, null, 2));
+    smokeStep("extensions");
     const extensions = await requestJson(baseUrl, "/api/extensions");
     assertSmoke(extensions.extensions.some((item) => item.name === "api-smoke-skill"), "extensions endpoint missing fixture skill");
     assertSmoke(extensions.summary.skill >= 1, "extensions endpoint missing skill summary");
     assertSmoke(extensions.extensions.some((item) => item.name === "api-smoke-skill" && item.trust?.manifestHash), "extensions endpoint missing manifest trust hash");
     assertSmoke(extensions.summary.trust && typeof extensions.summary.trust === "object", "extensions endpoint missing trust summary");
+    smokeStep("extension-trust");
     const extensionTrust = await requestJson(baseUrl, "/api/extension-trust?limit=10");
     assertSmoke(extensionTrust.trust?.policy?.localChecksumAudit === true, "extension trust audit missing checksum policy");
     assertSmoke(extensionTrust.trust?.policy?.localSignatureVerification === true, "extension trust audit missing signature policy");
     assertSmoke(extensionTrust.trust?.summary?.signatureVerified >= 1, "extension trust audit missing verified signature summary");
     assertSmoke(extensionTrust.trust?.rows?.some((item) => item.name === "api-smoke-skill" && item.trust?.status === "signature-verified"), "extension trust audit missing verified fixture row");
     assertSmoke(extensionTrust.trust?.guardrails?.some((item) => item.includes("SHA-256")), "extension trust audit missing checksum guardrail");
+    smokeStep("tools-with-extension");
     const toolsWithExtension = await requestJson(baseUrl, "/api/tools");
     assertSmoke(toolsWithExtension.tools.some((item) => item.name === "api-smoke-skill.smoke_probe"), "tools endpoint missing extension tool bridge");
     assertSmoke(toolsWithExtension.tools.every((item) => item.policy?.access), "tools endpoint missing tool policy access");
+    smokeStep("extension-tool-call-plan");
     const extensionToolCallPlan = await requestJson(baseUrl, "/api/extension-tool-call", {
       method: "POST",
       body: JSON.stringify({
@@ -13528,11 +16253,13 @@ async function runApiSmokeTest() {
     });
     assertSmoke(extensionToolCallPlan.status === "approval_required", "extension tool call should require approval");
     assertSmoke(extensionToolCallPlan.approval?.id, "extension tool call missing approval request");
+    smokeStep("extension-tool-approval");
     const approvedExtensionToolCall = await requestJson(baseUrl, "/api/approval", {
       method: "PATCH",
       body: JSON.stringify({ id: extensionToolCallPlan.approval.id, decision: "approved", note: "api smoke extension tool approval" })
     });
     assertSmoke(approvedExtensionToolCall.status === "approved", "extension tool approval did not update status");
+    smokeStep("extension-tool-execute");
     const extensionToolExecution = await requestJson(baseUrl, "/api/approval-execute", {
       method: "POST",
       body: JSON.stringify({ id: extensionToolCallPlan.approval.id })
@@ -13541,6 +16268,7 @@ async function runApiSmokeTest() {
     assertSmoke(extensionToolExecution.execution?.result?.mappedTool === "repo_map", "extension tool execution did not use mapped read-only tool");
     assertSmoke(String(extensionToolExecution.execution?.result?.result || "").includes("fileCount"), "extension tool execution result missing repo map evidence");
 
+    smokeStep("mcp-fixture");
     cleanup.mcpFixturePath = path.join(MCP_DIR, "servers.json");
     await fs.mkdir(MCP_DIR, { recursive: true });
     const originalMcpFixture = await fs.readFile(cleanup.mcpFixturePath, "utf8").catch(() => null);
@@ -13556,9 +16284,11 @@ async function runApiSmokeTest() {
         }
       }
     }, null, 2));
+    smokeStep("mcp");
     const mcp = await requestJson(baseUrl, "/api/mcp");
     assertSmoke(mcp.servers.some((item) => item.name === "api-smoke-mcp"), "MCP endpoint missing fixture server");
     assertSmoke(mcp.summary.stdio >= 1, "MCP endpoint missing stdio summary");
+    smokeStep("mcp-probe");
     const mcpProbe = await requestJson(baseUrl, "/api/mcp?probe=1", { timeoutMs: 120000 });
     const probedMcp = mcpProbe.servers.find((item) => item.name === "api-smoke-mcp");
     assertSmoke(probedMcp?.probe?.status === "probed", `MCP probe did not complete handshake: ${JSON.stringify(probedMcp?.probe || mcpProbe.errors || mcpProbe).slice(0, 1000)}`);
@@ -13566,6 +16296,7 @@ async function runApiSmokeTest() {
     assertSmoke(probedMcp?.probe?.counts?.resources === 1, "MCP probe missing resource listing");
     assertSmoke(probedMcp?.probe?.counts?.prompts === 1, "MCP probe missing prompt listing");
     assertSmoke(mcpProbe.summary.probed >= 1, "MCP probe summary missing probed count");
+    smokeStep("mcp-resource");
     const mcpResourceRead = await requestJson(baseUrl, "/api/mcp-resource", {
       method: "POST",
       timeoutMs: 120000,
@@ -13577,6 +16308,7 @@ async function runApiSmokeTest() {
     assertSmoke(mcpResourceRead.policy?.executesTool === false, "MCP resource read should not execute tools");
     assertSmoke(mcpResourceRead.policy?.writesFiles === false, "MCP resource read should not write files");
     assertSmoke(mcpResourceRead.contents?.some((item) => item.text?.includes("Forge MCP smoke resource content")), "MCP resource read missing fixture content");
+    smokeStep("mcp-tool-call-plan");
     const mcpToolCallPlan = await requestJson(baseUrl, "/api/mcp-tool-call", {
       method: "POST",
       body: JSON.stringify({
@@ -13587,11 +16319,13 @@ async function runApiSmokeTest() {
     });
     assertSmoke(mcpToolCallPlan.status === "approval_required", "MCP tool call should require approval");
     assertSmoke(mcpToolCallPlan.approval?.id, "MCP tool call missing approval request");
+    smokeStep("mcp-tool-approval");
     const approvedMcpToolCall = await requestJson(baseUrl, "/api/approval", {
       method: "PATCH",
       body: JSON.stringify({ id: mcpToolCallPlan.approval.id, decision: "approved", note: "api smoke MCP tool approval" })
     });
     assertSmoke(approvedMcpToolCall.status === "approved", "MCP tool approval did not update status");
+    smokeStep("mcp-tool-execute");
     const mcpToolExecution = await requestJson(baseUrl, "/api/approval-execute", {
       method: "POST",
       timeoutMs: 120000,
@@ -13606,6 +16340,7 @@ async function runApiSmokeTest() {
       "approved MCP tool call result missing fixture response"
     );
 
+    smokeStep("asset-fixtures");
     cleanup.assetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.png`);
     await fs.writeFile(cleanup.assetFixturePath, createSmokePngBuffer({ r: 255, g: 0, b: 0, a: 255 }));
     cleanup.svgAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.svg`);
@@ -13639,6 +16374,7 @@ async function runApiSmokeTest() {
     await fs.writeFile(cleanup.compressedPdfAssetFixturePath, createSmokePdfBuffer({ compressed: true }));
     cleanup.mediaAssetFixturePath = path.join(currentWorkspace, `.forge-asset-smoke-${Date.now()}.wav`);
     await fs.writeFile(cleanup.mediaAssetFixturePath, createSmokeWavBuffer());
+    smokeStep("assets");
     const assets = await requestJson(baseUrl, "/api/assets");
     const assetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.assetFixturePath));
     const svgAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.svgAssetFixturePath));
@@ -13659,6 +16395,7 @@ async function runApiSmokeTest() {
     assertSmoke(assets.assets.some((item) => item.path === compressedPdfAssetFixtureName && item.type === "document"), "assets endpoint missing compressed pdf fixture");
     assertSmoke(assets.assets.some((item) => item.path === mediaAssetFixtureName && item.type === "media"), "assets endpoint missing media fixture");
     assertSmoke(assets.policy?.access === "metadata-and-inspection", "assets endpoint missing inspection policy");
+    smokeStep("asset-inspect:image");
     const imageInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(assetFixtureName)}`);
     assertSmoke(imageInspection.image?.format === "png", "asset inspection did not read png header");
     assertSmoke(imageInspection.image?.width === 1 && imageInspection.image?.height === 1, "asset inspection did not read png dimensions");
@@ -13668,26 +16405,32 @@ async function runApiSmokeTest() {
     assertSmoke(typeof imageInspection.ocr?.enabled === "boolean", "asset inspection missing OCR execution switch state");
     assertSmoke(typeof imageInspection.ocr?.cached === "boolean", "asset inspection missing OCR cache state");
     assertSmoke("textPath" in (imageInspection.ocr || {}) || imageInspection.ocr?.reason, "asset inspection missing OCR artifact evidence");
+    smokeStep("asset-inspect:svg");
     const svgInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(svgAssetFixtureName)}`);
     assertSmoke(svgInspection.image?.format === "svg", "asset inspection did not identify svg image");
     assertSmoke(svgInspection.image?.width === 120 && svgInspection.image?.height === 40, "asset inspection did not extract svg dimensions");
     assertSmoke(svgInspection.ocr?.engine === "local-svg-text-extractor", "asset inspection missing SVG text extractor");
     assertSmoke(svgInspection.ocr?.textSample?.includes("Forge SVG smoke text"), "asset inspection did not extract SVG text");
     assertSmoke(svgInspection.ocr?.textBlocks?.some((item) => item.includes("Forge SVG aria smoke")), "asset inspection did not extract SVG aria label");
+    smokeStep("asset-inspect:data");
     const dataInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(dataAssetFixtureName)}`);
     assertSmoke(dataInspection.data?.headers?.includes("name"), "asset inspection did not parse csv headers");
     assertSmoke(dataInspection.data?.rows?.length >= 2, "asset inspection did not parse csv rows");
+    smokeStep("asset-inspect:parquet");
     const parquetInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(parquetDataAssetFixtureName)}`);
     assertSmoke(parquetInspection.data?.format === "parquet", "asset inspection did not identify parquet data");
     assertSmoke(parquetInspection.data?.footerAvailable === true, "asset inspection did not detect parquet footer");
     assertSmoke(parquetInspection.data?.metadataStrings?.some((item) => item.includes("forge_parquet_smoke")), "asset inspection did not extract parquet metadata strings");
+    smokeStep("asset-inspect:docx");
     const documentInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(documentAssetFixtureName)}`);
     assertSmoke(documentInspection.document?.packageType === "office-open-xml", "asset inspection did not identify OOXML document");
     assertSmoke(documentInspection.document?.textSample?.includes("Forge DOCX smoke text"), "asset inspection did not extract docx text");
+    smokeStep("asset-inspect:legacy-doc");
     const legacyDocumentInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(legacyDocumentAssetFixtureName)}`);
     assertSmoke(legacyDocumentInspection.document?.packageType === "compound-file-binary", "asset inspection did not identify legacy Office binary document");
     assertSmoke(legacyDocumentInspection.document?.streamHints?.includes("WordDocument"), "asset inspection did not extract legacy Office stream hints");
     assertSmoke(legacyDocumentInspection.document?.textSample?.includes("Forge legacy DOC smoke text"), "asset inspection did not extract legacy Office text sample");
+    smokeStep("asset-inspect:pdf");
     const pdfInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(pdfAssetFixtureName)}`);
     assertSmoke(pdfInspection.document?.format === "pdf", "asset inspection did not identify PDF document");
     assertSmoke(pdfInspection.document?.textSample?.includes("Forge PDF smoke text"), "asset inspection did not extract PDF text sample");
@@ -13696,6 +16439,7 @@ async function runApiSmokeTest() {
       pdfInspection.document?.layout?.textBlocks?.some((block) => block.text.includes("Forge PDF smoke text") && block.x === 72 && block.y === 720),
       "asset inspection did not extract positioned PDF text block"
     );
+    smokeStep("asset-inspect:compressed-pdf");
     const compressedPdfInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(compressedPdfAssetFixtureName)}`);
     assertSmoke(compressedPdfInspection.document?.format === "pdf", "asset inspection did not identify compressed PDF document");
     assertSmoke(compressedPdfInspection.document?.textSample?.includes("Forge compressed PDF smoke text"), "asset inspection did not extract compressed PDF text sample");
@@ -13705,6 +16449,7 @@ async function runApiSmokeTest() {
       compressedPdfInspection.document?.layout?.textBlocks?.some((block) => block.compressed === true && block.filter === "FlateDecode" && block.text.includes("Forge compressed PDF smoke text") && block.x === 96 && block.y === 700),
       "asset inspection did not extract positioned compressed PDF text block"
     );
+    smokeStep("asset-inspect:media");
     const mediaInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(mediaAssetFixtureName)}`);
     assertSmoke(mediaInspection.media?.format === "wav", "asset inspection did not parse wav media");
     assertSmoke(mediaInspection.media?.durationSeconds > 0, "asset inspection did not calculate media duration");
@@ -13712,6 +16457,7 @@ async function runApiSmokeTest() {
     assertSmoke(typeof mediaInspection.transcription?.cached === "boolean", "asset inspection missing transcription cache status");
     assertSmoke(mediaInspection.transcription?.reason || mediaInspection.transcription?.transcriptPath, "asset inspection missing transcription audit evidence");
 
+    smokeStep("apply-conflict");
     cleanup.applyFixtureAPath = path.join(currentWorkspace, `.forge-apply-smoke-a-${Date.now()}.txt`);
     cleanup.applyFixtureBPath = path.join(currentWorkspace, `.forge-apply-smoke-b-${Date.now()}.txt`);
     await fs.writeFile(cleanup.applyFixtureAPath, "alpha\n", "utf8");
@@ -13800,12 +16546,21 @@ async function runApiSmokeTest() {
     ].join("\n");
     const hunkPartialApply = await requestJson(baseUrl, "/api/apply", {
       method: "POST",
-      body: JSON.stringify({ diff: hunkConflictingDiff, prompt: "api smoke partial hunk apply", allowPartial: true, skipChecks: true, skipGit: true })
+      body: JSON.stringify({
+        diff: hunkConflictingDiff,
+        prompt: "api smoke partial hunk apply",
+        allowPartial: true,
+        skipChecks: true,
+        skipGit: true,
+        selectedHunks: [{ path: applyHunkFixtureName, selectedHunks: 1, totalHunks: 2 }]
+      })
     });
     assertSmoke(hunkPartialApply.status?.startsWith("partial_"), "partial hunk apply missing partial status");
     assertSmoke(hunkPartialApply.policy?.supportsPartialHunks === true, "partial hunk apply missing policy evidence");
     assertSmoke(hunkPartialApply.analysis?.summary?.applicableHunks === 1, "partial hunk apply did not count applicable hunk");
     assertSmoke(hunkPartialApply.analysis?.summary?.conflictHunks === 1, "partial hunk apply did not count conflicting hunk");
+    assertSmoke(hunkPartialApply.selectedHunks?.[0]?.path === applyHunkFixtureName, "partial hunk apply missing selected hunk audit");
+    assertSmoke(hunkPartialApply.policy?.selectedHunks === 1, "partial hunk apply missing selected hunk policy count");
     assertSmoke(hunkPartialApply.applied?.some((item) => item.path === applyHunkFixtureName && item.status === "partial" && item.applicableHunks === 1), "partial hunk apply did not write partial file evidence");
     assertSmoke(hunkPartialApply.conflicts?.some((item) => item.path === applyHunkFixtureName && item.hunk?.includes("@@ -4")), "partial hunk apply did not preserve hunk conflict evidence");
     assertSmoke((await fs.readFile(cleanup.applyHunkFixturePath, "utf8")) === "one changed\ntwo\nthree\nfour\n", "partial hunk apply did not update only applicable hunk");
@@ -13943,6 +16698,12 @@ async function runApiSmokeTest() {
     assertSmoke(blockedApprovalExecution.execution?.blocked === true, "blocked approval execution missing blocked flag");
     assertSmoke(blockedApprovalExecution.execution?.escalation?.relativePath?.includes(".forge/escalations/"), "blocked command execution missing escalation artifact");
     cleanup.escalationPath = blockedApprovalExecution.execution?.escalation?.path || "";
+    const explicitEscalation = await requestJson(baseUrl, "/api/approval-escalation", {
+      method: "POST",
+      body: JSON.stringify({ id: blockedCommand.approval.id, reason: "api smoke explicit escalation evidence" })
+    });
+    assertSmoke(explicitEscalation.escalation?.relativePath?.includes(".forge/escalations/"), "explicit approval escalation missing artifact");
+    cleanup.explicitEscalationPath = explicitEscalation.escalation?.path || "";
 
     const approvedProcessDecision = await requestJson(baseUrl, "/api/approval", {
       method: "PATCH",
@@ -13988,6 +16749,11 @@ async function runApiSmokeTest() {
     assertSmoke(runningProcess, "started process missing from process list");
     assertSmoke(runningProcess.logPath?.includes(".forge/process-logs/"), "managed process missing persistent log path");
     assertSmoke(runningProcess.artifactPath?.includes(".forge/process-logs/"), "managed process missing persistent artifact path");
+    const startupCommands = await requestJson(baseUrl, "/api/process-startup-commands?limit=8");
+    assertSmoke(startupCommands.policy?.access === "read-only-startup-discovery", "startup discovery missing read-only policy");
+    assertSmoke(startupCommands.commands?.[0]?.command === "node server.js", "startup discovery should prioritize expanded direct node start command");
+    assertSmoke(startupCommands.commands?.some((item) => item.command === "npm start"), "startup discovery missing package start command fallback");
+    assertSmoke(startupCommands.commands?.every((item) => item.policy?.allowed === true), "startup discovery returned non-policy-approved command");
     const processHealth = await requestJson(baseUrl, `/api/process-health?id=${encodeURIComponent(startedProcess.id)}`);
     assertSmoke(processHealth.policy?.access === "managed-process-health-and-artifacts", "process health missing read-only policy");
     assertSmoke(processHealth.summary?.total >= 1, "process health missing summary");
@@ -14003,13 +16769,20 @@ async function runApiSmokeTest() {
         name: "api-smoke-process",
         commandIncludes: [".forge-process-smoke.js"],
         expectedStatus: 200,
-        expectedBodyIncludes: processSmokeToken
+        expectedOutputIncludes: [processSmokeToken],
+        expectedProbeUrlIncludes: ["127.0.0.1"],
+        expectedProbeBodyIncludes: [processSmokeToken]
       }]
     }, null, 2), "utf8");
     const processHealthWithRules = await requestJson(baseUrl, `/api/process-health?id=${encodeURIComponent(startedProcess.id)}`);
+    const healthRuleRow = processHealthWithRules.rows?.find((item) => item.id === startedProcess.id);
     assertSmoke(processHealthWithRules.rules?.configured === true, "process health rules not detected");
     assertSmoke(processHealthWithRules.summary?.ruleMatched >= 1, "process health rules did not match process");
-    assertSmoke(processHealthWithRules.rows?.some((item) => item.id === startedProcess.id && item.rules?.status === "pass"), "process health rule did not pass");
+    assertSmoke(healthRuleRow?.probe?.bodySample?.includes(processSmokeToken), "process health probe missing response body evidence");
+    assertSmoke(healthRuleRow?.rules?.status === "pass", "process health rule did not pass");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.expectedOutputIncludes?.includes(processSmokeToken)), "process health rule missing output expectation");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.expectedProbeUrlIncludes?.includes("127.0.0.1")), "process health rule missing probe url expectation");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.expectedProbeBodyIncludes?.includes(processSmokeToken)), "process health rule missing probe body expectation");
     cleanup.processLogPaths.push(path.join(APP_ROOT, runningProcess.logPath));
     cleanup.processLogPaths.push(path.join(APP_ROOT, runningProcess.artifactPath));
     let processSearch = null;
@@ -14074,6 +16847,12 @@ async function runApiSmokeTest() {
     const healthWithSnapshot = await requestJson(baseUrl, "/api/health");
     assertSmoke(healthWithSnapshot.contextSnapshot?.generatedAt, "health missing context snapshot");
     assertSmoke(healthWithSnapshot.contextRollup?.generatedAt, "health missing context rollup");
+    assertSmoke(Array.isArray(healthWithSnapshot.recoverySummary?.cues), "health missing recovery summary cues");
+    assertSmoke(Array.isArray(healthWithSnapshot.recoverySummary?.nextActions), "health missing recovery summary next actions");
+    assertSmoke(Array.isArray(healthWithSnapshot.recoverySummary?.changedFiles), "health missing recovery changed files");
+    assertSmoke(Array.isArray(healthWithSnapshot.recoverySummary?.selectedHunks), "health missing recovery selected hunks");
+    assertSmoke(Array.isArray(healthWithSnapshot.recoverySummary?.failedCommands), "health missing recovery failed commands");
+    assertSmoke(Array.isArray(healthWithSnapshot.recoverySummary?.verificationCommands), "health missing recovery verification commands");
     const createdThread = await requestJson(baseUrl, "/api/thread", {
       method: "POST",
       body: JSON.stringify({
@@ -14232,7 +17011,7 @@ async function runApiSmokeTest() {
     console.log(JSON.stringify({
       ok: true,
       apiSmoke: true,
-    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight"],
+    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "debug-diagnostics", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-startup-commands", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight"],
       queueId: queued.id,
       handoffId: handoff.id
     }));
@@ -14284,7 +17063,12 @@ async function runApiSmokeTest() {
     if (cleanup.remotePublishDir) await fs.rm(cleanup.remotePublishDir, { recursive: true, force: true }).catch(() => {});
     if (cleanup.remoteCiArtifactPath) await fs.rm(cleanup.remoteCiArtifactPath, { force: true }).catch(() => {});
     if (cleanup.escalationPath) await fs.rm(cleanup.escalationPath, { force: true }).catch(() => {});
+    if (cleanup.explicitEscalationPath) await fs.rm(cleanup.explicitEscalationPath, { force: true }).catch(() => {});
     if (cleanup.processEscalationPath) await fs.rm(cleanup.processEscalationPath, { force: true }).catch(() => {});
+    if (cleanup.commandFailureFixturePath) await fs.rm(cleanup.commandFailureFixturePath, { force: true }).catch(() => {});
+    for (const fixturePath of cleanup.commandFailureFixturePaths || []) {
+      await fs.rm(fixturePath, { force: true }).catch(() => {});
+    }
     if (cleanup.processHealthRulesPath) {
       if (cleanup.originalProcessHealthRules === null) {
         await fs.rm(cleanup.processHealthRulesPath, { force: true }).catch(() => {});
@@ -14325,39 +17109,57 @@ async function runApiSmokeTest() {
       await fs.writeFile(SEMANTIC_INDEX_PATH, originalSemanticIndex, "utf8");
     }
     currentWorkspace = originalWorkspace;
-    server.closeIdleConnections?.();
-    server.closeAllConnections?.();
-    await new Promise((resolve) => server.close(resolve));
+    await closeSmokeServer(server);
   }
+}
+
+function runCliTask(task) {
+  task().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }
 
 if (process.argv.includes("--mcp-smoke-server")) {
   runMcpSmokeServer();
 } else if (process.argv.includes("--api-smoke-test")) {
-  runApiSmokeTest().then(() => {
-    process.exit(0);
-  }).catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
+  runCliTask(runApiSmokeTest);
+} else if (process.argv.includes("--api-smoke-section") || process.argv.some((item) => item.startsWith("--api-smoke-section="))) {
+  runCliTask(() => runApiSmokeSectionTest(getCliOption("--api-smoke-section")));
 } else if (process.argv.includes("--ui-smoke-test")) {
-  runUiSmokeTest().then(() => {
-    process.exit(0);
-  }).catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
+  runCliTask(runUiSmokeTest);
 } else if (process.argv.includes("--smoke-test")) {
-  runSmokeTest().then(() => {
-    process.exit(0);
-  }).catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
+  runCliTask(runSmokeTest);
 } else {
-  server.listen(PORT, "127.0.0.1", () => {
-    console.log(`Forge Code running at http://127.0.0.1:${PORT}`);
-    console.log(`Workspace: ${currentWorkspace}`);
-    console.log(`DeepSeek key: ${process.env.DEEPSEEK_API_KEY ? "configured" : "missing"}`);
-  });
+  const listenWithRetry = (activePort) => {
+    const runtimeServer = createAppServer();
+    runtimeServer.once("error", (error) => {
+      const retryableListenError = error && (error.code === "EADDRINUSE" || error.code === "EACCES");
+      if (retryableListenError) {
+        const reason = error.code === "EACCES" ? "not allowed" : "already in use";
+        const maxRetryPort = Math.min(65535, PORT + PORT_RETRY_LIMIT);
+        if (PORT_AUTO_RETRY && activePort < maxRetryPort) {
+          const nextPort = activePort + 1;
+          console.warn(`Port ${activePort} is ${reason}. Trying ${nextPort}...`);
+          setImmediate(() => listenWithRetry(nextPort));
+          return;
+        }
+        console.error(`Port ${activePort} is ${reason}.`);
+        console.error(`Close the existing process or start Forge Code with another port, for example:`);
+        console.error(`  set PORT=${activePort + 1}`);
+        console.error(`  node server.js`);
+        process.exit(1);
+      }
+      throw error;
+    });
+    runtimeServer.listen(activePort, "127.0.0.1", () => {
+      process.env.FORGE_PORT = String(activePort);
+      process.env.PORT = String(activePort);
+      console.log(`Forge Code running at http://127.0.0.1:${activePort}`);
+      console.log(`FORGE_URL=http://127.0.0.1:${activePort}`);
+      console.log(`Workspace: ${currentWorkspace}`);
+      console.log(`DeepSeek key: ${process.env.DEEPSEEK_API_KEY ? "configured" : "missing"}`);
+    });
+  };
+  listenWithRetry(PORT);
 }

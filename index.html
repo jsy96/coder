@@ -161,6 +161,7 @@
           <form id="promptForm" class="prompt-box">
             <label class="sr-only" for="promptInput">任务提示词</label>
             <textarea id="promptInput" rows="2" placeholder="例如：把这个应用改成支持查看文件内容，并补上错误提示..."></textarea>
+            <div id="referencePreview" class="reference-preview" aria-live="polite"></div>
             <div class="prompt-actions">
               <button class="ghost" type="button" id="attachBtn">重新加载上下文</button>
               <button class="ghost" type="button" id="queueBtn">加入队列</button>
@@ -205,6 +206,8 @@
           <div class="section-title">
             <span>Diff 预览</span>
             <strong id="diffSummary">暂无修改</strong>
+            <button type="button" id="toggleAllDiffBtn" disabled>折叠全部</button>
+            <button type="button" id="copyAllDiffBtn" disabled>复制全部</button>
           </div>
           <div id="diffList" class="diff-list">
             <div class="empty-state">运行代理后，这里会显示 DeepSeek 生成的 unified diff。批准写入前会自动创建 checkpoint。</div>
@@ -218,8 +221,15 @@
             <div class="button-row">
               <button type="button" id="reviewBtn">复核改动</button>
               <button type="button" id="runCommandsBtn">运行建议命令</button>
+              <button type="button" id="debugDiagnosticsBtn">一键诊断</button>
             </div>
           </div>
+          <form id="manualCommandForm" class="manual-command-form">
+            <input id="manualCommandInput" type="text" placeholder="输入安全验证命令，例如 node --check app.js" autocomplete="off" />
+            <button type="submit" id="manualCommandRunBtn">运行</button>
+            <button type="button" id="manualCommandStageBtn">加入面板</button>
+          </form>
+          <div id="commandHistoryList" class="command-history-list"></div>
           <div id="checksList">
             <div class="check-row queued">
               <span></span>
@@ -228,6 +238,16 @@
           </div>
           <div id="reviewList" class="review-list">
             <div class="empty-state">审查发现和自动验证结果会显示在这里。</div>
+          </div>
+          <div class="debug-diagnostics" id="debugDiagnosticsPanel">
+            <div class="debug-diagnostics-head">
+              <strong>调试诊断</strong>
+              <label>
+                <input id="debugRunChecks" type="checkbox" />
+                运行安全检查
+              </label>
+            </div>
+            <div class="empty-state">点击“一键诊断”后，这里会聚合检查命令、进程健康、页面 Trace 和代码诊断。</div>
           </div>
           <div class="section-title compact inline-title">
             <span>审查记录</span>
@@ -255,6 +275,9 @@
           </div>
           <form id="processForm" class="process-form">
             <input id="processCommandInput" type="text" placeholder="npm run dev 或 npm start" />
+            <button type="button" id="processDiscoverBtn">发现</button>
+            <button type="button" id="processStartDiscoveredBtn">发现并启动</button>
+            <button type="button" id="processStartDebugBtn">发现并调试</button>
             <button type="submit" id="startProcessBtn">启动</button>
           </form>
           <form id="processSearchForm" class="process-form">

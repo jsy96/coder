@@ -8,6 +8,11 @@
     "check": "node --check server.js && node --check app.js",
     "smoke": "node server.js --smoke-test",
     "ui-smoke": "node server.js --ui-smoke-test",
-    "api-smoke": "node server.js --api-smoke-test"
+    "api-smoke": "node server.js --api-smoke-test",
+    "api-smoke:fast": "node server.js --api-smoke-section=fast",
+    "api-smoke:coding": "node server.js --api-smoke-section=coding",
+    "api-smoke:debug": "node server.js --api-smoke-section=debug",
+    "api-smoke:integrations": "node server.js --api-smoke-section=integrations",
+    "api-smoke:publish": "node server.js --api-smoke-section=publish"
   }
 }

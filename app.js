@@ -3,6 +3,7 @@ const form = document.querySelector("#promptForm");
 const workspaceForm = document.querySelector("#workspaceForm");
 const processForm = document.querySelector("#processForm");
 const processSearchForm = document.querySelector("#processSearchForm");
+const manualCommandForm = document.querySelector("#manualCommandForm");
 const processSearchBtn = document.querySelector("#processSearchBtn");
 const processHistoryBtn = document.querySelector("#processHistoryBtn");
 const processHealthBtn = document.querySelector("#processHealthBtn");
@@ -11,6 +12,7 @@ const browserCheckForm = document.querySelector("#browserCheckForm");
 const workspaceInput = document.querySelector("#workspaceInput");
 const processCommandInput = document.querySelector("#processCommandInput");
 const processSearchInput = document.querySelector("#processSearchInput");
+const manualCommandInput = document.querySelector("#manualCommandInput");
 const browserCheckUrlInput = document.querySelector("#browserCheckUrlInput");
 const browserSelectorInput = document.querySelector("#browserSelectorInput");
 const input = document.querySelector("#promptInput");
@@ -24,7 +26,14 @@ const refreshFilesBtn = document.querySelector("#refreshFilesBtn");
 const newTaskBtn = document.querySelector("#newTaskBtn");
 const runAgentBtn = document.querySelector("#runAgentBtn");
 const runCommandsBtn = document.querySelector("#runCommandsBtn");
+const manualCommandRunBtn = document.querySelector("#manualCommandRunBtn");
+const manualCommandStageBtn = document.querySelector("#manualCommandStageBtn");
+const debugDiagnosticsBtn = document.querySelector("#debugDiagnosticsBtn");
+const debugRunChecks = document.querySelector("#debugRunChecks");
 const startProcessBtn = document.querySelector("#startProcessBtn");
+const processDiscoverBtn = document.querySelector("#processDiscoverBtn");
+const processStartDiscoveredBtn = document.querySelector("#processStartDiscoveredBtn");
+const processStartDebugBtn = document.querySelector("#processStartDebugBtn");
 const browserBaselineBtn = document.querySelector("#browserBaselineBtn");
 const browserScreenshotBtn = document.querySelector("#browserScreenshotBtn");
 const browserAuditBtn = document.querySelector("#browserAuditBtn");
@@ -66,11 +75,15 @@ const planSteps = document.querySelector("#planSteps");
 const goalState = document.querySelector("#goalState");
 const diffList = document.querySelector("#diffList");
 const diffSummary = document.querySelector("#diffSummary");
+const toggleAllDiffBtn = document.querySelector("#toggleAllDiffBtn");
+const copyAllDiffBtn = document.querySelector("#copyAllDiffBtn");
 const conflictResolutionPanel = document.querySelector("#conflictResolutionPanel");
+const commandHistoryList = document.querySelector("#commandHistoryList");
 const checksList = document.querySelector("#checksList");
 const reviewList = document.querySelector("#reviewList");
 const reviewArtifactList = document.querySelector("#reviewArtifactList");
 const approvalList = document.querySelector("#approvalList");
+const debugDiagnosticsPanel = document.querySelector("#debugDiagnosticsPanel");
 const queueList = document.querySelector("#queueList");
 const processList = document.querySelector("#processList");
 const browserCheckResult = document.querySelector("#browserCheckResult");
@@ -90,6 +103,7 @@ const mcpCatalogList = document.querySelector("#mcpCatalogList");
 const mcpProbeBtn = document.querySelector("#mcpProbeBtn");
 const assetCatalogList = document.querySelector("#assetCatalogList");
 const runState = document.querySelector("#runState");
+const referencePreview = document.querySelector("#referencePreview");
 
 const state = {
   files: [],
@@ -104,8 +118,105 @@ const state = {
   activeThreadId: "",
   threadMessages: [],
   contextSnapshot: null,
-  contextRollup: null
+  contextRollup: null,
+  lastDebugDiagnostics: null,
+  lastFailedCommand: null,
+  commandResults: {},
+  commandHistory: [],
+  activeRepairChain: null,
+  repairChains: [],
+  lastCapabilityAudit: null,
+  lastRecoverySummary: null,
+  commandDebugRestoredScope: "",
+  manualCommandHistoryCursor: -1,
+  manualCommandHistoryDraft: "",
+  referencePreviewTimer: 0,
+  referencePreviewRequestId: 0
 };
+
+const COMMAND_DEBUG_STORAGE_KEY = "forge-command-debug-state-v1";
+
+function currentDebugScope() {
+  return [
+    workspaceStatus?.textContent || "",
+    state.activeThreadId || "no-thread"
+  ].join("::");
+}
+
+function pruneCommandResults(results = {}) {
+  const entries = Object.entries(results || {})
+    .filter(([command, run]) => command && run?.status === "done")
+    .sort((a, b) => String(b[1]?.completedAt || b[1]?.startedAt || "").localeCompare(String(a[1]?.completedAt || a[1]?.startedAt || "")))
+    .slice(0, 30);
+  return Object.fromEntries(entries);
+}
+
+function saveCommandDebugState() {
+  try {
+    const payload = {
+      scope: currentDebugScope(),
+      savedAt: new Date().toISOString(),
+      lastFailedCommand: state.lastFailedCommand,
+      commandResults: pruneCommandResults(state.commandResults),
+      commandHistory: pruneCommandHistory(state.commandHistory),
+      activeRepairChain: state.activeRepairChain,
+      repairChains: pruneRepairChains(state.repairChains)
+    };
+    window.localStorage?.setItem(COMMAND_DEBUG_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Best-effort UI recovery cache.
+  }
+}
+
+function clearCommandDebugState({ persist = true } = {}) {
+  state.lastFailedCommand = null;
+  state.commandResults = {};
+  state.commandHistory = [];
+  state.activeRepairChain = null;
+  state.repairChains = [];
+  state.commandDebugRestoredScope = "";
+  renderLastFailedCommandCard();
+  updateCommandToolbarSummaries();
+  if (persist) saveCommandDebugState();
+}
+
+function restoreCommandDebugState() {
+  try {
+    const scope = currentDebugScope();
+    if (state.commandDebugRestoredScope === scope) return false;
+    const raw = window.localStorage?.getItem(COMMAND_DEBUG_STORAGE_KEY);
+    if (!raw) return false;
+    const payload = JSON.parse(raw);
+    if (!payload || payload.scope !== scope) return false;
+    state.commandResults = pruneCommandResults(payload.commandResults || {});
+    state.lastFailedCommand = payload.lastFailedCommand || null;
+    state.commandHistory = pruneCommandHistory(payload.commandHistory || []);
+    state.activeRepairChain = payload.activeRepairChain || null;
+    state.repairChains = pruneRepairChains(payload.repairChains || []);
+    state.commandDebugRestoredScope = scope;
+    renderLastFailedCommandCard();
+    renderCommandHistory();
+    updateCommandToolbarSummaries();
+    if (state.lastFailedCommand) {
+      appendDebugEvidence(
+        "已恢复最近失败命令",
+        "ready",
+        `${state.lastFailedCommand.command || ""}\n${summarizeCommandOutput(state.lastFailedCommand.result?.output || state.lastFailedCommand.error || "")}`
+      );
+    }
+    if (state.activeRepairChain) {
+      appendToolCall({
+        title: "已恢复修复证据链",
+        label: "repair",
+        state: state.activeRepairChain.status || "ready",
+        body: summarizeRepairEvidenceChain(state.activeRepairChain)
+      });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -145,11 +256,11 @@ async function consumeSse(response, onEvent) {
   }
 }
 
-async function runAgentRequest(prompt) {
+async function runAgentRequest(prompt, debugContext = buildAgentDebugContext()) {
   if (!window.ReadableStream) {
     return await api("/api/agent", {
       method: "POST",
-      body: JSON.stringify({ prompt })
+      body: JSON.stringify({ prompt, debugContext })
     });
   }
   let finalResult = null;
@@ -157,24 +268,46 @@ async function runAgentRequest(prompt) {
   const response = await fetch("/api/agent-stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt })
+    body: JSON.stringify({ prompt, debugContext })
   });
-  await consumeSse(response, (event, data) => {
-    streamLog.push({ event, data });
-    if (event === "start") setBusy(true, "流式启动");
-    if (event === "goal") renderPlan(["流式代理启动", "读取上下文", "生成 diff 和审查"]);
-    if (event === "context") {
-      appendToolCall({
-        title: "流式上下文事件",
-        label: "stream",
-        state: `${data.fileCount || 0} files`,
-        body: JSON.stringify(data, null, 2)
-      });
-    }
-    if (event === "token") setBusy(true, `token ${data.index || streamLog.length}`);
-    if (event === "result") finalResult = data;
-    if (event === "error") throw new Error(data.message || "流式代理失败");
-  });
+  try {
+    await consumeSse(response, (event, data) => {
+      streamLog.push({ event, data });
+      if (event === "start") setBusy(true, "流式启动");
+      if (event === "goal") renderPlan(["流式代理启动", "读取上下文", "生成 diff 和审查"]);
+      if (event === "context") {
+        const missingReferences = data.missingReferences || [];
+        appendToolCall({
+          title: "流式上下文事件",
+          label: "stream",
+          state: `${data.fileCount || 0} files · ${(data.referencedFiles || []).length} refs · ${missingReferences.length} missing`,
+          body: JSON.stringify(data, null, 2)
+        });
+        if (missingReferences.length) {
+          appendToolCall({
+            title: "未命中的文件引用",
+            label: "ctx",
+            state: `${missingReferences.length} missing`,
+            body: missingReferences.map((item) => `@${item.path} · ${item.reason || "未匹配"}`).join("\n")
+          });
+        }
+      }
+      if (event === "token") setBusy(true, `token ${data.index || streamLog.length}`);
+      if (event === "result") finalResult = data;
+      if (event === "error") throw new Error(data.message || "流式代理失败");
+    });
+  } catch (error) {
+    error.streamLog = streamLog.map((item) => ({
+      event: item.event,
+      data: item.event === "result"
+        ? { reply: item.data?.reply, patches: item.data?.patches?.length || 0, streamPolicy: item.data?.streamPolicy }
+        : item.event === "token"
+          ? { index: item.data?.index, chars: String(item.data?.token || "").length }
+          : item.data
+    }));
+    error.endpoint = "/api/agent-stream";
+    throw error;
+  }
   if (!finalResult) throw new Error("流式代理未返回最终结果。");
   finalResult.streamLog = streamLog.map((item) => ({
     event: item.event,
@@ -187,6 +320,138 @@ async function runAgentRequest(prompt) {
   return finalResult;
 }
 
+function buildAgentDebugContext() {
+  const diagnostics = state.lastDebugDiagnostics;
+  if (!diagnostics) return null;
+  const referencedFiles = debugEvidenceReferencedFiles(diagnostics);
+  return {
+    source: "lastDebugDiagnostics",
+    generatedAt: diagnostics.generatedAt || "",
+    status: diagnostics.status || "",
+    summary: diagnostics.summary || {},
+    debugContext: {
+      referencedFiles
+    },
+    "debugContext.referencedFiles": referencedFiles,
+    referencedFiles,
+    findings: (diagnostics.findings || []).slice(0, 10).map((item) => ({
+      severity: item.severity || "info",
+      area: item.area || "",
+      message: item.message || "",
+      evidence: (item.evidence || []).slice(0, 6)
+    })),
+    nextActions: (diagnostics.nextActions || []).slice(0, 8),
+    verificationPlan: diagnostics.verificationPlan ? {
+      status: diagnostics.verificationPlan.status || "",
+      commands: (diagnostics.verificationPlan.commands || []).slice(0, 8)
+    } : null,
+    processHealth: diagnostics.processHealth ? {
+      summary: diagnostics.processHealth.summary || {},
+      rows: (diagnostics.processHealth.rows || []).slice(0, 8).map((row) => ({
+        id: row.id,
+        status: row.status,
+        command: row.command,
+        probe: row.probe,
+        rules: row.rules
+      }))
+    } : null,
+    browserTrace: diagnostics.browserTrace ? {
+      ok: diagnostics.browserTrace.ok,
+      url: diagnostics.browserTrace.url,
+      finalUrl: diagnostics.browserTrace.finalUrl,
+      summary: diagnostics.browserTrace.summary,
+      console: (diagnostics.browserTrace.console || []).slice(0, 8),
+      exceptions: (diagnostics.browserTrace.exceptions || []).slice(0, 8),
+      network: (diagnostics.browserTrace.network || []).filter((item) => item.failed || item.status >= 400).slice(0, 8)
+    } : null
+  };
+}
+
+function buildDebugFixPrompt(result = state.lastDebugDiagnostics) {
+  if (!result) return "";
+  const referencedFiles = debugEvidenceReferencedFiles(result);
+  const findings = (result.findings || [])
+    .slice(0, 8)
+    .map((item, index) => `${index + 1}. [${item.severity || "info"}] ${item.area || "debug"}：${item.message || ""}${item.evidence?.length ? `；证据：${item.evidence.slice(0, 4).join(" / ")}` : ""}`)
+    .join("\n");
+  const actions = (result.nextActions || [])
+    .slice(0, 6)
+    .map((item, index) => {
+      const meta = [
+        item.priority ? `P${item.priority}` : "",
+        item.kind || "",
+        item.target ? `target=${item.target}` : "",
+        item.evidence?.length ? `evidence=${item.evidence.slice(0, 3).join(" / ")}` : ""
+      ].filter(Boolean).join(" · ");
+      return `${index + 1}. ${item.label || item.id || "建议动作"}${meta ? `（${meta}）` : ""}${item.description ? `：${item.description}` : ""}${item.command ? `；命令：${item.command}` : ""}`;
+    })
+    .join("\n");
+  const commands = (result.verificationPlan?.commands || [])
+    .slice(0, 6)
+    .map((item) => `- ${item.command || item}${item.reason ? `：${item.reason}` : ""}`)
+    .join("\n");
+  return [
+    state.lastPrompt ? `继续修复上一轮任务：${state.lastPrompt}` : "请基于最近一次调试诊断修复当前项目。",
+    "",
+    "请优先依据已附加的最近调试诊断上下文定位问题，读取必要文件，生成最小 diff，并给出可运行的验证命令。",
+    "",
+    referencedFiles.length ? `优先读取相关文件：\n${referencedFiles.map((file) => `@${file}`).join("\n")}` : "",
+    referencedFiles.length ? "" : "",
+    result.status ? `诊断状态：${result.status}` : "",
+    result.summary ? `诊断摘要：${JSON.stringify(result.summary)}` : "",
+    findings ? `主要发现：\n${findings}` : "",
+    actions ? `建议动作：\n${actions}` : "",
+    commands ? `建议验证命令：\n${commands}` : "",
+    "",
+    "要求：不要猜测文件内容；先读取相关文件；如果无法安全修改，请说明原因并给出下一步排查命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function buildReviewFixPrompt(item = {}) {
+  const location = [item.file, item.line].filter(Boolean).join(":");
+  return [
+    state.lastPrompt ? `继续修复上一轮任务：${state.lastPrompt}` : "请修复当前审查发现。",
+    "",
+    "请优先读取相关文件，针对下面这条审查发现生成最小 diff，并给出可运行的验证命令。",
+    "",
+    `严重级别：${item.severity || "info"}`,
+    location ? `位置：${location}` : "",
+    item.message ? `发现：${item.message}` : "",
+    "",
+    "要求：不要猜测文件内容；如果无法安全修改，请说明原因并给出下一步排查命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function submitPromptForm() {
+  if (form.requestSubmit) {
+    form.requestSubmit();
+  } else {
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  }
+}
+
+function shouldSubmitPromptFromKey(event) {
+  if (!event || event.key !== "Enter") return false;
+  if (event.isComposing || event.keyCode === 229) return false;
+  if (event.shiftKey && !event.metaKey && !event.ctrlKey) return false;
+  return true;
+}
+
+function handlePromptInputKeydown(event) {
+  if (!shouldSubmitPromptFromKey(event)) return;
+  event.preventDefault();
+  submitPromptForm();
+}
+
+function resizePromptInput() {
+  if (!input) return;
+  input.style.height = "auto";
+  const maxHeight = Number.parseInt(getComputedStyle(input).maxHeight, 10) || 320;
+  const nextHeight = Math.min(Math.max(input.scrollHeight, 68), maxHeight);
+  input.style.height = `${nextHeight}px`;
+  input.classList.toggle("is-scrollable", input.scrollHeight > maxHeight);
+}
+
 function showToast(message) {
   toast.textContent = message;
   toast.classList.add("show");
@@ -194,13 +459,287 @@ function showToast(message) {
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2600);
 }
 
+function formatBytes(bytes = 0) {
+  const value = Number(bytes || 0);
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${value} B`;
+}
+
+function escapeHtml(value = "") {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function normalizeReferencePath(value = "") {
+  return String(value || "").replace(/^\.?[\\/]/, "").replaceAll("\\", "/");
+}
+
+function referenceSuggestionScore(token = "", filePath = "") {
+  const needle = normalizeReferencePath(token).toLowerCase();
+  const candidate = normalizeReferencePath(filePath).toLowerCase();
+  if (!needle || !candidate) return 0;
+  if (candidate === needle) return 1000;
+  const needleBase = needle.split("/").pop() || needle;
+  const candidateBase = candidate.split("/").pop() || candidate;
+  const orderedMatchRatio = (source = "", target = "") => {
+    let index = 0;
+    for (const char of source) {
+      const next = target.indexOf(char, index);
+      if (next === -1) continue;
+      index = next + 1;
+    }
+    return source.length ? index / target.length : 0;
+  };
+  let score = 0;
+  if (candidateBase === needleBase) score += 520;
+  if (candidate.endsWith(`/${needle}`) || candidate.endsWith(needle)) score += 420;
+  if (candidateBase.includes(needleBase)) score += 260;
+  if (candidate.includes(needle)) score += 220;
+  if (pathExtension(candidateBase) === pathExtension(needleBase)) {
+    const compactNeedle = needleBase.replace(/[^a-z0-9]/g, "");
+    const compactCandidate = candidateBase.replace(/[^a-z0-9]/g, "");
+    if (orderedMatchRatio(compactNeedle, compactCandidate) >= 0.75) score += 180;
+  }
+  const needleParts = needle.split(/[\/._-]+/).filter(Boolean);
+  const candidateParts = new Set(candidate.split(/[\/._-]+/).filter(Boolean));
+  for (const part of needleParts) {
+    if (part.length >= 2 && candidateParts.has(part)) score += 45;
+  }
+  if (candidateBase[0] && needleBase[0] && candidateBase[0] === needleBase[0]) score += 20;
+  return score;
+}
+
+function pathExtension(value = "") {
+  const last = String(value || "").split("/").pop() || "";
+  const index = last.lastIndexOf(".");
+  return index > 0 ? last.slice(index).toLowerCase() : "";
+}
+
+function suggestReferencePaths(token = "", files = state.files || []) {
+  const normalizedToken = normalizeReferencePath(token);
+  return (files || [])
+    .map((file) => ({
+      path: normalizeReferencePath(file.path || ""),
+      size: file.size,
+      score: referenceSuggestionScore(normalizedToken, file.path || "")
+    }))
+    .filter((item) => item.path && item.score >= 80)
+    .sort((a, b) => b.score - a.score || a.path.length - b.path.length || a.path.localeCompare(b.path))
+    .slice(0, 3);
+}
+
+function replacePromptReferenceToken(fromPath = "", toPath = "") {
+  if (!input || !fromPath || !toPath) return false;
+  const escaped = String(fromPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const before = "(^|[\\s([{\\\"'，。；：、])";
+  const trailing = "([.,;:!?，。；：！？、]*)";
+  const after = "(?=$|[\\s，。；：、'\\\"`<>()\\[\\]{}])";
+  const pattern = new RegExp(`${before}@${escaped}${trailing}${after}`, "g");
+  const next = input.value.replace(pattern, (match, prefix, suffix = "") => `${prefix}@${toPath}${suffix}`);
+  if (next === input.value) return false;
+  input.value = next;
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  showToast(`已替换为 @${toPath}`);
+  return true;
+}
+
+function buildMissingReferenceContext(preview = {}) {
+  const missing = preview.missing || preview.missingReferences || [];
+  if (!missing.length) return "";
+  const references = preview.references || preview.referencedFiles || [];
+  const tokens = preview.tokens || [];
+  return [
+    "请修复当前提示词中的未命中 @file 引用，让代理在写代码/调试前能读取正确文件。",
+    "",
+    tokens.length ? `提示词中识别到 ${tokens.length} 个 @file token。` : "",
+    references.length ? `已命中文件：${references.map((item) => `@${item.path || item}`).join(" ")}` : "已命中文件：(无)",
+    "",
+    "未命中的 @file 引用：",
+    missing.map((item) => {
+      const suggestions = (item.suggestions || []).map((suggestion) => `@${suggestion.path || suggestion}`).join(" ");
+      return `- @${item.path || item}: ${item.reason || "未在当前工作区文件列表中找到匹配文件。"}${suggestions ? ` 候选：${suggestions}` : ""}`;
+    }).join("\n"),
+    "",
+    "要求：先搜索当前工作区中最可能对应的文件路径；把提示词里的错误 @file 改成真实路径；不要假装已经读取未命中文件；如果确实没有对应文件，请说明缺失文件和下一步排查命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendMissingReferencesToPrompt(preview = {}) {
+  const context = buildMissingReferenceContext(preview);
+  if (!context) {
+    showToast("暂无未命中的文件引用。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "未命中文件引用已加入提示词",
+    label: "@file",
+    state: `${(preview.missing || preview.missingReferences || []).length} missing`,
+    body: context.slice(0, 12000)
+  });
+  showToast("未命中文件引用已加入提示词。");
+  return context;
+}
+
+function runMissingReferenceRepair(preview = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再修复引用。");
+    return "";
+  }
+  const context = buildMissingReferenceContext(preview);
+  if (!context) {
+    showToast("暂无可修复的未命中文件引用。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接修复这些引用问题：优先搜索真实文件路径，更新提示词中的 @file 引用，并在必要时继续执行原本的编码/调试任务。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "已启动引用修复",
+    label: "@file",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动引用修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function renderReferencePreview(preview = null) {
+  if (!referencePreview) return;
+  const tokens = preview?.tokens || [];
+  if (!tokens.length) {
+    referencePreview.innerHTML = "";
+    referencePreview.className = "reference-preview";
+    return;
+  }
+  const references = preview.references || [];
+  const missing = preview.missing || [];
+  referencePreview.className = `reference-preview ${missing.length ? "has-missing" : "all-matched"}`;
+  const matchedText = references.length
+    ? references.slice(0, 5).map((item) => `@${escapeHtml(item.path)}`).join(" ")
+    : "暂无命中文件";
+  const missingText = missing.length
+    ? missing.slice(0, 5).map((item) => `@${escapeHtml(item.path)}`).join(" ")
+    : "";
+  const suggestionItems = missing
+    .flatMap((item) => (item.suggestions || []).slice(0, 2).map((suggestion) => ({
+      from: item.path,
+      to: suggestion.path,
+      label: `@${item.path} -> @${suggestion.path}`
+    })))
+    .slice(0, 4);
+  const suggestionText = suggestionItems.length
+    ? `<span class="reference-preview-suggestions">建议：${suggestionItems.map((item) => `<button type="button" data-action="apply-reference-suggestion" data-from="${escapeHtml(item.from)}" data-to="${escapeHtml(item.to)}">${escapeHtml(item.label)}</button>`).join("")}</span>`
+    : "";
+  referencePreview.innerHTML = `
+    <span class="reference-preview-summary">${references.length}/${tokens.length} 个 @file 命中 · ${formatBytes(preview.bytes || 0)}</span>
+    <span class="reference-preview-paths">${matchedText}</span>
+    ${missingText ? `<span class="reference-preview-missing">未命中：${missingText}</span>` : ""}
+    ${suggestionText}
+    ${missing.length ? `<span class="reference-preview-actions"><button type="button" data-action="prompt-missing-references">加入提示词</button><button type="button" data-action="repair-missing-references">修复引用</button></span>` : ""}
+  `;
+  referencePreview.querySelectorAll("[data-action='apply-reference-suggestion']").forEach((button) => {
+    button.addEventListener("click", () => {
+      replacePromptReferenceToken(button.dataset.from || "", button.dataset.to || "");
+    });
+  });
+  referencePreview.querySelector("[data-action='prompt-missing-references']")?.addEventListener("click", () => {
+    appendMissingReferencesToPrompt(preview);
+  });
+  referencePreview.querySelector("[data-action='repair-missing-references']")?.addEventListener("click", () => {
+    runMissingReferenceRepair(preview);
+  });
+}
+
+function localPromptReferencePreview(prompt = "") {
+  const text = String(prompt || "");
+  if (!text.includes("@")) return { tokens: [], references: [], missing: [], bytes: 0 };
+  const tokens = [];
+  const pattern = /(^|[\s([{"'，。；：、])@([^\s，。；：、'"`<>()\[\]{}]+)/g;
+  let match;
+  while ((match = pattern.exec(text))) {
+    const raw = match[2].replace(/[.,;:!?，。；：！？、]+$/g, "");
+    if (!raw || raw.includes("@")) continue;
+    const token = raw.replace(/^\.?[\\/]/, "").replaceAll("\\", "/");
+    if (!tokens.some((item) => item.toLowerCase() === token.toLowerCase())) tokens.push(token);
+  }
+  const references = [];
+  const matched = new Set();
+  for (const token of tokens.slice(0, 24)) {
+    const file = state.files.find((item) => String(item.path || "").replaceAll("\\", "/").toLowerCase() === token.toLowerCase());
+    if (!file) continue;
+    matched.add(token.toLowerCase());
+    references.push({ path: file.path, size: file.size });
+  }
+  const missing = tokens
+    .slice(0, 24)
+    .filter((token) => !matched.has(token.toLowerCase()))
+    .map((path) => ({
+      path,
+      reason: "未在当前文件列表中找到匹配文件。",
+      suggestions: suggestReferencePaths(path)
+    }));
+  const bytes = references.reduce((sum, item) => sum + Number(item.size || 0), 0);
+  return { tokens: tokens.slice(0, 24), references, missing, bytes };
+}
+
+function scheduleReferencePreview({ immediate = false } = {}) {
+  if (!referencePreview || !input) return;
+  resizePromptInput();
+  window.clearTimeout(state.referencePreviewTimer);
+  const prompt = input.value;
+  const localPreview = localPromptReferencePreview(prompt);
+  renderReferencePreview(localPreview);
+  if (!localPreview.tokens.length) return;
+  const requestId = state.referencePreviewRequestId + 1;
+  state.referencePreviewRequestId = requestId;
+  state.referencePreviewTimer = window.setTimeout(async () => {
+    try {
+      const preview = await api("/api/prompt-references", {
+        method: "POST",
+        body: JSON.stringify({ prompt })
+      });
+      if (state.referencePreviewRequestId === requestId && input.value === prompt) {
+        renderReferencePreview(preview);
+      }
+    } catch {
+      if (state.referencePreviewRequestId === requestId) {
+        referencePreview.classList.add("has-missing");
+      }
+    }
+  }, immediate ? 0 : 260);
+}
+
 function setBusy(value, label = "待命") {
   state.busy = value;
   runAgentBtn.disabled = value;
   approveBtn.disabled = value;
   if (approvePartialBtn) approvePartialBtn.disabled = value;
+  if (copyAllDiffBtn) {
+    const hasDiff = Boolean(state.pendingDiff || (state.pendingPatches || []).some((patch) => patch.diff));
+    copyAllDiffBtn.disabled = value || !hasDiff;
+  }
+  if (toggleAllDiffBtn) {
+    const hasDiff = Boolean(state.pendingPatches?.length);
+    toggleAllDiffBtn.disabled = value || !hasDiff;
+  }
   rollbackBtn.disabled = value;
   runCommandsBtn.disabled = value;
+  if (debugDiagnosticsBtn) debugDiagnosticsBtn.disabled = value;
   if (queueIsolationBtn) queueIsolationBtn.disabled = value;
   if (startProcessBtn) startProcessBtn.disabled = value;
   if (processHealthBtn) processHealthBtn.disabled = value;
@@ -278,6 +817,798 @@ function persistActiveThread() {
   }).catch(() => {});
 }
 
+function compactThreadMessages(messages = [], max = 9000) {
+  const rows = (Array.isArray(messages) ? messages : []).slice(-18).map((message, index) => {
+    const role = message.role === "user" ? "user" : "agent";
+    const text = String(message.text || "").trim();
+    const createdAt = message.createdAt ? ` @ ${message.createdAt}` : "";
+    return `#${index + 1} ${role}${createdAt}\n${text}`;
+  });
+  return rows.join("\n\n").slice(0, max);
+}
+
+function buildThreadPromptContext(detail = {}) {
+  const messages = Array.isArray(detail.messages) ? detail.messages : [];
+  if (!detail.id && !messages.length) return "";
+  const summary = detail.summary || {};
+  return [
+    "请基于这段历史会话上下文继续当前编码/调试任务。",
+    "",
+    `会话 ID：${detail.id || summary.id || ""}`,
+    `标题：${detail.title || summary.title || "未命名会话"}`,
+    `状态：${detail.status || summary.status || "active"}`,
+    summary.parentThreadId ? `父会话：${summary.parentThreadId}` : "",
+    summary.pendingProposalId ? `待审批提案：${summary.pendingProposalId}` : "",
+    `消息数：${messages.length || summary.messageCount || 0}`,
+    summary.lastMessage ? `最近消息摘要：${summary.lastMessage}` : "",
+    "",
+    "最近会话消息：",
+    compactThreadMessages(messages),
+    "",
+    "要求：先读取必要文件和当前工作树状态，不要假设历史上下文仍然完全准确；保留已有正确改动，优先补齐最影响写代码/调试体验的最小闭环；需要改代码时输出最小 diff，并给出或执行安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+async function loadThreadDetail(thread = {}) {
+  const id = thread.id || "";
+  if (!id) throw new Error("会话缺少 id。");
+  return api(`/api/thread?id=${encodeURIComponent(id)}`);
+}
+
+function appendThreadFailureEvidence(thread = {}, error, {
+  title = "会话操作失败",
+  action = "thread-action",
+  endpoint = "/api/thread",
+  request = null,
+  retry = null
+} = {}) {
+  return appendActionFailureEvidence({
+    kind: "thread",
+    action,
+    targetName: thread.title || thread.id || "thread",
+    endpoint,
+    request: request || { id: thread.id || "" },
+    item: thread,
+    error
+  }, {
+    title,
+    label: "thread",
+    retry,
+    safe: thread.id ? () => appendThreadContextToPrompt(thread) : null
+  });
+}
+
+async function appendThreadContextToPrompt(thread = {}) {
+  try {
+    const detail = await loadThreadDetail(thread);
+    const context = buildThreadPromptContext(detail);
+    if (!context) {
+      showToast("暂无可加入提示词的会话上下文。");
+      return "";
+    }
+    const current = input.value.trim();
+    input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: `会话上下文已加入提示词：${detail.title || detail.id}`,
+      label: "thread",
+      state: detail.status || "active",
+      body: context.slice(0, 12000)
+    });
+    showToast("会话上下文已加入提示词。");
+    return context;
+  } catch (error) {
+    showToast(error.message);
+    appendThreadFailureEvidence(thread, error, {
+      title: `会话上下文加入失败：${thread.title || thread.id || "thread"}`,
+      action: "thread-prompt",
+      endpoint: "/api/thread",
+      request: { id: thread.id || "" },
+      retry: () => appendThreadContextToPrompt(thread)
+    });
+    return "";
+  }
+}
+
+async function runThreadContinuation(thread = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再继续会话。");
+    return "";
+  }
+  try {
+    const detail = await loadThreadDetail(thread);
+    const context = buildThreadPromptContext(detail);
+    if (!context) {
+      showToast("暂无可用于继续的会话上下文。");
+      return "";
+    }
+    const prompt = [
+      context,
+      "",
+      "请现在直接基于这段历史会话继续推进：先核对当前文件状态，再完成下一步最小可验证修复或增强；如历史结论已过期，请以当前工作树为准。"
+    ].join("\n");
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: `已启动会话继续：${detail.title || detail.id}`,
+      label: "thread",
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于历史会话启动继续任务。");
+    submitPromptForm();
+    return prompt;
+  } catch (error) {
+    showToast(error.message);
+    appendThreadFailureEvidence(thread, error, {
+      title: `会话继续失败：${thread.title || thread.id || "thread"}`,
+      action: "thread-continuation",
+      endpoint: "/api/thread",
+      request: { id: thread.id || "" },
+      retry: () => runThreadContinuation(thread)
+    });
+    return "";
+  }
+}
+
+function contextEvidenceValue(kind, result = {}) {
+  if (kind === "snapshot") return result.snapshot || result;
+  if (kind === "compact") return result.compact || result;
+  if (kind === "rollup") return result.rollup || result;
+  return result;
+}
+
+function contextEvidenceTitle(kind) {
+  if (kind === "snapshot") return "上下文摘要";
+  if (kind === "compact") return "上下文压缩";
+  if (kind === "rollup") return "上下文滚动摘要";
+  return "上下文证据";
+}
+
+function contextEvidenceLabel(kind) {
+  if (kind === "compact") return "compact";
+  if (kind === "rollup") return "rollup";
+  return "context";
+}
+
+function contextEvidencePromptTitle(kind) {
+  if (kind === "snapshot") return "上下文摘要已加入提示词";
+  if (kind === "compact") return "上下文压缩已加入提示词";
+  if (kind === "rollup") return "上下文滚动摘要已加入提示词";
+  return "上下文证据已加入提示词";
+}
+
+function buildContextEvidencePrompt(kind, result = {}) {
+  const evidence = contextEvidenceValue(kind, result);
+  if (!evidence || typeof evidence !== "object") return "";
+  const title = contextEvidenceTitle(kind);
+  const summaryLines = [];
+  if (evidence.workspace) summaryLines.push(`工作区：${evidence.workspace}`);
+  if (evidence.generatedAt) summaryLines.push(`生成时间：${evidence.generatedAt}`);
+  if (evidence.fileCount !== undefined) summaryLines.push(`文件数：${evidence.fileCount}`);
+  if (evidence.repo?.fileCount !== undefined) summaryLines.push(`仓库文件数：${evidence.repo.fileCount}`);
+  if (evidence.summary?.entries !== undefined) summaryLines.push(`滚动条目：${evidence.summary.entries}`);
+  if (Array.isArray(evidence.summary)) summaryLines.push(`摘要条目：${evidence.summary.length}`);
+  if (evidence.goal?.phase) summaryLines.push(`目标阶段：${evidence.goal.phase}`);
+  return [
+    `请基于这份${title}继续当前编码/调试任务。`,
+    "",
+    ...summaryLines,
+    "",
+    `${title} JSON：`,
+    JSON.stringify(evidence, null, 2).slice(0, 12000),
+    "",
+    "要求：先核对当前工作树和必要文件，判断这份上下文是否仍然准确；优先补齐最影响写代码/调试体验的最小闭环；需要改代码时输出最小 diff，并给出或执行安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendContextEvidenceCard(kind, result = {}) {
+  const evidence = contextEvidenceValue(kind, result);
+  appendToolCall({
+    title: `${contextEvidenceTitle(kind)}已保存`,
+    label: contextEvidenceLabel(kind),
+    state: "完成",
+    body: JSON.stringify(evidence, null, 2).slice(0, 12000)
+  });
+  const context = buildContextEvidencePrompt(kind, result);
+  if (!context) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="continue">直接继续</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    const current = input.value.trim();
+    input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: contextEvidencePromptTitle(kind),
+      label: contextEvidenceLabel(kind),
+      state: "ready",
+      body: context.slice(0, 12000)
+    });
+    showToast(`${contextEvidencePromptTitle(kind)}。`);
+  });
+  actions.querySelector("[data-action='continue']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再继续上下文任务。");
+      return;
+    }
+    const prompt = [
+      context,
+      "",
+      "请现在直接基于这份上下文证据继续推进：先确认当前文件状态，再完成下一步最小可验证修复或增强；如果上下文过期，以当前工作树为准。"
+    ].join("\n");
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: `已启动上下文继续：${contextEvidenceTitle(kind)}`,
+      label: contextEvidenceLabel(kind),
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于上下文证据启动继续任务。");
+    submitPromptForm();
+  });
+  log.lastElementChild?.appendChild(actions);
+}
+
+function appendContextFailureEvidence(kind, error, {
+  endpoint = "",
+  request = null
+} = {}) {
+  const message = error?.message || String(error || "unknown error");
+  const evidence = {
+    status: "failed",
+    generatedAt: new Date().toISOString(),
+    kind,
+    title: contextEvidenceTitle(kind),
+    endpoint,
+    request,
+    error: message,
+    workspace: workspaceStatus?.textContent || "",
+    lastPrompt: state.lastPrompt || input.value.trim(),
+    pendingDiff: {
+      bytes: String(state.pendingDiff || "").length,
+      files: (state.pendingPatches || []).map((patch) => patch.path).filter(Boolean).slice(0, 20)
+    },
+    contextState: {
+      hasSnapshot: Boolean(state.contextSnapshot),
+      hasRollup: Boolean(state.contextRollup),
+      hasDebugDiagnostics: Boolean(state.lastDebugDiagnostics),
+      hasRepairChain: Boolean(state.activeRepairChain),
+      activeThreadId: state.activeThreadId || ""
+    }
+  };
+  appendContextEvidenceCard(kind, {
+    [kind]: evidence
+  });
+  return evidence;
+}
+
+function modelEvidenceValue(kind, result = {}) {
+  if (kind === "policy") return result.policy || result;
+  if (kind === "usage") return result.usage || result;
+  if (kind === "budget") return result.budget || result;
+  if (kind === "cost") return result.cost || result;
+  if (kind === "cost-policy") return result.policy || result;
+  if (kind === "billing") return result.billing || result;
+  return result;
+}
+
+function modelEvidenceTitle(kind) {
+  if (kind === "policy") return "模型策略";
+  if (kind === "usage") return "模型用量";
+  if (kind === "budget") return "模型预算";
+  if (kind === "cost") return "模型成本";
+  if (kind === "cost-policy") return "模型价格表";
+  if (kind === "billing") return "模型账单核对";
+  return "模型证据";
+}
+
+function modelEvidenceState(kind, evidence = {}) {
+  if (kind === "usage") return `${evidence.summary?.requestCount || 0} requests`;
+  if (kind === "cost-policy") return evidence.valid ? "valid" : "invalid";
+  return evidence.status || "unknown";
+}
+
+function modelEvidenceSummary(kind, evidence = {}) {
+  if (kind === "policy") {
+    return {
+      generatedAt: evidence.generatedAt,
+      status: evidence.status,
+      endpoint: evidence.endpoint,
+      runtime: evidence.runtime,
+      budgetPolicy: evidence.budgetPolicy,
+      guardrails: evidence.guardrails,
+      remainingGaps: evidence.remainingGaps
+    };
+  }
+  if (kind === "usage") {
+    return {
+      generatedAt: evidence.generatedAt,
+      endpoint: evidence.endpoint,
+      summary: evidence.summary,
+      totals: evidence.totals,
+      recent: evidence.recent?.slice(0, 12),
+      policy: evidence.policy
+    };
+  }
+  if (kind === "budget") {
+    return {
+      generatedAt: evidence.generatedAt,
+      status: evidence.status,
+      blocksModelCall: evidence.blocksModelCall,
+      checks: evidence.checks,
+      usage: evidence.usage,
+      policy: evidence.policy,
+      message: evidence.message
+    };
+  }
+  if (kind === "cost") {
+    return {
+      generatedAt: evidence.generatedAt,
+      status: evidence.status,
+      currency: evidence.currency,
+      configured: evidence.configured,
+      estimatedCost: evidence.estimatedCost,
+      pricedModelCount: evidence.pricedModelCount,
+      unpricedModelCount: evidence.unpricedModelCount,
+      rows: evidence.rows,
+      policy: evidence.policy,
+      notes: evidence.notes,
+      error: evidence.error
+    };
+  }
+  if (kind === "cost-policy") {
+    return {
+      envVar: evidence.envVar,
+      configured: evidence.configured,
+      valid: evidence.valid,
+      parsed: evidence.parsed,
+      schema: evidence.schema,
+      exampleJson: evidence.exampleJson,
+      policy: evidence.policy,
+      notes: evidence.notes
+    };
+  }
+  if (kind === "billing") {
+    return {
+      generatedAt: evidence.generatedAt,
+      status: evidence.status,
+      configured: evidence.configured,
+      currency: evidence.currency,
+      period: evidence.period,
+      estimatedCost: evidence.estimatedCost,
+      actualCost: evidence.actualCost,
+      variance: evidence.variance,
+      rows: evidence.rows,
+      billing: evidence.billing,
+      policy: evidence.policy,
+      notes: evidence.notes,
+      error: evidence.error
+    };
+  }
+  return evidence;
+}
+
+function buildModelEvidencePrompt(kind, result = {}) {
+  const evidence = modelEvidenceValue(kind, result);
+  if (!evidence || typeof evidence !== "object") return "";
+  const title = modelEvidenceTitle(kind);
+  const summary = modelEvidenceSummary(kind, evidence);
+  const status = modelEvidenceState(kind, evidence);
+  const warnings = [
+    evidence.blocksModelCall ? "预算会阻止模型请求" : "",
+    evidence.error ? `错误：${evidence.error}` : "",
+    evidence.unpricedModelCount ? `未定价模型：${evidence.unpricedModelCount}` : "",
+    evidence.valid === false ? "价格表 schema 无效" : "",
+    evidence.status === "over_budget" ? "预算超限" : "",
+    evidence.status === "variance" ? "账单存在差异" : ""
+  ].filter(Boolean);
+  return [
+    `请基于这份${title}证据优化当前项目的模型运行、预算、成本或账单核对体验。`,
+    "",
+    `证据类型：${kind}`,
+    `状态：${status}`,
+    warnings.length ? `风险：${warnings.join("；")}` : "",
+    "",
+    "模型证据摘要：",
+    JSON.stringify(summary, null, 2).slice(0, 9000),
+    "",
+    "完整证据 JSON：",
+    JSON.stringify(evidence, null, 2).slice(0, 12000),
+    "",
+    "要求：先判断该证据是否暴露真实写代码/调试时的模型稳定性、fallback、预算、成本或账单 blocker；需要改代码时输出最小 diff；需要验证时给出或执行安全检查命令；不要发起真实模型请求或远端写入。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendModelEvidenceToPrompt(kind, result = {}) {
+  const context = buildModelEvidencePrompt(kind, result);
+  if (!context) {
+    showToast("暂无可加入提示词的模型证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `${modelEvidenceTitle(kind)}证据已加入提示词`,
+    label: "model",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("模型证据已加入提示词。");
+  return context;
+}
+
+function runModelEvidenceRepair(kind, result = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动模型证据优化。");
+    return "";
+  }
+  const context = buildModelEvidencePrompt(kind, result);
+  if (!context) {
+    showToast("暂无可用于优化的模型证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这份模型证据继续改进：优先补齐模型 fallback、预算预检、成本估算、价格表 schema 或账单核对中的最大短板，并给出安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动模型证据优化：${modelEvidenceTitle(kind)}`,
+    label: "model",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于模型证据启动优化任务。");
+  submitPromptForm();
+  return prompt;
+}
+
+function buildModelVerificationPrompt(kind, result = {}) {
+  const context = buildModelEvidencePrompt(kind, result);
+  if (!context) return "";
+  const commands = [
+    "node --check app.js",
+    "node --check server.js",
+    "node server.js --ui-smoke-test",
+    "node server.js --api-smoke-section=debug"
+  ];
+  return [
+    context,
+    "",
+    "目标：把这份模型运行证据转成可验证修复闭环。",
+    "",
+    "建议验证命令：",
+    ...commands.map((command) => `- ${command}`),
+    "",
+    "输出要求：",
+    "1. 先判断问题属于模型 fallback、预算预检、成本估算、价格表 schema、账单核对、SSE 流式解析还是错误恢复。",
+    "2. 如果需要改代码，请生成最小 diff，避免无关重构。",
+    "3. 不要发起真实模型请求、远端写入或泄露密钥。",
+    "4. 修复后必须说明应运行哪些本地验证命令，并优先复用上面的安全检查。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendModelVerificationPromptToPrompt(kind, result = {}) {
+  const prompt = buildModelVerificationPrompt(kind, result);
+  if (!prompt) {
+    showToast("暂无可生成验证提示的模型证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `${modelEvidenceTitle(kind)}验证提示已加入提示词`,
+    label: "model",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("模型验证提示已加入提示词。");
+  return prompt;
+}
+
+function runModelVerificationFix(kind, result = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动模型验证修复。");
+    return "";
+  }
+  const prompt = buildModelVerificationPrompt(kind, result);
+  if (!prompt) {
+    showToast("暂无可运行的模型验证修复提示。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动模型验证修复：${modelEvidenceTitle(kind)}`,
+    label: "model",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动带验证要求的模型运行修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendModelEvidenceCard(kind, result = {}) {
+  const evidence = modelEvidenceValue(kind, result);
+  appendToolCall({
+    title: `${modelEvidenceTitle(kind)}已读取`,
+    label: "model",
+    state: modelEvidenceState(kind, evidence || {}),
+    body: JSON.stringify(modelEvidenceSummary(kind, evidence || {}), null, 2).slice(0, 12000)
+  });
+  const context = buildModelEvidencePrompt(kind, result);
+  if (!context) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="repair">直接优化</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendModelEvidenceToPrompt(kind, result);
+  });
+  actions.querySelector("[data-action='verification-prompt']").addEventListener("click", () => {
+    appendModelVerificationPromptToPrompt(kind, result);
+  });
+  actions.querySelector("[data-action='verification-fix']").addEventListener("click", () => {
+    runModelVerificationFix(kind, result);
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    runModelEvidenceRepair(kind, result);
+  });
+  log.lastElementChild?.appendChild(actions);
+}
+
+function buildModelFailureEvidence(kind, error, {
+  endpoint = "",
+  request = null
+} = {}) {
+  return {
+    generatedAt: new Date().toISOString(),
+    status: "failed",
+    kind,
+    title: modelEvidenceTitle(kind),
+    endpoint,
+    request,
+    error: normalizeActionFailureError(error),
+    workspace: workspaceStatus?.textContent || "",
+    lastPrompt: state.lastPrompt || input.value.trim(),
+    modelRuntime: {
+      candidates: state.modelRuntime?.candidates || [],
+      lastModel: state.modelRuntime?.lastModel || "",
+      lastStatus: state.modelRuntime?.lastStatus || "",
+      lastError: state.modelRuntime?.lastError || "",
+      requestCount: state.modelRuntime?.requestCount || 0,
+      failureCount: state.modelRuntime?.failureCount || 0
+    },
+    pendingDiff: state.pendingDiff?.patches?.length ? {
+      patches: state.pendingDiff.patches.length,
+      commands: (state.pendingCommands || []).map((item) => item.command || item).slice(0, 8)
+    } : null
+  };
+}
+
+function appendModelFailureEvidence(kind, error, options = {}) {
+  const evidence = buildModelFailureEvidence(kind, error, options);
+  const result = kind === "cost-policy" ? { policy: evidence } : { [kind]: evidence };
+  appendToolCall({
+    title: `${modelEvidenceTitle(kind)}读取失败`,
+    label: "model",
+    state: "失败",
+    body: buildModelEvidencePrompt(kind, result).slice(0, 12000)
+  });
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="repair">直接优化</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendModelEvidenceToPrompt(kind, result);
+  });
+  actions.querySelector("[data-action='verification-prompt']").addEventListener("click", () => {
+    appendModelVerificationPromptToPrompt(kind, result);
+  });
+  actions.querySelector("[data-action='verification-fix']").addEventListener("click", () => {
+    runModelVerificationFix(kind, result);
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    runModelEvidenceRepair(kind, result);
+  });
+  log.lastElementChild?.appendChild(actions);
+  return evidence;
+}
+
+function buildAgentFailureContext(error, {
+  prompt = "",
+  debugContext = null,
+  endpoint = "",
+  streamLog = []
+} = {}) {
+  const message = error?.message || String(error || "unknown error");
+  const events = streamLog || error?.streamLog || [];
+  const referencedFiles = Array.isArray(debugContext?.referencedFiles)
+    ? debugContext.referencedFiles.map((file) => String(file || "").trim()).filter(Boolean).slice(0, 16)
+    : [];
+  return [
+    "请基于这次代理/模型请求失败证据继续修复当前项目的写代码与调试体验。",
+    "",
+    `失败端点：${endpoint || error?.endpoint || "/api/agent-stream"}`,
+    `错误信息：${message}`,
+    `原始需求字符数：${String(prompt || "").length}`,
+    `附加调试上下文：${debugContext ? "是" : "否"}`,
+    referencedFiles.length ? `调试诊断相关文件：\n${referencedFiles.map((file) => `@${file}`).join("\n")}` : "",
+    `流式事件数：${events.length}`,
+    "",
+    "原始用户需求：",
+    String(prompt || "").slice(0, 8000),
+    "",
+    "最近流式事件：",
+    JSON.stringify(events.slice(-8), null, 2).slice(0, 8000),
+    "",
+    debugContext ? "附加调试上下文：" : "",
+    debugContext ? JSON.stringify(debugContext, null, 2).slice(0, 8000) : "",
+    "",
+    "要求：先判断失败属于模型配置、预算/密钥、上下文引用、SSE 流式解析、后端异常还是 UI 恢复问题；需要改代码时输出最小 diff；需要验证时给出或执行安全检查命令；不要发起真实远端写入。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendAgentFailureEvidence(error, options = {}) {
+  const context = buildAgentFailureContext(error, options);
+  const message = error?.message || String(error || "unknown error");
+  const referencedFiles = Array.isArray(options.debugContext?.referencedFiles)
+    ? options.debugContext.referencedFiles.map((file) => String(file || "").trim()).filter(Boolean).slice(0, 16)
+    : [];
+  appendToolCall({
+    title: "代理请求失败证据",
+    label: "ai",
+    state: "失败",
+    body: context.slice(0, 12000)
+  });
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference-files">引用文件</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="retry">重试</button><button type="button" data-action="diagnose">诊断修复</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    const current = input.value.trim();
+    input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "代理失败证据已加入提示词",
+      label: "ai",
+      state: "ready",
+      body: context.slice(0, 12000)
+    });
+    showToast("代理失败证据已加入提示词。");
+  });
+  actions.querySelector("[data-action='reference-files']").addEventListener("click", () => {
+    if (!referencedFiles.length) {
+      showToast("这次代理失败证据里没有调试相关文件。");
+      appendToolCall({
+        title: "代理失败证据未识别到文件",
+        label: "ai",
+        state: "跳过",
+        body: "当前代理失败证据没有 debugContext.referencedFiles。"
+      });
+      return;
+    }
+    const current = input.value.trim();
+    const existingLower = current.toLowerCase();
+    const refs = referencedFiles
+      .map((file) => `@${file}`)
+      .filter((ref) => !existingLower.includes(ref.toLowerCase()));
+    input.value = [current, refs.join(" ")].filter(Boolean).join(current ? "\n" : "");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "代理失败相关文件已引用",
+      label: "ai",
+      state: `${referencedFiles.length} files`,
+      body: referencedFiles.map((file) => `@${file}`).join("\n")
+    });
+    showToast(`已引用 ${referencedFiles.length} 个代理失败相关文件。`);
+  });
+  const buildAgentVerificationPrompt = () => [
+    context,
+    "",
+    referencedFiles.length ? `优先读取相关文件：\n${referencedFiles.map((file) => `@${file}`).join("\n")}` : "",
+    "",
+    "目标：把这次代理/模型请求失败转成可验证修复闭环。",
+    "",
+    "建议验证命令：",
+    "- node --check app.js",
+    "- node --check server.js",
+    "- node server.js --ui-smoke-test",
+    "- node server.js --api-smoke-section=debug",
+    "",
+    "输出要求：",
+    "1. 先判断失败属于模型配置、预算/密钥、上下文引用、SSE 流式解析、后端异常还是 UI 恢复问题。",
+    "2. 如果需要改代码，请生成最小 diff，避免无关重构。",
+    "3. 不要发起真实模型请求、远端写入或泄露密钥。",
+    "4. 修复后必须说明应运行哪些本地验证命令，并优先复用上面的安全检查。"
+  ].filter(Boolean).join("\n");
+  actions.querySelector("[data-action='verification-prompt']").addEventListener("click", () => {
+    const prompt = buildAgentVerificationPrompt();
+    const current = input.value.trim();
+    input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "代理失败验证提示已加入提示词",
+      label: "ai",
+      state: "ready",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("代理失败验证提示已加入提示词。");
+  });
+  actions.querySelector("[data-action='verification-fix']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再启动代理失败验证修复。");
+      return;
+    }
+    const prompt = buildAgentVerificationPrompt();
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "已启动代理失败验证修复",
+      label: "ai",
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在启动带验证要求的代理失败修复。");
+    submitPromptForm();
+  });
+  actions.querySelector("[data-action='retry']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再重试。");
+      return;
+    }
+    if (!options.prompt) {
+      showToast("没有可重试的原始需求。");
+      return;
+    }
+    input.value = options.prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "已准备重试代理请求",
+      label: "ai",
+      state: "ready",
+      body: `上次错误：${message}`
+    });
+    submitPromptForm();
+  });
+  actions.querySelector("[data-action='diagnose']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再启动诊断修复。");
+      return;
+    }
+    const prompt = [
+      context,
+      "",
+      referencedFiles.length ? `优先读取相关文件：\n${referencedFiles.map((file) => `@${file}`).join("\n")}` : "",
+      "",
+      "请现在直接基于这次代理失败证据修复请求链路：优先补齐错误恢复、模型配置提示、上下文引用处理、SSE 失败证据或可重试动作。"
+    ].join("\n");
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "已启动代理失败诊断修复",
+      label: "ai",
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于代理失败证据启动修复。");
+    submitPromptForm();
+  });
+  log.lastElementChild?.appendChild(actions);
+  return context;
+}
+
 function appendToolCall({ title, label, state: status, body }) {
   const article = document.createElement("article");
   article.className = `tool-call ${status === "运行中" ? "running" : ""}`;
@@ -297,6 +1628,1868 @@ function appendToolCall({ title, label, state: status, body }) {
   log.scrollTop = log.scrollHeight;
 }
 
+function compactJson(value, max = 12000) {
+  return JSON.stringify(value, null, 2).slice(0, max);
+}
+
+let lastCopyStatus = { ok: false, method: "none", reason: "not attempted" };
+
+function copyFailureSummary() {
+  if (lastCopyStatus.ok) return `复制方式：${lastCopyStatus.method}`;
+  return `复制失败：${lastCopyStatus.reason || "浏览器拒绝写入剪贴板"}`;
+}
+
+function copyLogBody(copied, copiedBody = "") {
+  return copied ? copiedBody : copyFailureSummary();
+}
+
+async function copyText(text) {
+  if (!text) {
+    lastCopyStatus = { ok: false, method: "none", reason: "没有可复制内容" };
+    return false;
+  }
+  const clipboard = navigator.clipboard;
+  try {
+    if (!clipboard?.writeText) throw new Error("navigator.clipboard.writeText unavailable");
+    await clipboard.writeText(text);
+    lastCopyStatus = { ok: true, method: "clipboard", reason: "" };
+    return true;
+  } catch (clipboardError) {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.left = "-9999px";
+    area.style.top = "0";
+    area.setAttribute("readonly", "");
+    try {
+      document.body.appendChild(area);
+      area.focus();
+      area.select();
+      area.setSelectionRange(0, area.value.length);
+      const ok = document.execCommand("copy");
+      lastCopyStatus = ok
+        ? { ok: true, method: "textarea-fallback", reason: "" }
+        : {
+            ok: false,
+            method: "textarea-fallback",
+            reason: clipboardError?.message
+              ? `剪贴板 API 失败，textarea fallback 也被拒绝：${clipboardError.message}`
+              : "剪贴板 API 失败，textarea fallback 也被拒绝"
+          };
+      return ok;
+    } catch (fallbackError) {
+      lastCopyStatus = {
+        ok: false,
+        method: "textarea-fallback",
+        reason: [
+          clipboardError?.message ? `clipboard: ${clipboardError.message}` : "",
+          fallbackError?.message ? `fallback: ${fallbackError.message}` : ""
+        ].filter(Boolean).join("；") || "浏览器拒绝复制"
+      };
+      return false;
+    } finally {
+      area.remove();
+    }
+  }
+}
+
+function buildDebugBundle(result) {
+  if (!result) return "";
+  return JSON.stringify({
+    generatedAt: result.generatedAt,
+    workspace: result.workspace,
+    status: result.status,
+    summary: result.summary,
+    findings: result.findings || [],
+    nextActions: result.nextActions || [],
+    verificationPlan: result.verificationPlan || null,
+    ciStatus: result.ciStatus || null,
+    processHealth: result.processHealth || null,
+    browserTrace: result.browserTrace ? {
+      ok: result.browserTrace.ok,
+      url: result.browserTrace.url,
+      finalUrl: result.browserTrace.finalUrl,
+      summary: result.browserTrace.summary,
+      artifactPath: result.browserTrace.artifactPath,
+      console: (result.browserTrace.console || []).slice(0, 20),
+      exceptions: (result.browserTrace.exceptions || []).slice(0, 20),
+      network: (result.browserTrace.network || []).filter((item) => item.failed || item.status >= 400).slice(0, 20)
+    } : null,
+    semanticDiagnostics: result.semanticDiagnostics || null
+  }, null, 2);
+}
+
+function debugEvidenceReferencedFiles(result = state.lastDebugDiagnostics) {
+  if (!result) return [];
+  const textParts = [
+    buildDebugBundle(result),
+    JSON.stringify(result.findings || []),
+    JSON.stringify(result.nextActions || []),
+    JSON.stringify(result.verificationPlan || {}),
+    JSON.stringify(result.processHealth || {}),
+    JSON.stringify(result.browserTrace || {}),
+    JSON.stringify(result.semanticDiagnostics || {})
+  ];
+  const text = textParts.filter(Boolean).join("\n");
+  if (!text.trim()) return [];
+  const workspaceFiles = (state.files || []).map((file) => file.path).filter(Boolean);
+  const matched = new Map();
+  for (const file of workspaceFiles) {
+    const normalized = String(file || "").replaceAll("\\", "/");
+    const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replaceAll("/", "[/\\\\]");
+    const pattern = new RegExp(`(^|[^\\w.-])(${escaped})(?::\\d+)?(?=$|[^\\w.-])`, "i");
+    if (pattern.test(text)) matched.set(normalized.toLowerCase(), normalized);
+  }
+  return [...matched.values()].slice(0, 16);
+}
+
+function referenceDebugEvidenceFilesInPrompt(result = state.lastDebugDiagnostics, { focus = true } = {}) {
+  const files = debugEvidenceReferencedFiles(result);
+  if (!files.length) {
+    appendDebugEvidence("调试诊断未识别到文件引用", "跳过", "当前诊断包、进程健康、页面 Trace 和语义诊断里没有匹配到当前工作区文件。");
+    showToast("调试诊断里没有识别到工作区文件。");
+    return [];
+  }
+  const existing = input.value.trim();
+  const existingLower = existing.toLowerCase();
+  const refs = files
+    .map((file) => `@${file}`)
+    .filter((ref) => !existingLower.includes(ref.toLowerCase()));
+  input.value = [existing, refs.join(" ")].filter(Boolean).join(existing ? "\n" : "");
+  if (focus) input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendDebugEvidence(
+    "已引用调试诊断文件",
+    `${files.length} files`,
+    files.map((file) => `@${file}`).join("\n")
+  );
+  showToast(`已引用 ${files.length} 个调试相关文件。`);
+  return files;
+}
+
+function appendDebugEvidence(title, stateLabel, value) {
+  appendToolCall({
+    title,
+    label: "debug",
+    state: stateLabel,
+    body: typeof value === "string" ? value : compactJson(value)
+  });
+}
+
+function buildDebugPromptContext(result, { title = "请基于这份调试诊断继续排查并修复问题。" } = {}) {
+  if (!result) return "";
+  const referencedFiles = debugEvidenceReferencedFiles(result);
+  const findings = (result.findings || [])
+    .slice(0, 10)
+    .map((item, index) => `${index + 1}. [${item.severity || "info"}] ${item.area || "debug"}：${item.message || ""}${item.evidence?.length ? `\n   证据：${item.evidence.slice(0, 5).join(" / ")}` : ""}`)
+    .join("\n");
+  const actions = (result.nextActions || [])
+    .slice(0, 8)
+    .map((item, index) => {
+      const meta = [
+        item.priority ? `P${item.priority}` : "",
+        item.kind || "",
+        item.target ? `target=${item.target}` : "",
+        item.evidence?.length ? `evidence=${item.evidence.slice(0, 4).join(" / ")}` : ""
+      ].filter(Boolean).join(" · ");
+      return `${index + 1}. ${item.label || item.id || item.description || "下一步"}${meta ? `\n   ${meta}` : ""}${item.command ? `\n   $ ${item.command}` : ""}${item.description ? `\n   ${item.description}` : ""}`;
+    })
+    .join("\n");
+  const commands = (result.verificationPlan?.commands || [])
+    .slice(0, 8)
+    .map((item) => `$ ${item.command}${item.reason ? `\n  ${item.reason}` : ""}`)
+    .join("\n");
+  return [
+    title,
+    "",
+    `诊断状态：${result.status || "unknown"}`,
+    `工作区：${result.workspace || ""}`,
+    result.summary ? `摘要：${JSON.stringify(result.summary)}` : "",
+    referencedFiles.length ? `优先读取相关文件：\n${referencedFiles.map((file) => `@${file}`).join("\n")}` : "",
+    "",
+    "主要发现：",
+    findings || "(暂无阻塞发现)",
+    "",
+    "建议动作：",
+    actions || "(暂无建议动作)",
+    "",
+    "验证命令：",
+    commands || "(暂无验证命令)",
+    result.processHealth?.summary ? ["", "进程健康摘要：", JSON.stringify(result.processHealth.summary, null, 2)].join("\n") : "",
+    result.browserTrace?.summary ? ["", "页面 Trace 摘要：", JSON.stringify(result.browserTrace.summary, null, 2)].join("\n") : "",
+    result.semanticDiagnostics?.summary ? ["", "语义诊断摘要：", JSON.stringify(result.semanticDiagnostics.summary, null, 2)].join("\n") : "",
+    "",
+    "完整诊断包：",
+    buildDebugBundle(result).slice(0, 12000)
+  ].filter((line) => line !== "").join("\n");
+}
+
+function appendDebugContextToPrompt(result = state.lastDebugDiagnostics, { focus = true } = {}) {
+  const context = buildDebugPromptContext(result);
+  if (!context) {
+    showToast("暂无可加入提示词的诊断上下文。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  if (focus) input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendDebugEvidence("诊断上下文已加入提示词", "ready", context.slice(0, 12000));
+  showToast("诊断上下文已加入提示词。");
+  return context;
+}
+
+function commandResultKey(command) {
+  return String(command || "").trim();
+}
+
+function normalizeCommandItems(commands = []) {
+  return (commands || [])
+    .map((item) => {
+      if (typeof item === "string") {
+        return { command: item.trim(), reason: "", policy: null };
+      }
+      return {
+        ...item,
+        command: String(item?.command || "").trim(),
+        reason: item?.reason || "",
+        policy: item?.policy || null
+      };
+    })
+    .filter((item) => item.command);
+}
+
+function commandItemsToText(commands = []) {
+  return normalizeCommandItems(commands)
+    .map((item) => item.command)
+    .join("\n");
+}
+
+function formatCommandFailureAnalysis(analysis = null) {
+  if (!analysis) return "";
+  const lines = [
+    analysis.category ? `failureCategory: ${analysis.category}` : "",
+    analysis.summary ? `summary: ${analysis.summary}` : "",
+    analysis.referencedFiles?.length ? `referencedFiles: ${analysis.referencedFiles.join(", ")}` : "",
+    analysis.sourceLocations?.length ? `sourceLocations:\n${formatCommandSourceLocations(analysis.sourceLocations)}` : "",
+    analysis.nextActions?.length ? `nextActions:\n${analysis.nextActions.map((item) => `- ${item}`).join("\n")}` : "",
+    analysis.findings?.length ? `findings:\n${analysis.findings.map((item) => `- ${item.severity || "warn"} ${item.category || "failure"}: ${item.message || ""}${item.evidence?.length ? ` (${item.evidence.slice(0, 3).join(" / ")})` : ""}`).join("\n")}` : ""
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+function formatCommandSourceLocations(locations = []) {
+  if (!Array.isArray(locations) || !locations.length) return "";
+  return locations
+    .slice(0, 16)
+    .map((item) => {
+      const pathValue = item.path || item.file || "";
+      const line = item.line ? `:${item.line}` : "";
+      const column = item.column ? `:${item.column}` : "";
+      const text = item.text ? ` · ${item.text}` : "";
+      return `- ${pathValue}${line}${column}${text}`;
+    })
+    .join("\n");
+}
+
+function commandSourceLocations(run = null) {
+  const locations = [
+    ...(run?.result?.failureAnalysis?.sourceLocations || []),
+    ...(run?.result?.recoveryChain?.sourceLocations || []),
+    ...(run?.result?.diagnostics?.commandFailure?.sourceLocations || [])
+  ];
+  const seen = new Set();
+  return locations
+    .filter((item) => item && (item.path || item.file))
+    .filter((item) => {
+      const key = `${String(item.path || item.file).toLowerCase()}:${item.line || 1}:${item.column || 0}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 16);
+}
+
+async function fetchCommandSourceContexts(run = null, { contextLines = 6, limit = 8 } = {}) {
+  const locations = commandSourceLocations(run);
+  if (!locations.length) return { contexts: [], summary: { requested: 0, returned: 0, errors: 0 } };
+  return await api("/api/source-context", {
+    method: "POST",
+    body: JSON.stringify({ locations, contextLines, limit })
+  });
+}
+
+function formatCommandSourceContexts(contexts = []) {
+  return (Array.isArray(contexts) ? contexts : [])
+    .slice(0, 8)
+    .map((item) => [
+      `@${item.path}:${item.line}${item.column ? `:${item.column}` : ""}`,
+      item.error ? `ERROR: ${item.error}` : item.context || ""
+    ].filter(Boolean).join("\n"))
+    .join("\n\n");
+}
+
+function buildCommandSourceContextPrompt(commandText, run = null, contexts = []) {
+  const command = String(commandText || "").trim();
+  const sourceBlock = formatCommandSourceContexts(contexts);
+  const verificationCommands = normalizeCommandItems([
+    command ? { command, reason: "修复后优先重跑原失败命令。" } : null,
+    ...(run?.result?.recoveryChain?.commands || []),
+    "node --check server.js",
+    "node --check app.js",
+    "node server.js --api-smoke-section=debug"
+  ].filter(Boolean)).slice(0, 8);
+  return [
+    "请基于失败命令的源码定位上下文继续修复当前项目。",
+    "",
+    command ? `失败命令：\n$ ${command}` : "",
+    run?.result?.failureAnalysis ? `失败分类：\n${formatCommandFailureAnalysis(run.result.failureAnalysis)}` : "",
+    sourceBlock ? `源码上下文：\n${sourceBlock}` : "源码上下文：未读取到可用片段。",
+    verificationCommands.length ? `修复后验证命令：\n${verificationCommands.map((item) => `- ${item.command}${item.reason ? `：${item.reason}` : ""}`).join("\n")}` : "",
+    "",
+    "要求：优先从上述行号附近定位根因；需要改代码时输出最小 diff；修复后先重跑原失败命令，再运行相关 smoke 或语法检查。"
+  ].filter(Boolean).join("\n");
+}
+
+async function runCommandSourceContextFix(commandText, run = null) {
+  const command = String(commandText || "").trim();
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再发起源码定位修复。");
+    return "";
+  }
+  try {
+    const result = await fetchCommandSourceContexts(run, { contextLines: 6, limit: 8 });
+    const prompt = buildCommandSourceContextPrompt(command, run, result.contexts);
+    if (!prompt) {
+      showToast("这条失败命令没有可运行的源码定位修复提示。");
+      return "";
+    }
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: `已启动源码定位修复：${command}`,
+      label: "ctx",
+      state: `${result.contexts?.length || 0} locations`,
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于源码上下文启动修复代理。");
+    submitPromptForm();
+    return prompt;
+  } catch (error) {
+    appendDebugEvidence("源码定位修复启动失败", "失败", error.message);
+    showToast(error.message);
+    return "";
+  }
+}
+
+function formatCommandRecoveryChain(chain = null) {
+  if (!chain) return "";
+  const commands = normalizeCommandItems(chain.commands || []);
+  const stages = Array.isArray(chain.stages) ? chain.stages : [];
+  const actions = Array.isArray(chain.nextActions) ? chain.nextActions : [];
+  return [
+    chain.category ? `recoveryCategory: ${chain.category}` : "",
+    chain.summary ? `summary: ${chain.summary}` : "",
+    chain.referencedFiles?.length ? `referencedFiles: ${chain.referencedFiles.join(", ")}` : "",
+    chain.sourceLocations?.length ? `sourceLocations:\n${formatCommandSourceLocations(chain.sourceLocations)}` : "",
+    stages.length ? `stages:\n${stages.map((item) => `- ${item.label || item.id || "stage"}: ${item.status || "pending"}${item.command ? ` · ${item.command}` : ""}`).join("\n")}` : "",
+    actions.length ? `nextActions:\n${actions.map((item) => `- ${item}`).join("\n")}` : "",
+    commands.length ? `commands:\n${commands.map((item) => `- ${item.command}${item.reason ? `：${item.reason}` : ""}`).join("\n")}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function summarizeCommandOutput(output = "", analysis = null) {
+  if (analysis?.summary) {
+    const suffix = String(output || "").trim()
+      ? ` · ${String(output || "").trim().split(/\r?\n/).filter(Boolean).slice(0, 1).join(" ").slice(0, 140)}`
+      : "";
+    return `${analysis.category || "failure"}：${analysis.summary}${suffix}`.slice(0, 260);
+  }
+  const text = String(output || "").trim();
+  if (!text) return "(无输出)";
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  return lines.slice(0, 2).join(" · ").slice(0, 260);
+}
+
+function buildCommandTranscript(commandText, run = null, { title = "请基于这次命令输出继续排查并修复问题。" } = {}) {
+  const result = run?.result || null;
+  const status = run?.status === "running"
+    ? "running"
+    : result?.blocked
+      ? "blocked"
+      : result
+        ? `exit ${result.exitCode ?? "?"}`
+        : "queued";
+  const output = result?.output || run?.error || "";
+  const diagnostics = result?.diagnostics || null;
+  const failureAnalysis = result?.failureAnalysis || diagnostics?.commandFailure || null;
+  const recoveryChain = result?.recoveryChain || null;
+  const sourceLocations = commandSourceLocations(run);
+  return [
+    title,
+    "",
+    "命令：",
+    `$ ${commandText}`,
+    "",
+    `状态：${status}`,
+    result?.policy ? `策略：${result.policy.risk} · ${result.policy.reason || ""}` : "",
+    result?.approval ? `审批：${result.approval.id}` : "",
+    failureAnalysis ? `失败分类：${failureAnalysis.category || "unknown"} · ${failureAnalysis.summary || ""}` : "",
+    sourceLocations.length ? `源码位置：${sourceLocations.length} 处` : "",
+    recoveryChain ? `恢复链：${recoveryChain.commands?.length || 0} 条命令 · ${recoveryChain.nextActions?.[0] || recoveryChain.status || ""}` : "",
+    diagnostics ? `诊断：${diagnostics.status || "attached"}` : "",
+    "",
+    recoveryChain ? [
+      "恢复链：",
+      formatCommandRecoveryChain(recoveryChain)
+    ].join("\n") : "",
+    recoveryChain ? "" : "",
+    failureAnalysis ? [
+      "失败分析：",
+      formatCommandFailureAnalysis(failureAnalysis)
+    ].join("\n") : "",
+    sourceLocations.length ? [
+      "源码位置：",
+      formatCommandSourceLocations(sourceLocations)
+    ].join("\n") : "",
+    failureAnalysis ? "" : "",
+    "输出：",
+    output.slice(0, 12000) || "(暂无输出)",
+    diagnostics ? [
+      "",
+      "诊断摘要：",
+      JSON.stringify({
+        summary: diagnostics.summary,
+        findings: diagnostics.findings,
+        nextActions: diagnostics.nextActions,
+        policy: diagnostics.policy
+      }, null, 2).slice(0, 6000)
+    ].join("\n") : ""
+  ].filter((line) => line !== "").join("\n");
+}
+
+function extractReferencedFilesFromCommandRun(commandText, run = null) {
+  const text = [
+    commandText,
+    run?.result?.output || "",
+    run?.error || ""
+  ].filter(Boolean).join("\n");
+  if (!text.trim()) return [];
+  const workspaceFiles = (state.files || []).map((file) => file.path).filter(Boolean);
+  const lowerFiles = new Map(workspaceFiles.map((file) => [file.toLowerCase(), file]));
+  const matched = new Map();
+  const sourceLocations = commandSourceLocations(run);
+  for (const location of sourceLocations) {
+    const locationPath = location?.path || location?.file || "";
+    const exact = lowerFiles.get(String(locationPath).toLowerCase());
+    if (exact) matched.set(exact.toLowerCase(), exact);
+  }
+  for (const file of workspaceFiles) {
+    const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const slashVariant = escaped.replaceAll("/", "[/\\\\]");
+    const pattern = new RegExp(`(^|[^\\w.-])(${slashVariant})(?::\\d+)?(?=$|[^\\w.-])`, "i");
+    if (pattern.test(text)) matched.set(file.toLowerCase(), file);
+  }
+  const loosePattern = /(?:^|[\s("'`])((?:\.?[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+)(?::\d+)?/g;
+  let match;
+  while ((match = loosePattern.exec(text))) {
+    const normalized = match[1].replace(/^\.?[\\/]/, "").replaceAll("\\", "/");
+    const exact = lowerFiles.get(normalized.toLowerCase());
+    if (exact) matched.set(exact.toLowerCase(), exact);
+  }
+  return [...matched.values()].slice(0, 8);
+}
+
+function referenceCommandFilesInPrompt(commandText, run = null) {
+  const files = extractReferencedFilesFromCommandRun(commandText, run);
+  if (!files.length) {
+    showToast("这次命令输出里没有识别到工作区文件路径。");
+    appendToolCall({
+      title: `命令输出未识别到文件引用：${commandText}`,
+      label: "$",
+      state: "跳过",
+      body: summarizeCommandOutput(run?.result?.output || run?.error || "")
+    });
+    return [];
+  }
+  const existing = input.value.trim();
+  const additions = files.map((file) => `@${file}`);
+  const existingLower = existing.toLowerCase();
+  const nextRefs = additions.filter((ref) => !existingLower.includes(ref.toLowerCase()));
+  input.value = [existing, nextRefs.join(" ")].filter(Boolean).join(existing ? "\n" : "");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已引用命令输出文件：${commandText}`,
+    label: "ctx",
+    state: `${files.length} files`,
+    body: files.map((file) => `@${file}`).join("\n")
+  });
+  showToast(`已引用 ${files.length} 个命令相关文件。`);
+  return files;
+}
+
+function appendCommandReferencedFilesEvidence(commandText, run = null) {
+  const command = String(commandText || "").trim();
+  if (!command || !run?.result || run.result.blocked || run.result.exitCode === 0) return [];
+  const files = extractReferencedFilesFromCommandRun(command, run);
+  if (!files.length) return [];
+  appendToolCall({
+    title: `失败命令相关文件已识别：${command}`,
+    label: "ctx",
+    state: `${files.length} files`,
+    body: [
+      "这次失败命令输出命中了工作区文件路径，可直接引用到下一轮修复提示。",
+      run?.result?.failureAnalysis?.sourceLocations?.length ? "\n源码位置：" : "",
+      run?.result?.failureAnalysis?.sourceLocations?.length ? formatCommandSourceLocations(run.result.failureAnalysis.sourceLocations) : "",
+      "",
+      ...files.map((file) => `@${file}`)
+    ].join("\n")
+  });
+  return files;
+}
+
+function appendCommandTranscriptToPrompt(commandText, run = null, { focus = true } = {}) {
+  const command = String(commandText || "").trim();
+  if (!command) {
+    showToast("这条命令没有可加入提示词的内容。");
+    return "";
+  }
+  const transcript = buildCommandTranscript(command, run);
+  const current = input.value.trim();
+  input.value = [current, transcript].filter(Boolean).join("\n\n---\n\n");
+  if (focus) input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `命令记录已加入提示词：${command}`,
+    label: "$",
+    state: "ready",
+    body: transcript.slice(0, 12000)
+  });
+  showToast("命令记录已加入提示词。");
+  return transcript;
+}
+
+function buildCommandVerificationPrompt(commandText, run = null, { diagnostics = null } = {}) {
+  const command = String(commandText || "").trim();
+  if (!command) return "";
+  const attachedDiagnostics = diagnostics
+    || run?.result?.diagnostics
+    || (state.lastFailedCommand?.command === command ? state.lastDebugDiagnostics : null);
+  const commandFiles = extractReferencedFilesFromCommandRun(command, run);
+  const failureAnalysis = run?.result?.failureAnalysis || attachedDiagnostics?.commandFailure || null;
+  const recoveryChain = run?.result?.recoveryChain || null;
+  const diagnosticFiles = attachedDiagnostics ? debugEvidenceReferencedFiles(attachedDiagnostics) : [];
+  const analysisFiles = Array.isArray(failureAnalysis?.referencedFiles) ? failureAnalysis.referencedFiles : [];
+  const recoveryFiles = Array.isArray(recoveryChain?.referencedFiles) ? recoveryChain.referencedFiles : [];
+  const sourceLocations = commandSourceLocations(run);
+  const files = [...new Map(
+    [...commandFiles, ...diagnosticFiles, ...analysisFiles, ...recoveryFiles]
+      .filter(Boolean)
+      .map((file) => [String(file).toLowerCase(), file])
+  ).values()].slice(0, 16);
+  const diagnosticCommands = normalizeCommandItems([
+    ...(attachedDiagnostics?.verificationPlan?.commands || []),
+    ...(recoveryChain?.commands || [])
+  ]);
+  const nextActions = (attachedDiagnostics?.nextActions || [])
+    .slice(0, 6)
+    .map((item, index) => `${index + 1}. ${item.label || item.id || "建议动作"}${item.description ? `：${item.description}` : ""}${item.command ? `；命令：${item.command}` : ""}`)
+    .join("\n");
+  const transcript = buildCommandTranscript(command, run, {
+    title: "这是一条失败命令的完整证据，请据此生成可验证修复方案。"
+  });
+  return [
+    state.lastPrompt ? `继续推进上一轮任务：${state.lastPrompt}` : "请基于最近失败命令修复当前项目。",
+    "",
+    "目标：把这次失败命令转成可验证的修复闭环。",
+    files.length ? `优先读取这些相关文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
+    failureAnalysis ? `失败分类：\n${formatCommandFailureAnalysis(failureAnalysis)}` : "",
+    sourceLocations.length ? `优先定位源码位置：\n${formatCommandSourceLocations(sourceLocations)}` : "",
+    recoveryChain ? `失败恢复链：\n${formatCommandRecoveryChain(recoveryChain)}` : "",
+    attachedDiagnostics?.summary ? `诊断摘要：${JSON.stringify(attachedDiagnostics.summary)}` : "",
+    nextActions ? `诊断建议动作：\n${nextActions}` : "",
+    diagnosticCommands.length ? `可复用验证命令：\n${diagnosticCommands.map((item) => `- ${item.command}${item.reason ? `：${item.reason}` : ""}`).join("\n")}` : "",
+    "",
+    "失败命令证据：",
+    transcript.slice(0, 16000),
+    "",
+    "输出要求：",
+    "1. 先判断失败根因，并说明要读取或修改的文件。",
+    "2. 如果需要改代码，请生成最小 diff，避免无关重构。",
+    "3. 必须给出 2-5 条可在当前工作区安全运行的验证命令。",
+    "4. 验证命令应优先复用现有脚本、node --check、smoke test 或只读检查。",
+    "5. 如果无法安全修复，请明确阻塞原因，并给出下一步只读排查命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendCommandVerificationPromptToPrompt(commandText, run = null, { focus = true } = {}) {
+  const command = String(commandText || "").trim();
+  const prompt = buildCommandVerificationPrompt(command, run);
+  if (!prompt) {
+    showToast("这条失败命令没有可生成的验证提示。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  if (focus) input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `失败命令验证提示已加入提示词：${command}`,
+    label: "$",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("失败命令验证提示已加入提示词。");
+  return prompt;
+}
+
+function runCommandVerificationFix(commandText, run = null) {
+  const command = String(commandText || "").trim();
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再发起验证修复。");
+    return "";
+  }
+  const prompt = buildCommandVerificationPrompt(command, run);
+  if (!prompt) {
+    showToast("这条失败命令没有可运行的验证修复提示。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动失败命令验证修复：${command}`,
+    label: "$",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动带验证要求的修复代理。");
+  submitPromptForm();
+  return prompt;
+}
+
+function runLastFailedCommandVerificationFix() {
+  const failure = state.lastFailedCommand;
+  if (!failure?.command) {
+    appendDebugEvidence("暂无失败命令可修复", "跳过", {
+      summary: state.lastDebugDiagnostics?.summary || null
+    });
+    showToast("当前没有最近失败命令可修复。");
+    return "";
+  }
+  return runCommandVerificationFix(failure.command, failure);
+}
+
+function summarizeCommandBatch(commands = []) {
+  const items = normalizeCommandItems(commands);
+  const summary = { total: items.length, passed: 0, failed: 0, blocked: 0, running: 0, queued: 0 };
+  for (const item of items) {
+    const run = state.commandResults[commandResultKey(item.command)];
+    if (!run) {
+      summary.queued += 1;
+    } else if (run.status === "running") {
+      summary.running += 1;
+    } else if (run.result?.blocked) {
+      summary.blocked += 1;
+    } else if (run.result?.exitCode === 0) {
+      summary.passed += 1;
+    } else if (run.result) {
+      summary.failed += 1;
+    } else {
+      summary.queued += 1;
+    }
+  }
+  return summary;
+}
+
+function formatCommandBatchSummary(commands = []) {
+  const summary = summarizeCommandBatch(commands);
+  if (!summary.total) return "0 条命令";
+  return `${summary.total} 条 · ${summary.passed} 通过 · ${summary.failed} 失败 · ${summary.blocked} 拒绝 · ${summary.running} 运行中 · ${summary.queued} 未运行`;
+}
+
+function commandBatchEvidence(commands = []) {
+  return normalizeCommandItems(commands)
+    .map((item, index) => {
+      const run = state.commandResults[commandResultKey(item.command)];
+      const result = run?.result;
+      const status = run?.status === "running"
+        ? "running"
+        : result?.blocked
+          ? "blocked"
+          : result
+            ? `exit ${result.exitCode ?? "?"}`
+            : "queued";
+      return [
+        `${index + 1}. $ ${item.command}`,
+        item.reason ? `   reason: ${item.reason}` : "",
+        item.policy ? `   policy: ${item.policy.risk} · ${item.policy.reason || ""}` : "",
+        `   status: ${status}`,
+        result?.output ? `   output: ${summarizeCommandOutput(result.output)}` : ""
+      ].filter(Boolean).join("\n");
+    })
+    .join("\n\n");
+}
+
+function commandBatchReferencedFiles(commands = []) {
+  const matched = new Map();
+  normalizeCommandItems(commands).forEach((item) => {
+    const run = state.commandResults[commandResultKey(item.command)];
+    extractReferencedFilesFromCommandRun(item.command, run).forEach((file) => {
+      matched.set(file.toLowerCase(), file);
+    });
+  });
+  return [...matched.values()].slice(0, 16);
+}
+
+function referenceCommandBatchFilesInPrompt(commands = [], { title = "命令组", focus = true } = {}) {
+  const files = commandBatchReferencedFiles(commands);
+  if (!files.length) {
+    appendToolCall({
+      title: `批量命令未识别到文件引用：${title}`,
+      label: "ctx",
+      state: "跳过",
+      body: commandBatchEvidence(commands).slice(0, 4000) || "命令输出里没有匹配当前工作区文件。"
+    });
+    showToast("这组命令输出里没有识别到工作区文件路径。");
+    return [];
+  }
+  const existing = input.value.trim();
+  const existingLower = existing.toLowerCase();
+  const refs = files
+    .map((file) => `@${file}`)
+    .filter((ref) => !existingLower.includes(ref.toLowerCase()));
+  input.value = [existing, refs.join(" ")].filter(Boolean).join(existing ? "\n" : "");
+  if (focus) input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已引用批量命令文件：${title}`,
+    label: "ctx",
+    state: `${files.length} files`,
+    body: files.map((file) => `@${file}`).join("\n")
+  });
+  showToast(`已引用 ${files.length} 个命令组相关文件。`);
+  return files;
+}
+
+function buildCommandBatchPromptContext(commands = [], { title = "命令组" } = {}) {
+  const items = normalizeCommandItems(commands);
+  if (!items.length) return "";
+  const summary = summarizeCommandBatch(items);
+  const failed = failedCommandItems(items);
+  const blocked = items.filter((item) => state.commandResults[commandResultKey(item.command)]?.result?.blocked);
+  const queued = items.filter((item) => !state.commandResults[commandResultKey(item.command)]?.result);
+  const referencedFiles = commandBatchReferencedFiles(items);
+  return [
+    "请基于这组命令运行证据继续推进当前代码修改或调试。",
+    "",
+    `命令组：${title}`,
+    `汇总：${formatCommandBatchSummary(items)}`,
+    referencedFiles.length ? `优先读取相关文件：\n${referencedFiles.map((file) => `@${file}`).join("\n")}` : "",
+    failed.length ? `失败命令：\n${failed.map((item) => `- $ ${item.command}`).join("\n")}` : "",
+    blocked.length ? `策略拦截命令：\n${blocked.map((item) => `- $ ${item.command}`).join("\n")}` : "",
+    queued.length ? `尚未运行命令：\n${queued.map((item) => `- $ ${item.command}`).join("\n")}` : "",
+    "",
+    "命令证据：",
+    commandBatchEvidence(items).slice(0, 16000),
+    "",
+    "要求：",
+    "1. 先读取上面列出的 @file；优先定位失败命令的根因，避免重复修改已经通过的部分。",
+    "2. 如果需要改代码，请生成最小 diff，并说明受影响文件。",
+    "3. 给出下一轮应运行的安全验证命令；优先只重跑失败项。",
+    "4. 被策略拦截的命令不要绕过策略；请给出安全替代命令或人工授权清单。",
+    "5. 如果仍缺证据，请给出只读排查步骤。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendCommandBatchEvidenceToPrompt(commands = [], { title = "命令组", focus = true } = {}) {
+  const context = buildCommandBatchPromptContext(commands, { title });
+  if (!context) {
+    showToast("当前没有可加入提示词的批量命令证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  if (focus) input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `批量命令证据已加入提示词：${title}`,
+    label: "$",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("批量命令证据已加入提示词。");
+  return context;
+}
+
+function commandBatchNeedsRepair(commands = []) {
+  const summary = summarizeCommandBatch(commands);
+  return summary.failed > 0 || summary.blocked > 0 || summary.queued > 0;
+}
+
+function runCommandBatchEvidenceRepair(commands = [], { title = "命令组" } = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动批量证据修复。");
+    return "";
+  }
+  const context = buildCommandBatchPromptContext(commands, { title });
+  if (!context) {
+    showToast("当前没有可用于修复的批量命令证据。");
+    return "";
+  }
+  if (!commandBatchNeedsRepair(commands)) {
+    appendToolCall({
+      title: `批量命令无需修复：${title}`,
+      label: "$",
+      state: "跳过",
+      body: formatCommandBatchSummary(commands)
+    });
+    showToast("这组命令没有失败、拦截或未运行项。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这组命令证据继续修复：优先处理失败项；如果需要改代码，请输出最小 diff；如果只需要验证，请输出下一轮安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动批量命令证据修复：${title}`,
+    label: "$",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动批量命令证据修复代理。");
+  submitPromptForm();
+  return prompt;
+}
+
+function pruneCommandHistory(history = []) {
+  const seen = new Set();
+  const rows = (Array.isArray(history) ? history : [])
+    .map((item) => ({
+      command: String(item?.command || "").trim(),
+      reason: String(item?.reason || "").slice(0, 240),
+      source: String(item?.source || "").slice(0, 80),
+      pinned: Boolean(item?.pinned),
+      lastExitCode: item?.lastExitCode,
+      lastStatus: String(item?.lastStatus || "").slice(0, 80),
+      runCount: Number(item?.runCount || 0),
+      updatedAt: item?.updatedAt || item?.createdAt || new Date().toISOString(),
+      createdAt: item?.createdAt || item?.updatedAt || new Date().toISOString()
+    }))
+    .filter((item) => item.command)
+    .sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+    })
+    .filter((item) => {
+      const key = commandResultKey(item.command).toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  const pinned = rows.filter((item) => item.pinned).slice(0, 8);
+  const recent = rows.filter((item) => !item.pinned).slice(0, Math.max(0, 12 - pinned.length));
+  return [...pinned, ...recent];
+}
+
+function rememberCommand(command, { reason = "", source = "manual", result = null } = {}) {
+  const commandText = String(command || "").trim();
+  if (!commandText) return null;
+  const key = commandResultKey(commandText).toLowerCase();
+  const existing = (state.commandHistory || []).find((item) => commandResultKey(item.command).toLowerCase() === key);
+  const now = new Date().toISOString();
+  const next = {
+    command: commandText,
+    reason: reason || existing?.reason || "",
+    source: source || existing?.source || "manual",
+    pinned: Boolean(existing?.pinned),
+    lastExitCode: result?.exitCode ?? existing?.lastExitCode,
+    lastStatus: result ? (result.blocked ? "blocked" : result.exitCode === 0 ? "passed" : "failed") : existing?.lastStatus || "staged",
+    runCount: (existing?.runCount || 0) + (result ? 1 : 0),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now
+  };
+  state.commandHistory = pruneCommandHistory([
+    next,
+    ...(state.commandHistory || []).filter((item) => commandResultKey(item.command).toLowerCase() !== key)
+  ]);
+  renderCommandHistory();
+  saveCommandDebugState();
+  return next;
+}
+
+function updateCommandHistoryItem(command, patch = {}) {
+  const key = commandResultKey(command).toLowerCase();
+  const now = new Date().toISOString();
+  state.commandHistory = pruneCommandHistory((state.commandHistory || []).map((item) => (
+    commandResultKey(item.command).toLowerCase() === key
+      ? { ...item, ...patch, updatedAt: patch.pinned === undefined ? item.updatedAt : now }
+      : item
+  )));
+  renderCommandHistory();
+  saveCommandDebugState();
+}
+
+function clearUnpinnedCommandHistory() {
+  const before = state.commandHistory?.length || 0;
+  state.commandHistory = pruneCommandHistory((state.commandHistory || []).filter((item) => item.pinned));
+  renderCommandHistory();
+  saveCommandDebugState();
+  appendToolCall({
+    title: "最近命令已清理",
+    label: "$",
+    state: "完成",
+    body: `清理前 ${before} 条，保留固定命令 ${state.commandHistory.length} 条。`
+  });
+  showToast("已清空未固定的最近命令。");
+}
+
+function renderCommandHistory() {
+  if (!commandHistoryList) return;
+  const history = pruneCommandHistory(state.commandHistory);
+  commandHistoryList.innerHTML = "";
+  if (!history.length) {
+    commandHistoryList.hidden = true;
+    return;
+  }
+  commandHistoryList.hidden = false;
+  const header = document.createElement("div");
+  header.className = "command-history-toolbar";
+  header.innerHTML = `<strong>最近命令</strong><button type="button" data-action="clear-unpinned">清空未固定</button>`;
+  header.querySelector("[data-action='clear-unpinned']").addEventListener("click", clearUnpinnedCommandHistory);
+  commandHistoryList.appendChild(header);
+  history.slice(0, 6).forEach((item) => {
+    const row = document.createElement("div");
+    row.className = `command-history-row ${item.lastStatus || "staged"} ${item.pinned ? "pinned" : ""}`;
+    row.innerHTML = `
+      <button type="button" data-action="fill"><code></code><small></small></button>
+      <button type="button" data-action="pin"></button>
+      <button type="button" data-action="stage">加入</button>
+      <button type="button" data-action="run">重跑</button>
+    `;
+    row.querySelector("code").textContent = item.command;
+    row.querySelector("small").textContent = [
+      item.lastStatus || "staged",
+      item.pinned ? "固定" : "",
+      item.lastExitCode === undefined ? "" : `exit ${item.lastExitCode}`,
+      item.runCount ? `${item.runCount} 次` : "",
+      item.reason || item.source || ""
+    ].filter(Boolean).join(" · ");
+    row.querySelector("[data-action='fill']").addEventListener("click", () => {
+      if (manualCommandInput) {
+        manualCommandInput.value = item.command;
+        manualCommandInput.focus();
+      }
+      appendToolCall({
+        title: `最近命令已填入：${item.command}`,
+        label: "$",
+        state: "ready",
+        body: item.command
+      });
+    });
+    const pinButton = row.querySelector("[data-action='pin']");
+    pinButton.textContent = item.pinned ? "取消固定" : "固定";
+    pinButton.addEventListener("click", () => {
+      updateCommandHistoryItem(item.command, { pinned: !item.pinned });
+      appendToolCall({
+        title: item.pinned ? `最近命令已取消固定：${item.command}` : `最近命令已固定：${item.command}`,
+        label: "$",
+        state: "ready",
+        body: item.command
+      });
+      showToast(item.pinned ? "已取消固定命令。" : "命令已固定。");
+    });
+    row.querySelector("[data-action='stage']").addEventListener("click", () => {
+      stageManualCommand(item.command, { reason: item.reason || "最近命令", focus: false });
+    });
+    row.querySelector("[data-action='run']").addEventListener("click", async () => {
+      stageManualCommand(item.command, { reason: item.reason || "最近命令", focus: false });
+      if (state.busy) {
+        showToast("代理正在运行，已先加入面板。");
+        return;
+      }
+      setBusy(true, "重跑最近命令");
+      const ok = await runSuggestedCommand(item.command, { single: true });
+      setBusy(false, ok ? "命令通过" : "命令失败");
+    });
+    commandHistoryList.appendChild(row);
+  });
+}
+
+function commandHistoryNavigationItems() {
+  return pruneCommandHistory(state.commandHistory)
+    .map((item) => item.command)
+    .filter(Boolean);
+}
+
+function resetManualCommandHistoryNavigation() {
+  state.manualCommandHistoryCursor = -1;
+  state.manualCommandHistoryDraft = "";
+}
+
+function applyManualCommandHistoryNavigation(direction) {
+  if (!manualCommandInput) return false;
+  const history = commandHistoryNavigationItems();
+  if (!history.length) return false;
+  if (state.manualCommandHistoryCursor === -1) {
+    state.manualCommandHistoryDraft = manualCommandInput.value || "";
+  }
+  const nextCursor = Math.max(-1, Math.min(history.length - 1, state.manualCommandHistoryCursor + direction));
+  if (nextCursor === state.manualCommandHistoryCursor) return true;
+  state.manualCommandHistoryCursor = nextCursor;
+  manualCommandInput.value = nextCursor === -1 ? state.manualCommandHistoryDraft : history[nextCursor];
+  manualCommandInput.focus();
+  requestAnimationFrame(() => {
+    const end = manualCommandInput.value.length;
+    manualCommandInput.setSelectionRange(end, end);
+  });
+  return true;
+}
+
+function handleManualCommandInputKeydown(event) {
+  if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+  if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  const direction = event.key === "ArrowUp" ? 1 : -1;
+  if (applyManualCommandHistoryNavigation(direction)) {
+    event.preventDefault();
+  }
+}
+
+function stageDebugActionCommand(action = {}) {
+  const command = String(action.command || "").trim();
+  if (!command) {
+    showToast("这条调试建议没有可运行命令。");
+    return false;
+  }
+  const nextCommand = {
+    command,
+    reason: action.description || action.label || action.id || "调试建议",
+    source: action.id || "debug-action",
+    priority: Number(action.priority || 0) || undefined,
+    evidence: Array.isArray(action.evidence) ? action.evidence.slice(0, 6) : [],
+    target: action.target || "",
+    kind: action.kind || ""
+  };
+  const existing = normalizeCommandItems(state.pendingCommands);
+  const merged = [
+    nextCommand,
+    ...existing.filter((item) => commandResultKey(item.command) !== commandResultKey(command))
+  ];
+  renderCommands(merged);
+  rememberCommand(command, { reason: nextCommand.reason, source: nextCommand.source });
+  appendToolCall({
+    title: `已加入下一步验证命令：${action.label || action.id || command}`,
+    label: "debug",
+    state: "ready",
+    body: [
+      action.priority ? `priority: ${action.priority}` : "",
+      action.kind ? `kind: ${action.kind}` : "",
+      action.target ? `target: ${action.target}` : "",
+      action.description || "",
+      action.evidence?.length ? `evidence:\n${action.evidence.map((item) => `- ${item}`).join("\n")}` : "",
+      `$ ${command}`
+    ].filter(Boolean).join("\n")
+  });
+  showToast("下一步验证命令已放入命令面板。");
+  return true;
+}
+
+async function runRecommendedDebugAction(result = state.lastDebugDiagnostics) {
+  const actions = Array.isArray(result?.nextActions) ? result.nextActions : [];
+  const action = actions
+    .filter((item) => String(item.command || "").trim())
+    .sort((left, right) => (Number(right.priority) || 0) - (Number(left.priority) || 0))[0];
+  const command = String(action?.command || "").trim();
+  if (!command) {
+    appendDebugEvidence("暂无可运行的推荐动作", "跳过", {
+      summary: result?.summary || null,
+      nextActions: actions
+    });
+    showToast("当前诊断没有可直接运行的推荐动作。");
+    return false;
+  }
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再运行推荐动作。");
+    return false;
+  }
+  stageDebugActionCommand(action);
+  appendToolCall({
+    title: `开始运行推荐动作：${action.label || action.id || command}`,
+    label: "debug",
+    state: "running",
+    body: [
+      action.priority ? `priority: ${action.priority}` : "",
+      action.kind ? `kind: ${action.kind}` : "",
+      action.target ? `target: ${action.target}` : "",
+      action.description || "",
+      action.evidence?.length ? `evidence:\n${action.evidence.map((item) => `- ${item}`).join("\n")}` : "",
+      `$ ${command}`
+    ].filter(Boolean).join("\n")
+  });
+  const startedAt = new Date().toISOString();
+  const chain = createRepairEvidenceChain({
+    source: "debug-recommended-action",
+    command,
+    diagnostics: result,
+    prompt: state.lastPrompt || input.value.trim()
+  });
+  updateRepairEvidenceChain({
+    id: chain.id,
+    status: "checking",
+    recommendedAction: {
+      id: action.id || "",
+      label: action.label || "",
+      description: action.description || "",
+      priority: Number(action.priority || 0) || null,
+      kind: action.kind || "",
+      target: action.target || "",
+      evidence: Array.isArray(action.evidence) ? action.evidence.slice(0, 6) : [],
+      command
+    },
+    commandRun: {
+      command,
+      status: "running",
+      startedAt
+    }
+  }, { title: "推荐动作已加入恢复证据链" });
+  setBusy(true, "运行推荐动作");
+  let ok = false;
+  try {
+    ok = await runSuggestedCommand(command, { single: true });
+  } finally {
+    const run = state.commandResults[commandResultKey(command)] || {};
+    updateRepairEvidenceChain({
+      id: chain.id,
+      status: ok ? "verified" : "needs_repair",
+      commandRun: {
+        command,
+        status: ok ? "passed" : "failed",
+        startedAt,
+        completedAt: new Date().toISOString(),
+        exitCode: run.result?.exitCode ?? null,
+        blocked: Boolean(run.result?.blocked),
+        outputSummary: summarizeCommandOutput(run.result?.output || run.error || "")
+      }
+    }, { title: ok ? "推荐动作通过并已沉淀恢复证据" : "推荐动作失败已沉淀恢复证据" });
+    setBusy(false, ok ? "推荐动作通过" : "推荐动作失败");
+  }
+  return ok;
+}
+
+function stageManualCommand(command, { reason = "手动验证命令", focus = true } = {}) {
+  const commandText = String(command || "").trim();
+  if (!commandText) {
+    showToast("请输入要运行的安全验证命令。");
+    manualCommandInput?.focus();
+    return null;
+  }
+  const nextCommand = {
+    command: commandText,
+    reason,
+    source: "manual-command"
+  };
+  const existing = normalizeCommandItems(state.pendingCommands);
+  const merged = [
+    nextCommand,
+    ...existing.filter((item) => commandResultKey(item.command) !== commandResultKey(commandText))
+  ];
+  renderCommands(merged);
+  rememberCommand(commandText, { reason, source: "manual-command" });
+  if (focus) manualCommandInput?.focus();
+  appendToolCall({
+    title: `手动验证命令已加入面板：${commandText}`,
+    label: "$",
+    state: "ready",
+    body: `$ ${commandText}`
+  });
+  showToast("手动验证命令已加入命令面板。");
+  return nextCommand;
+}
+
+function pruneRepairChains(chains = []) {
+  return (Array.isArray(chains) ? chains : [])
+    .filter((chain) => chain?.id)
+    .sort((a, b) => String(b.updatedAt || b.startedAt || "").localeCompare(String(a.updatedAt || a.startedAt || "")))
+    .slice(0, 12);
+}
+
+function repairChainFiles(repair = null) {
+  return (repair?.patches || [])
+    .map((patch) => patch.path)
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function summarizeRepairEvidenceChain(chain = null) {
+  if (!chain) return "(无修复证据链)";
+  const lines = [
+    `id: ${chain.id || ""}`,
+    `status: ${chain.status || "unknown"}`,
+    `source: ${chain.source || ""}`,
+    chain.recommendedAction ? `recommendedAction: ${chain.recommendedAction.label || chain.recommendedAction.id || "debug action"} · ${chain.recommendedAction.command || ""}` : "",
+    chain.command ? `failedCommand: ${chain.command}` : "",
+    chain.commandRun ? `commandRun: ${chain.commandRun.status || "unknown"} · exit ${chain.commandRun.exitCode ?? "?"} · ${chain.commandRun.outputSummary || ""}` : "",
+    chain.failure ? `failure: exit ${chain.failure.exitCode ?? "?"} · ${chain.failure.outputSummary || "(无输出摘要)"}` : "",
+    chain.diagnostics ? `diagnostics: ${chain.diagnostics.status || "attached"} · ${chain.diagnostics.findingCount || 0} findings` : "",
+    chain.repair ? `repair: ${chain.repair.hasDiff ? "diff ready" : "no diff"} · ${chain.repair.files?.join(", ") || "no files"} · ${chain.repair.commandCount || 0} commands` : "",
+    chain.apply ? `apply: ${chain.apply.status || ""} · checkpoint ${chain.apply.checkpointId || "(none)"} · task ${chain.apply.taskId || "(none)"}` : "",
+    chain.verification ? `verification: ${chain.verification.skipped ? "skipped" : chain.verification.ok ? "passed" : "failed"} · ${chain.verification.checkCount || 0} checks` : ""
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+function storeRepairEvidenceChain(chain = null) {
+  if (!chain?.id) return null;
+  const updated = { ...chain, updatedAt: new Date().toISOString() };
+  const active = state.activeRepairChain;
+  const shouldReplaceActive = !active || active.id === updated.id;
+  if (updated.status === "verified") {
+    if (shouldReplaceActive) state.activeRepairChain = null;
+  } else if (shouldReplaceActive) {
+    state.activeRepairChain = updated;
+  }
+  state.repairChains = pruneRepairChains([
+    updated,
+    ...(state.repairChains || []).filter((item) => item.id !== updated.id)
+  ]);
+  saveCommandDebugState();
+  return updated;
+}
+
+function createRepairEvidenceChain({ source, command = "", result = null, diagnostics = null, prompt = "" } = {}) {
+  const now = new Date().toISOString();
+  const chain = {
+    id: `repair-chain-${now.replace(/[:.]/g, "-")}`,
+    scope: currentDebugScope(),
+    source: source || "manual-command",
+    status: "diagnosed",
+    startedAt: now,
+    updatedAt: now,
+    prompt: prompt || state.lastPrompt || input.value.trim(),
+    command,
+    failure: result ? {
+      exitCode: result.exitCode,
+      blocked: Boolean(result.blocked),
+      outputSummary: summarizeCommandOutput(result.output || ""),
+      output: String(result.output || "").slice(0, 8000),
+      policy: result.policy || null
+    } : null,
+    diagnostics: diagnostics ? {
+      status: diagnostics.status || "",
+      summary: diagnostics.summary || null,
+      findingCount: diagnostics.findings?.length || 0,
+      nextActions: (diagnostics.nextActions || []).slice(0, 6)
+    } : null,
+    recommendedAction: null,
+    commandRun: null,
+    repair: null,
+    apply: null,
+    verification: null
+  };
+  const stored = storeRepairEvidenceChain(chain);
+  appendToolCall({
+    title: "修复证据链已创建",
+    label: "repair",
+    state: "diagnosed",
+    body: summarizeRepairEvidenceChain(stored)
+  });
+  return stored;
+}
+
+function updateRepairEvidenceChain(patch = {}, { title = "修复证据链已更新" } = {}) {
+  const patchId = String(patch.id || "").trim();
+  const base = (patchId
+    ? [state.activeRepairChain, ...(state.repairChains || [])].find((item) => item?.id === patchId)
+    : null)
+    || state.activeRepairChain
+    || createRepairEvidenceChain({ source: "manual", prompt: state.lastPrompt || input.value.trim() });
+  const next = {
+    ...base,
+    ...patch,
+    recommendedAction: patch.recommendedAction === undefined ? base.recommendedAction : patch.recommendedAction,
+    commandRun: patch.commandRun === undefined ? base.commandRun : patch.commandRun,
+    repair: patch.repair === undefined ? base.repair : patch.repair,
+    apply: patch.apply === undefined ? base.apply : patch.apply,
+    verification: patch.verification === undefined ? base.verification : patch.verification
+  };
+  const stored = storeRepairEvidenceChain(next);
+  appendToolCall({
+    title,
+    label: "repair",
+    state: stored.status || "updated",
+    body: summarizeRepairEvidenceChain(stored)
+  });
+  return stored;
+}
+
+function failedCommandItems(commands = []) {
+  return normalizeCommandItems(commands).filter((item) => {
+    const run = state.commandResults[commandResultKey(item.command)];
+    return Boolean(run?.result && run.result.exitCode !== 0 && !run.result.blocked);
+  });
+}
+
+function smokeSectionCommandItems(commands = [], section = "") {
+  const needle = `--api-smoke-section=${section}`;
+  return normalizeCommandItems(commands).filter((item) => String(item.command || "").includes(needle));
+}
+
+async function runSmokeSectionCommands(commands = [], section = "", { title = "建议命令" } = {}) {
+  const items = smokeSectionCommandItems(commands, section);
+  if (!items.length) {
+    showToast(`当前命令列表没有 ${section} 分段 smoke。`);
+    appendToolCall({
+      title: `没有 ${section} 分段 smoke 可运行：${title}`,
+      label: "$",
+      state: "跳过",
+      body: commandItemsToText(commands)
+    });
+    return false;
+  }
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再运行 smoke。");
+    return false;
+  }
+  setBusy(true, `运行 ${section} smoke`);
+  const ok = await runCommandBatch(items, {
+    title: `${title} · ${section} smoke`,
+    stopOnFailure: true
+  });
+  setBusy(false, ok ? `${section} smoke 通过` : `${section} smoke 失败`);
+  return ok;
+}
+
+function updateCommandToolbarSummaries() {
+  checksList?.querySelectorAll(".command-list-toolbar").forEach((toolbar) => {
+    const summary = toolbar.querySelector("[data-command-batch-summary]");
+    const rows = Array.from(checksList.querySelectorAll(".command-row[data-command-key]"));
+    const commands = rows
+      .map((row) => row.dataset.commandKey || row.querySelector("code")?.textContent || "")
+      .filter(Boolean);
+    if (summary) summary.textContent = formatCommandBatchSummary(commands);
+    const referenceFilesButton = toolbar.querySelector("[data-action='reference-batch-files']");
+    if (referenceFilesButton) referenceFilesButton.disabled = commandBatchReferencedFiles(commands).length === 0;
+    const rerunFailedButton = toolbar.querySelector("[data-action='rerun-failed-commands']");
+    if (rerunFailedButton) {
+      const failedCount = failedCommandItems(commands).length;
+      rerunFailedButton.textContent = failedCount ? `重跑失败(${failedCount})` : "重跑失败";
+      rerunFailedButton.disabled = failedCount === 0;
+    }
+    const repairButton = toolbar.querySelector("[data-action='run-batch-evidence']");
+    if (repairButton) repairButton.disabled = !commandBatchNeedsRepair(commands);
+    const fastSmokeButton = toolbar.querySelector("[data-action='run-fast-smoke']");
+    if (fastSmokeButton) {
+      const fastSmokeItems = smokeSectionCommandItems(commands, "fast");
+      fastSmokeButton.hidden = fastSmokeItems.length === 0;
+      fastSmokeButton.disabled = fastSmokeItems.length === 0;
+    }
+    const debugSmokeButton = toolbar.querySelector("[data-action='run-debug-smoke']");
+    if (debugSmokeButton) {
+      const debugSmokeItems = smokeSectionCommandItems(commands, "debug");
+      debugSmokeButton.hidden = debugSmokeItems.length === 0;
+      debugSmokeButton.disabled = debugSmokeItems.length === 0;
+    }
+  });
+}
+
+function renderCommandToolbar(commands = [], { title = "建议命令" } = {}) {
+  const items = normalizeCommandItems(commands);
+  if (!items.length) return null;
+  const toolbar = document.createElement("div");
+  toolbar.className = "command-list-toolbar";
+  toolbar.innerHTML = `
+    <strong></strong>
+    <small data-command-batch-summary></small>
+    <button type="button" data-action="run-fast-smoke" hidden>快速 smoke</button>
+    <button type="button" data-action="run-debug-smoke" hidden>调试 smoke</button>
+    <button type="button" data-action="copy-all-commands">复制全部命令</button>
+    <button type="button" data-action="reference-batch-files" disabled>引用文件</button>
+    <button type="button" data-action="prompt-batch-evidence">批量证据</button>
+    <button type="button" data-action="run-batch-evidence" disabled>证据修复</button>
+    <button type="button" data-action="run-all-commands">运行全部</button>
+    <button type="button" data-action="rerun-failed-commands" disabled>重跑失败</button>
+  `;
+  toolbar.querySelector("strong").textContent = title;
+  toolbar.querySelector("[data-command-batch-summary]").textContent = formatCommandBatchSummary(items);
+  toolbar.querySelector("[data-action='run-fast-smoke']").addEventListener("click", async () => {
+    await runSmokeSectionCommands(items, "fast", { title });
+  });
+  toolbar.querySelector("[data-action='run-debug-smoke']").addEventListener("click", async () => {
+    await runSmokeSectionCommands(items, "debug", { title });
+  });
+  toolbar.querySelector("[data-action='copy-all-commands']").addEventListener("click", async () => {
+    const body = commandItemsToText(items);
+    const copied = await copyText(body);
+    appendToolCall({
+      title: copied ? `已复制全部命令：${title}` : `复制全部命令失败：${title}`,
+      label: "$",
+      state: copied ? "完成" : "失败",
+      body: copyLogBody(copied, body)
+    });
+    showToast(copied ? "全部命令已复制。" : copyFailureSummary());
+  });
+  toolbar.querySelector("[data-action='reference-batch-files']").addEventListener("click", () => {
+    referenceCommandBatchFilesInPrompt(items, { title });
+  });
+  toolbar.querySelector("[data-action='prompt-batch-evidence']").addEventListener("click", () => {
+    appendCommandBatchEvidenceToPrompt(items, { title });
+  });
+  toolbar.querySelector("[data-action='run-batch-evidence']").addEventListener("click", () => {
+    runCommandBatchEvidenceRepair(items, { title });
+  });
+  toolbar.querySelector("[data-action='run-all-commands']").addEventListener("click", async () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再运行命令。");
+      return;
+    }
+    setBusy(true, "运行命令");
+    const ok = await runCommandBatch(items, { title });
+    setBusy(false, ok ? "命令通过" : "命令失败");
+  });
+  toolbar.querySelector("[data-action='rerun-failed-commands']").addEventListener("click", async () => {
+    const failedItems = failedCommandItems(items);
+    if (!failedItems.length) {
+      appendToolCall({
+        title: `没有失败命令可重跑：${title}`,
+        label: "$",
+        state: "跳过",
+        body: formatCommandBatchSummary(items)
+      });
+      showToast("当前没有失败命令可重跑。");
+      updateCommandToolbarSummaries();
+      return;
+    }
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再重跑失败命令。");
+      return;
+    }
+    setBusy(true, "重跑失败命令");
+    const ok = await runCommandBatch(failedItems, {
+      title: `${title} · 重跑失败`,
+      stopOnFailure: false
+    });
+    setBusy(false, ok ? "失败命令已通过" : "仍有失败命令");
+  });
+  updateCommandToolbarSummaries();
+  return toolbar;
+}
+
+function renderCommandRowStatus(row, commandText, run = null) {
+  const small = row.querySelector("small");
+  const button = row.querySelector("button[data-action='run']");
+  const detailButton = row.querySelector("button[data-action='detail']");
+  const copyOutputButton = row.querySelector("button[data-action='copy-output']");
+  const promptButton = row.querySelector("button[data-action='prompt-command']");
+  const referenceFilesButton = row.querySelector("button[data-action='reference-command-files']");
+  let verificationPromptButton = row.querySelector("button[data-action='verification-prompt']");
+  let verificationFixButton = row.querySelector("button[data-action='verification-fix']");
+  const baseMeta = row.dataset.meta || "";
+  row.classList.remove("passed", "failed", "running");
+  if (!run) {
+    row.classList.add("queued");
+    if (small) small.textContent = baseMeta;
+    if (button) {
+      button.textContent = "运行";
+      button.disabled = false;
+    }
+    if (detailButton) {
+      detailButton.hidden = true;
+      detailButton.onclick = null;
+    }
+    if (copyOutputButton) {
+      copyOutputButton.hidden = true;
+      copyOutputButton.onclick = null;
+    }
+    if (promptButton) {
+      promptButton.hidden = true;
+      promptButton.onclick = null;
+    }
+    if (referenceFilesButton) {
+      referenceFilesButton.hidden = true;
+      referenceFilesButton.onclick = null;
+    }
+    if (verificationPromptButton) {
+      verificationPromptButton.hidden = true;
+      verificationPromptButton.onclick = null;
+    }
+    if (verificationFixButton) {
+      verificationFixButton.hidden = true;
+      verificationFixButton.onclick = null;
+    }
+    return;
+  }
+  row.classList.remove("queued");
+  if (run.status === "running") {
+    row.classList.add("running");
+    if (small) small.textContent = [baseMeta, "运行中"].filter(Boolean).join(" · ");
+    if (button) {
+      button.textContent = "运行中";
+      button.disabled = true;
+    }
+    if (detailButton) {
+      detailButton.hidden = true;
+      detailButton.onclick = null;
+    }
+    if (copyOutputButton) {
+      copyOutputButton.hidden = true;
+      copyOutputButton.onclick = null;
+    }
+    if (promptButton) {
+      promptButton.hidden = true;
+      promptButton.onclick = null;
+    }
+    if (referenceFilesButton) {
+      referenceFilesButton.hidden = true;
+      referenceFilesButton.onclick = null;
+    }
+    if (verificationPromptButton) {
+      verificationPromptButton.hidden = true;
+      verificationPromptButton.onclick = null;
+    }
+    if (verificationFixButton) {
+      verificationFixButton.hidden = true;
+      verificationFixButton.onclick = null;
+    }
+    return;
+  }
+  const ok = run.result?.exitCode === 0;
+  const canBuildVerificationPrompt = Boolean(run.result && run.result.exitCode !== 0 && !run.result.blocked);
+  row.classList.add(ok ? "passed" : "failed");
+  if (small) {
+    small.textContent = [
+      baseMeta,
+      run.result?.blocked ? "已拒绝" : `exit ${run.result?.exitCode ?? "?"}`,
+      summarizeCommandOutput(run.result?.output || run.error || "")
+    ].filter(Boolean).join(" · ");
+  }
+  if (button) {
+    button.textContent = "重跑";
+    button.disabled = false;
+  }
+  if (detailButton) detailButton.hidden = false;
+  if (detailButton) detailButton.onclick = () => {
+    appendToolCall({
+      title: `命令详情：${commandText}`,
+      label: "$",
+      state: run.result?.exitCode === 0 ? "完成" : run.result?.blocked ? "已拒绝" : "失败",
+      body: [
+        run.result?.policy ? `policy: ${run.result.policy.risk} · ${run.result.policy.reason}` : "",
+        run.result?.approval ? `approval: ${run.result.approval.id}` : "",
+        run.result?.diagnostics ? `diagnostics: ${run.result.diagnostics.status || "attached"}` : "",
+        "",
+        run.result?.output || run.error || "(无输出)"
+      ].filter((line) => line !== "").join("\n")
+    });
+  };
+  if (copyOutputButton) copyOutputButton.hidden = false;
+  if (copyOutputButton) copyOutputButton.onclick = async () => {
+    const output = run.result?.output || run.error || "";
+    const copied = await copyText(output);
+    appendToolCall({
+      title: copied ? `已复制命令输出：${commandText}` : `复制命令输出失败：${commandText}`,
+      label: "$",
+      state: copied ? "完成" : "失败",
+      body: copyLogBody(copied, output.slice(0, 4000) || "(无输出)")
+    });
+    showToast(copied ? "命令输出已复制。" : copyFailureSummary());
+  };
+  if (promptButton) promptButton.hidden = false;
+  if (promptButton) promptButton.onclick = () => {
+    appendCommandTranscriptToPrompt(commandText, run);
+  };
+  if (referenceFilesButton) referenceFilesButton.hidden = false;
+  if (referenceFilesButton) referenceFilesButton.onclick = () => {
+    referenceCommandFilesInPrompt(commandText, run);
+  };
+  if (canBuildVerificationPrompt && !verificationPromptButton) {
+    verificationPromptButton = document.createElement("button");
+    verificationPromptButton.type = "button";
+    verificationPromptButton.dataset.action = "verification-prompt";
+    verificationPromptButton.textContent = "验证提示";
+    row.insertBefore(verificationPromptButton, button || null);
+  }
+  if (verificationPromptButton) {
+    verificationPromptButton.hidden = !canBuildVerificationPrompt;
+    verificationPromptButton.onclick = canBuildVerificationPrompt
+      ? () => appendCommandVerificationPromptToPrompt(commandText, run)
+      : null;
+  }
+  if (canBuildVerificationPrompt && !verificationFixButton) {
+    verificationFixButton = document.createElement("button");
+    verificationFixButton.type = "button";
+    verificationFixButton.dataset.action = "verification-fix";
+    verificationFixButton.textContent = "验证修复";
+    row.insertBefore(verificationFixButton, button || null);
+  }
+  if (verificationFixButton) {
+    verificationFixButton.hidden = !canBuildVerificationPrompt;
+    verificationFixButton.onclick = canBuildVerificationPrompt
+      ? () => runCommandVerificationFix(commandText, run)
+      : null;
+  }
+}
+
+function renderLastFailedCommandCard(result = state.lastDebugDiagnostics) {
+  const host = debugDiagnosticsPanel?.querySelector(".debug-last-failed-command");
+  if (!host) return;
+  const failure = state.lastFailedCommand;
+  host.innerHTML = "";
+  host.hidden = !failure;
+  if (!failure) return;
+
+  const command = failure.command || "";
+  const output = failure.result?.output || failure.error || "";
+  const failureAnalysis = failure.result?.failureAnalysis || failure.result?.diagnostics?.commandFailure || null;
+  const recoveryChain = failure.result?.recoveryChain || null;
+  const recoveryCommands = normalizeCommandItems(recoveryChain?.commands || []);
+  host.innerHTML = `
+    <div>
+      <strong>最近失败命令</strong>
+      <code></code>
+      <small></small>
+      <div class="debug-last-failed-analysis" hidden>
+        <span data-last-failed-meta="category"></span>
+        <span data-last-failed-meta="files"></span>
+        <span data-last-failed-meta="source-locations"></span>
+        <span data-last-failed-meta="next-action"></span>
+        <span data-last-failed-meta="recovery-chain"></span>
+      </div>
+    </div>
+    <div class="debug-last-failed-actions">
+      <button type="button" data-last-failed-action="detail">详情</button>
+      <button type="button" data-last-failed-action="copy-command">复制命令</button>
+      <button type="button" data-last-failed-action="copy-output">复制输出</button>
+      <button type="button" data-last-failed-action="prompt">加入提示词</button>
+      <button type="button" data-last-failed-action="reference-files">引用文件</button>
+      <button type="button" data-last-failed-action="source-context">定位源码</button>
+      <button type="button" data-last-failed-action="source-context-prompt">源码修复提示</button>
+      <button type="button" data-last-failed-action="source-context-fix">源码直接修复</button>
+      <button type="button" data-last-failed-action="verification-prompt">验证提示</button>
+      <button type="button" data-last-failed-action="verification-fix">验证修复</button>
+      <button type="button" data-last-failed-action="stage-recovery">放入复查命令</button>
+      <button type="button" data-last-failed-action="run-recovery">运行复查链</button>
+      <button type="button" data-last-failed-action="rerun">重跑</button>
+      <button type="button" data-last-failed-action="fix">直接修复</button>
+    </div>
+  `;
+  host.querySelector("code").textContent = command;
+  host.querySelector("small").textContent = [
+    failure.result?.blocked ? "已拒绝" : `exit ${failure.result?.exitCode ?? "?"}`,
+    summarizeCommandOutput(output, failureAnalysis)
+  ].filter(Boolean).join(" · ");
+  const analysisRow = host.querySelector(".debug-last-failed-analysis");
+  if ((failureAnalysis || recoveryChain) && analysisRow) {
+    const referencedFileCount = Array.isArray(failureAnalysis?.referencedFiles) ? failureAnalysis.referencedFiles.length : 0;
+    const sourceLocationCount = commandSourceLocations(failure).length;
+    const firstNextAction = Array.isArray(failureAnalysis?.nextActions) ? failureAnalysis.nextActions[0] : "";
+    analysisRow.hidden = false;
+    analysisRow.querySelector("[data-last-failed-meta='category']").textContent = `分类：${failureAnalysis?.category || recoveryChain?.category || "unknown"}`;
+    analysisRow.querySelector("[data-last-failed-meta='files']").textContent = `相关文件：${referencedFileCount}`;
+    analysisRow.querySelector("[data-last-failed-meta='source-locations']").textContent = `源码位置：${sourceLocationCount}`;
+    analysisRow.querySelector("[data-last-failed-meta='next-action']").textContent = firstNextAction ? `下一步：${firstNextAction}` : "下一步：查看详情";
+    analysisRow.querySelector("[data-last-failed-meta='recovery-chain']").textContent = recoveryCommands.length ? `复查链：${recoveryCommands.length} 条` : "复查链：待生成";
+  }
+  host.querySelector("[data-last-failed-action='detail']").addEventListener("click", () => {
+    appendToolCall({
+      title: `最近失败命令详情：${command}`,
+      label: "$",
+      state: failure.result?.blocked ? "已拒绝" : "失败",
+      body: [
+        failure.result?.policy ? `policy: ${failure.result.policy.risk} · ${failure.result.policy.reason}` : "",
+        failure.result?.approval ? `approval: ${failure.result.approval.id}` : "",
+        failureAnalysis ? formatCommandFailureAnalysis(failureAnalysis) : "",
+        recoveryChain ? formatCommandRecoveryChain(recoveryChain) : "",
+        failure.result?.diagnostics ? `diagnostics: ${failure.result.diagnostics.status || "attached"}` : "",
+        "",
+        output || "(无输出)"
+      ].filter((line) => line !== "").join("\n")
+    });
+  });
+  host.querySelector("[data-last-failed-action='copy-command']").addEventListener("click", async () => {
+    const copied = await copyText(command);
+    appendDebugEvidence(copied ? "最近失败命令已复制" : "最近失败命令复制失败", copied ? "完成" : "失败", copyLogBody(copied, command));
+    showToast(copied ? "失败命令已复制。" : copyFailureSummary());
+  });
+  host.querySelector("[data-last-failed-action='copy-output']").addEventListener("click", async () => {
+    const copied = await copyText(output);
+    appendDebugEvidence(copied ? "最近失败命令输出已复制" : "最近失败命令输出复制失败", copied ? "完成" : "失败", copyLogBody(copied, output || "(无输出)"));
+    showToast(copied ? "失败输出已复制。" : copyFailureSummary());
+  });
+  host.querySelector("[data-last-failed-action='prompt']").addEventListener("click", () => {
+    appendCommandTranscriptToPrompt(command, failure);
+  });
+  host.querySelector("[data-last-failed-action='reference-files']").addEventListener("click", () => {
+    referenceCommandFilesInPrompt(command, failure);
+  });
+  host.querySelector("[data-last-failed-action='source-context']").addEventListener("click", async () => {
+    try {
+      const result = await fetchCommandSourceContexts(failure, { contextLines: 6, limit: 8 });
+      appendToolCall({
+        title: `失败命令源码定位：${command}`,
+        label: "ctx",
+        state: `${result.contexts?.length || 0} locations`,
+        body: formatCommandSourceContexts(result.contexts).slice(0, 12000) || "未读取到源码上下文。"
+      });
+      showToast(`已读取 ${result.contexts?.length || 0} 处源码上下文。`);
+    } catch (error) {
+      appendDebugEvidence("失败命令源码定位失败", "失败", error.message);
+      showToast(error.message);
+    }
+  });
+  host.querySelector("[data-last-failed-action='source-context-prompt']").addEventListener("click", async () => {
+    try {
+      const result = await fetchCommandSourceContexts(failure, { contextLines: 6, limit: 8 });
+      const prompt = buildCommandSourceContextPrompt(command, failure, result.contexts);
+      const current = input.value.trim();
+      input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+      input.focus();
+      scheduleReferencePreview({ immediate: true });
+      appendToolCall({
+        title: `源码修复提示已加入提示词：${command}`,
+        label: "ctx",
+        state: `${result.contexts?.length || 0} locations`,
+        body: prompt.slice(0, 12000)
+      });
+      showToast("源码修复提示已加入提示词。");
+    } catch (error) {
+      appendDebugEvidence("源码修复提示生成失败", "失败", error.message);
+      showToast(error.message);
+    }
+  });
+  host.querySelector("[data-last-failed-action='source-context-fix']").addEventListener("click", () => {
+    runCommandSourceContextFix(command, failure);
+  });
+  host.querySelector("[data-last-failed-action='verification-prompt']").addEventListener("click", () => {
+    appendCommandVerificationPromptToPrompt(command, failure);
+  });
+  host.querySelector("[data-last-failed-action='verification-fix']").addEventListener("click", () => {
+    runCommandVerificationFix(command, failure);
+  });
+  host.querySelector("[data-last-failed-action='stage-recovery']").addEventListener("click", () => {
+    if (!recoveryCommands.length) {
+      showToast("这次失败没有可放入命令面板的复查链。");
+      return;
+    }
+    stageRepairVerificationCommands(recoveryCommands, {
+      title: "失败命令复查链",
+      successTitle: "失败命令复查链已放入命令面板",
+      source: "failed-command-recovery-chain"
+    });
+  });
+  host.querySelector("[data-last-failed-action='run-recovery']").addEventListener("click", async () => {
+    if (!recoveryCommands.length) {
+      showToast("这次失败没有可运行的复查链。");
+      return;
+    }
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再运行复查链。");
+      return;
+    }
+    renderCommands(recoveryCommands);
+    setBusy(true, "运行失败命令复查链");
+    const ok = await runCommandBatch(recoveryCommands, {
+      title: "失败命令复查链",
+      stopOnFailure: true
+    });
+    setBusy(false, ok ? "复查链通过" : "复查链失败");
+  });
+  host.querySelector("[data-last-failed-action='rerun']").addEventListener("click", async () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再重跑命令。");
+      return;
+    }
+    setBusy(true, "重跑失败命令");
+    const ok = await runSuggestedCommand(command, { single: true });
+    setBusy(false, ok ? "命令通过" : "命令失败");
+  });
+  host.querySelector("[data-last-failed-action='fix']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再发起修复。");
+      return;
+    }
+    const prompt = buildDebugFixPrompt(result);
+    const failurePrompt = [
+      prompt || (state.lastPrompt ? `继续修复上一轮任务：${state.lastPrompt}` : "请修复最近一次失败命令。"),
+      "",
+      "最近失败命令：",
+      `$ ${command}`,
+      "",
+      "失败输出：",
+      output.slice(0, 4000) || "(无输出)"
+    ].join("\n");
+    input.value = failurePrompt;
+    scheduleReferencePreview({ immediate: true });
+    appendDebugEvidence("已启动最近失败命令修复", "running", failurePrompt);
+    showToast("正在启动最近失败命令修复代理。");
+    submitPromptForm();
+  });
+}
+
+function updateCommandRunState(command, run) {
+  const key = commandResultKey(command);
+  state.commandResults[key] = {
+    ...run,
+    startedAt: run?.startedAt || state.commandResults[key]?.startedAt || new Date().toISOString(),
+    completedAt: run?.status === "done" ? new Date().toISOString() : ""
+  };
+  if (run?.status === "done" && run.result && run.result.exitCode !== 0 && !run.result.blocked) {
+    state.lastFailedCommand = { command: key, ...state.commandResults[key], capturedAt: new Date().toISOString() };
+    if (run.result.failureAnalysis) {
+      appendDebugEvidence("失败命令已分类", run.result.failureAnalysis.category || "failure", formatCommandFailureAnalysis(run.result.failureAnalysis));
+    }
+    appendCommandReferencedFilesEvidence(key, state.commandResults[key]);
+    renderLastFailedCommandCard();
+  } else if (run?.status === "done" && run.result?.exitCode === 0 && state.lastFailedCommand?.command === key) {
+    state.lastFailedCommand = null;
+    renderLastFailedCommandCard();
+  }
+  if (run?.status === "done" && run.result) {
+    rememberCommand(key, {
+      reason: state.commandHistory.find((item) => commandResultKey(item.command) === key)?.reason || "",
+      source: "command-run",
+      result: run.result
+    });
+  }
+  checksList?.querySelectorAll(".command-row").forEach((row) => {
+    if (row.dataset.commandKey === key) renderCommandRowStatus(row, key, run);
+  });
+  updateCommandToolbarSummaries();
+  saveCommandDebugState();
+}
+
+function verificationPlanCommands(plan = null) {
+  const commands = [
+    ...(plan?.commands || []),
+    ...(plan?.typecheck?.commands || [])
+  ];
+  return normalizeCommandItems(commands);
+}
+
+async function runVerificationPlanCommands(plan = null) {
+  const commands = verificationPlanCommands(plan);
+  if (!commands.length) {
+    showToast("当前验证计划没有可运行命令。");
+    return false;
+  }
+  renderCommands(commands);
+  appendDebugEvidence(
+    "开始运行验证计划",
+    "running",
+    commands.map((item) => `$ ${item.command}${item.reason ? `\n  ${item.reason}` : ""}`).join("\n")
+  );
+  const ok = await runCommandBatch(commands, { title: "验证计划", stopOnFailure: true });
+  appendDebugEvidence(
+    ok ? "验证计划命令全部通过" : "验证计划已停在失败命令",
+    ok ? "完成" : "失败",
+    commandBatchEvidence(commands)
+  );
+  return ok;
+}
+
 function renderPlan(items = []) {
   const fallback = ["读取工作区上下文", "生成修改方案", "审批后写入文件"];
   const plan = items.length ? items : fallback;
@@ -309,20 +3502,57 @@ function renderPlan(items = []) {
   });
 }
 
+function referenceFileInPrompt(filePath, { titlePrefix = "已引用文件" } = {}) {
+  const reference = `@${filePath}`;
+  if (!input.value.includes(reference)) {
+    input.value = `${input.value.trimEnd()}\n${reference}\n`;
+  }
+  input.focus();
+  appendToolCall({
+    title: `${titlePrefix}：${filePath}`,
+    label: "ctx",
+    state: "已加入输入",
+    body: "该文件路径已追加到提示词输入框，代理会优先把它作为编辑/排查上下文。"
+  });
+  scheduleReferencePreview({ immediate: true });
+}
+
+function appendFileReadFailureEvidence(filePath, error, {
+  title = "读取文件失败",
+  action = "file-read",
+  retry = null
+} = {}) {
+  return appendActionFailureEvidence({
+    kind: "file",
+    action,
+    targetName: filePath || "file",
+    endpoint: "/api/file",
+    request: { path: filePath || "" },
+    item: { path: filePath || "" },
+    error
+  }, {
+    title: `${title}：${filePath || "file"}`,
+    label: "cat",
+    retry,
+    safe: filePath ? () => referenceFileInPrompt(filePath) : null
+  });
+}
+
 function renderFiles(files = []) {
   state.files = files;
   fileList.innerHTML = "";
   if (!files.length) {
     fileList.textContent = "没有找到可读取的文本文件";
+    scheduleReferencePreview({ immediate: true });
     return;
   }
   files.slice(0, 80).forEach((file) => {
-    const row = document.createElement("button");
-    row.type = "button";
+    const row = document.createElement("div");
     row.className = "file-row";
-    row.textContent = file.path;
-    row.addEventListener("click", async () => {
-      try {
+    row.innerHTML = `<button type="button" data-action="read"></button><button type="button" data-action="reference">引用</button>`;
+    row.querySelector("[data-action='read']").textContent = file.path;
+    row.querySelector("[data-action='read']").addEventListener("click", async () => {
+      const readFile = async () => {
         const data = await api(`/api/file?path=${encodeURIComponent(file.path)}`);
         appendToolCall({
           title: `读取文件：${file.path}`,
@@ -330,12 +3560,24 @@ function renderFiles(files = []) {
           state: "完成",
           body: data.content.slice(0, 5000)
         });
+      };
+      try {
+        await readFile();
       } catch (error) {
         showToast(error.message);
+        appendFileReadFailureEvidence(file.path, error, {
+          title: "读取文件失败",
+          action: "file-read",
+          retry: readFile
+        });
       }
+    });
+    row.querySelector("[data-action='reference']").addEventListener("click", () => {
+      referenceFileInPrompt(file.path);
     });
     fileList.appendChild(row);
   });
+  scheduleReferencePreview({ immediate: true });
 }
 
 function summarizeRepoMap(repoMap) {
@@ -349,24 +3591,295 @@ function summarizeRepoMap(repoMap) {
   return `${symbols} 个符号，${scripts} 个脚本${types ? `，${types}` : ""}`;
 }
 
+function summarizeDiffPatch(diff = "") {
+  const summary = { additions: 0, deletions: 0 };
+  String(diff || "").split(/\r?\n/).forEach((line) => {
+    if (line.startsWith("+++") || line.startsWith("---")) return;
+    if (line.startsWith("+")) summary.additions += 1;
+    if (line.startsWith("-")) summary.deletions += 1;
+  });
+  return summary;
+}
+
+function summarizeDiffPatches(patches = []) {
+  return patches.reduce((summary, patch) => {
+    const fileSummary = summarizeDiffPatch(patch.diff || "");
+    summary.additions += fileSummary.additions;
+    summary.deletions += fileSummary.deletions;
+    return summary;
+  }, { additions: 0, deletions: 0 });
+}
+
+function splitPatchHunks(diff = "") {
+  const lines = String(diff || "").split(/\r?\n/);
+  const headers = [];
+  const hunks = [];
+  let current = null;
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      if (current) hunks.push(current);
+      current = { header: line, lines: [line] };
+    } else if (current) {
+      current.lines.push(line);
+    } else if (line.trim()) {
+      headers.push(line);
+    }
+  }
+  if (current) hunks.push(current);
+  return { headers, hunks };
+}
+
+function selectedDiffPatchText(patch = {}, selectedHunkIndexes = []) {
+  const parsed = splitPatchHunks(patch.diff || "");
+  if (!parsed.hunks.length || selectedHunkIndexes.length === parsed.hunks.length) return patch.diff || "";
+  const selected = new Set(selectedHunkIndexes.map((index) => Number(index)));
+  const hunkText = parsed.hunks
+    .filter((_, index) => selected.has(index))
+    .flatMap((hunk) => hunk.lines);
+  return [...parsed.headers, ...hunkText, ""].join("\n");
+}
+
+function collectSelectedDiff() {
+  const selectedPatches = [];
+  const selectedSummary = [];
+  diffList.querySelectorAll(".diff-file").forEach((item) => {
+    const index = Number(item.dataset.patchIndex);
+    const patch = state.pendingPatches?.[index] || null;
+    if (!patch) return;
+    const hunkCheckboxes = [...item.querySelectorAll("[data-diff-hunk-index] input[type='checkbox']")];
+    if (!hunkCheckboxes.length) {
+      selectedPatches.push(patch.diff || "");
+      selectedSummary.push({ path: patch.path, selectedHunks: null, totalHunks: null });
+      return;
+    }
+    const selectedIndexes = hunkCheckboxes
+      .map((checkbox) => Number(checkbox.closest("[data-diff-hunk-index]")?.dataset.diffHunkIndex))
+      .filter((_, checkboxIndex) => hunkCheckboxes[checkboxIndex].checked);
+    if (!selectedIndexes.length) return;
+    selectedPatches.push(selectedDiffPatchText(patch, selectedIndexes));
+    selectedSummary.push({ path: patch.path, selectedHunks: selectedIndexes.length, totalHunks: hunkCheckboxes.length });
+  });
+  return {
+    diff: selectedPatches.filter(Boolean).join("\n").trimEnd() + (selectedPatches.length ? "\n" : ""),
+    summary: selectedSummary
+  };
+}
+
 function renderDiff(patches = []) {
   state.pendingPatches = patches;
   diffList.innerHTML = "";
   renderConflictResolution(null);
   if (!patches.length) {
     diffSummary.textContent = "暂无修改";
+    if (toggleAllDiffBtn) {
+      toggleAllDiffBtn.disabled = true;
+      toggleAllDiffBtn.textContent = "折叠全部";
+      toggleAllDiffBtn.setAttribute("aria-expanded", "true");
+    }
+    if (copyAllDiffBtn) copyAllDiffBtn.disabled = true;
     diffList.innerHTML = `<div class="empty-state">本次没有建议写入的 diff。</div>`;
     return;
   }
-  diffSummary.textContent = `${patches.length} 个文件`;
-  patches.forEach((patch) => {
+  const total = summarizeDiffPatches(patches);
+  diffSummary.textContent = `${patches.length} 个文件 · +${total.additions} / -${total.deletions}`;
+  if (toggleAllDiffBtn) {
+    toggleAllDiffBtn.disabled = false;
+    toggleAllDiffBtn.textContent = "折叠全部";
+    toggleAllDiffBtn.setAttribute("aria-expanded", "true");
+  }
+  if (copyAllDiffBtn) copyAllDiffBtn.disabled = false;
+  patches.forEach((patch, patchIndex) => {
+    const fileSummary = summarizeDiffPatch(patch.diff || "");
+    const parsedHunks = splitPatchHunks(patch.diff || "");
     const item = document.createElement("div");
     item.className = "diff-file";
-    item.innerHTML = `<header></header><pre></pre>`;
-    item.querySelector("header").textContent = patch.path;
+    item.dataset.patchIndex = String(patchIndex);
+    item.innerHTML = `<header><span></span><small class="diff-file-stats"></small><button type="button" data-action="select-file-hunks">全选 hunk</button><button type="button" data-action="clear-file-hunks">取消 hunk</button><button type="button" data-action="reference-file-from-diff">引用</button><button type="button" data-action="read-file-from-diff">原文</button><button type="button" data-action="toggle-file-diff">折叠</button><button type="button" data-action="copy-file-diff">复制</button></header><div class="diff-hunk-selector"></div><pre></pre>`;
+    item.querySelector("span").textContent = patch.path;
+    item.querySelector(".diff-file-stats").textContent = `+${fileSummary.additions} / -${fileSummary.deletions}${parsedHunks.hunks.length ? ` · ${parsedHunks.hunks.length} hunks` : ""}`;
+    const hunkSelector = item.querySelector(".diff-hunk-selector");
+    if (parsedHunks.hunks.length) {
+      parsedHunks.hunks.forEach((hunk, hunkIndex) => {
+        const hunkSummary = summarizeDiffPatch(hunk.lines.join("\n"));
+        const row = document.createElement("label");
+        row.className = "diff-hunk-choice";
+        row.dataset.diffHunkIndex = String(hunkIndex);
+        row.innerHTML = `<input type="checkbox" checked /><span></span><small></small>`;
+        row.querySelector("span").textContent = hunk.header || `hunk ${hunkIndex + 1}`;
+        row.querySelector("small").textContent = `+${hunkSummary.additions} / -${hunkSummary.deletions}`;
+        hunkSelector.appendChild(row);
+      });
+    } else {
+      hunkSelector.hidden = true;
+    }
     item.querySelector("pre").textContent = patch.diff || "新文件或完整替换内容将在批准后写入。";
+    item.querySelector("[data-action='select-file-hunks']").addEventListener("click", () => {
+      item.querySelectorAll("[data-diff-hunk-index] input[type='checkbox']").forEach((checkbox) => { checkbox.checked = true; });
+    });
+    item.querySelector("[data-action='clear-file-hunks']").addEventListener("click", () => {
+      item.querySelectorAll("[data-diff-hunk-index] input[type='checkbox']").forEach((checkbox) => { checkbox.checked = false; });
+    });
+    item.querySelector("[data-action='reference-file-from-diff']").addEventListener("click", () => {
+      referenceFileInPrompt(patch.path, { titlePrefix: "已引用 diff 文件" });
+    });
+    item.querySelector("[data-action='read-file-from-diff']").addEventListener("click", async () => {
+      const readOriginal = async () => {
+        const data = await api(`/api/file?path=${encodeURIComponent(patch.path)}`);
+        appendToolCall({
+          title: `读取 diff 原文件：${patch.path}`,
+          label: "cat",
+          state: "完成",
+          body: data.content.slice(0, 8000)
+        });
+      };
+      try {
+        await readOriginal();
+      } catch (error) {
+        appendFileReadFailureEvidence(patch.path, error, {
+          title: "读取 diff 原文件失败",
+          action: "diff-original-read",
+          retry: readOriginal
+        });
+        showToast(error.message);
+      }
+    });
+    item.querySelector("[data-action='toggle-file-diff']").addEventListener("click", (event) => {
+      const collapsed = item.classList.toggle("collapsed");
+      event.currentTarget.textContent = collapsed ? "展开" : "折叠";
+      event.currentTarget.setAttribute("aria-expanded", String(!collapsed));
+    });
+    item.querySelector("[data-action='copy-file-diff']").addEventListener("click", async () => {
+      const copied = await copyText(patch.diff || "");
+    appendToolCall({
+      title: copied ? `已复制 diff：${patch.path}` : `复制 diff 失败：${patch.path}`,
+      label: "diff",
+      state: copied ? "完成" : "失败",
+      body: copyLogBody(copied, (patch.diff || "").slice(0, 4000))
+    });
+      showToast(copied ? "单文件 diff 已复制。" : copyFailureSummary());
+    });
     diffList.appendChild(item);
   });
+}
+
+function setAllDiffFilesCollapsed(collapsed) {
+  diffList.querySelectorAll(".diff-file").forEach((item) => {
+    item.classList.toggle("collapsed", collapsed);
+    const button = item.querySelector("[data-action='toggle-file-diff']");
+    if (button) {
+      button.textContent = collapsed ? "展开" : "折叠";
+      button.setAttribute("aria-expanded", String(!collapsed));
+    }
+  });
+  if (toggleAllDiffBtn) {
+    toggleAllDiffBtn.textContent = collapsed ? "展开全部" : "折叠全部";
+    toggleAllDiffBtn.setAttribute("aria-expanded", String(!collapsed));
+  }
+}
+
+function combinedPendingDiff() {
+  return (state.pendingPatches || [])
+    .map((patch) => patch.diff || "")
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function collectConflictResolutionsFromPanel() {
+  const conflicts = state.conflictPreview?.conflictPreviews || [];
+  if (!conflicts.length || !conflictResolutionPanel) return [];
+  return [...conflictResolutionPanel.querySelectorAll(".conflict-resolution-row")]
+    .map((row) => {
+      const index = Number(row.dataset.index || 0);
+      const conflict = conflicts[index] || {};
+      return {
+        path: conflict.path,
+        hunk: conflict.hunk,
+        oldStart: conflict.oldStart,
+        current: conflict.current || [],
+        proposed: conflict.proposed || [],
+        resolved: row.querySelector("textarea")?.value || ""
+      };
+    })
+    .filter((item) => item.path);
+}
+
+function buildConflictResolutionContext(preview = state.conflictPreview) {
+  const conflicts = preview?.conflictPreviews || [];
+  if (!conflicts.length) return "";
+  const resolutions = collectConflictResolutionsFromPanel();
+  const rows = conflicts.map((conflict, index) => {
+    const resolution = resolutions[index] || {};
+    return [
+      `### ${index + 1}. ${conflict.path || "unknown"} ${conflict.hunk || ""}`.trim(),
+      "<<<<<<< CURRENT",
+      ...(conflict.current || []).slice(0, 80),
+      "=======",
+      ...(conflict.proposed || []).slice(0, 80),
+      ">>>>>>> PROPOSED",
+      resolution.resolved ? `Resolved 草稿：\n${resolution.resolved}` : ""
+    ].filter(Boolean).join("\n");
+  }).join("\n\n");
+  const files = [...new Set(conflicts.map((item) => item.path).filter(Boolean))];
+  return [
+    "请基于当前 diff 冲突继续修复，目标是生成可安全审批的最小解决 diff。",
+    "",
+    `冲突数量：${conflicts.length}`,
+    files.length ? `涉及文件：${files.map((file) => `@${file}`).join(" ")}` : "",
+    state.pendingDiff ? `待审批 diff 字节数：${state.pendingDiff.length}` : "",
+    "",
+    "冲突证据：",
+    rows,
+    "",
+    "要求：先读取涉及文件的当前内容；不要直接覆盖用户改动；综合 CURRENT、PROPOSED 和 resolved 草稿，优先保留两边正确意图；生成新的待审批 diff，并给出安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendConflictResolutionToPrompt(preview = state.conflictPreview) {
+  const context = buildConflictResolutionContext(preview);
+  if (!context) {
+    showToast("暂无可加入提示词的冲突证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "冲突证据已加入提示词",
+    label: "merge",
+    state: `${preview?.conflictPreviews?.length || 0} conflicts`,
+    body: context.slice(0, 12000)
+  });
+  showToast("冲突证据已加入提示词。");
+  return context;
+}
+
+function runConflictResolutionRepair(preview = state.conflictPreview) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再修复冲突。");
+    return "";
+  }
+  const context = buildConflictResolutionContext(preview);
+  if (!context) {
+    showToast("暂无可修复的冲突证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接修复这些冲突：读取相关文件，生成最小可审批 diff，必要时更新冲突解决草稿，并给出可运行的验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "已启动冲突修复",
+    label: "merge",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动冲突修复。");
+  submitPromptForm();
+  return prompt;
 }
 
 function renderConflictResolution(preview = null) {
@@ -378,7 +3891,7 @@ function renderConflictResolution(preview = null) {
   if (!conflicts.length) return;
   const header = document.createElement("div");
   header.className = "conflict-resolution-head";
-  header.innerHTML = `<strong>冲突解决</strong><button type="button" data-action="create-resolution-draft">生成解决草稿</button>`;
+  header.innerHTML = `<strong>冲突解决</strong><span class="conflict-resolution-actions"><button type="button" data-action="prompt-conflicts">加入提示词</button><button type="button" data-action="repair-conflicts">直接修复</button><button type="button" data-action="create-resolution-draft">生成解决草稿</button></span>`;
   conflictResolutionPanel.appendChild(header);
   conflicts.forEach((conflict, index) => {
     const row = document.createElement("div");
@@ -404,23 +3917,212 @@ function renderCheckpoints(checkpoints = []) {
   rollbackBtn.textContent = checkpoints.length ? `回滚 ${checkpoints[0].slice(0, 19)}` : "回滚";
 }
 
+function buildApplyFailureContext(errorOrResult, {
+  diff = state.pendingDiff || "",
+  patches = state.pendingPatches || [],
+  commands = state.pendingCommands || [],
+  allowPartial = false,
+  repairContext = state.activeRepairChain || null,
+  prompt = state.lastPrompt || input.value.trim(),
+  title = "写入失败证据"
+} = {}) {
+  const isError = errorOrResult instanceof Error;
+  const message = isError
+    ? errorOrResult.message
+    : (errorOrResult?.repairError || errorOrResult?.verification?.reason || errorOrResult?.status || "unknown failure");
+  const failedChecks = (errorOrResult?.verification?.checks || [])
+    .filter((check) => check.exitCode !== 0)
+    .map((check) => ({
+      command: check.command,
+      exitCode: check.exitCode,
+      output: String(check.output || "").slice(0, 3000)
+    }))
+    .slice(0, 5);
+  const patchFiles = patches.map((patch) => patch.path).filter(Boolean).slice(0, 20);
+  return [
+    "请基于这次 diff 写入 / 验证失败证据继续修复当前项目。",
+    "",
+    `证据类型：${title}`,
+    `状态：${isError ? "request_failed" : errorOrResult?.status || "failed"}`,
+    `错误/原因：${message}`,
+    `允许部分应用：${allowPartial ? "是" : "否"}`,
+    `待写入 diff 字节数：${String(diff || "").length}`,
+    `待写入文件数：${patchFiles.length}`,
+    "",
+    "原始需求：",
+    String(prompt || "").slice(0, 6000),
+    "",
+    "待写入文件：",
+    patchFiles.length ? patchFiles.map((file) => `- ${file}`).join("\n") : "- 无",
+    "",
+    "建议/验证命令：",
+    commands.length ? commands.map((item) => `- ${typeof item === "string" ? item : item.command || JSON.stringify(item)}`).join("\n") : "- 无",
+    "",
+    failedChecks.length ? "失败检查：" : "",
+    failedChecks.length ? JSON.stringify(failedChecks, null, 2).slice(0, 8000) : "",
+    "",
+    "待写入 diff：",
+    String(diff || "").slice(0, 12000),
+    "",
+    repairContext ? "当前修复证据链：" : "",
+    repairContext ? summarizeRepairEvidenceChain(repairContext) : "",
+    "",
+    "要求：先判断失败是 diff 过期、冲突、文件路径问题、写入异常、验证失败还是修复代理未产出 diff；需要改代码时输出最小 diff；如果应先部分应用或重新生成冲突解决草稿，请明确下一步安全动作。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendApplyFailureEvidence(errorOrResult, options = {}) {
+  const context = buildApplyFailureContext(errorOrResult, options);
+  appendToolCall({
+    title: options.title || "写入失败证据",
+    label: "fs",
+    state: errorOrResult?.status || "失败",
+    body: context.slice(0, 12000)
+  });
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="retry" ${state.pendingDiff ? "" : "disabled"}>重试写入</button><button type="button" data-action="partial" ${state.pendingDiff && !options.allowPartial ? "" : "disabled"}>部分应用</button><button type="button" data-action="repair">诊断修复</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    const current = input.value.trim();
+    input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "写入失败证据已加入提示词",
+      label: "fs",
+      state: "ready",
+      body: context.slice(0, 12000)
+    });
+    showToast("写入失败证据已加入提示词。");
+  });
+  actions.querySelector("[data-action='retry']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再重试写入。");
+      return;
+    }
+    applyPendingDiff({ allowPartial: Boolean(options.allowPartial) });
+  });
+  actions.querySelector("[data-action='partial']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再部分应用。");
+      return;
+    }
+    applyPendingDiff({ allowPartial: true });
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再启动写入诊断修复。");
+      return;
+    }
+    const prompt = [
+      context,
+      "",
+      "请现在直接基于这次写入失败证据继续修复：优先修正 diff、冲突、验证失败或写入恢复链路，并给出下一轮安全验证命令。"
+    ].join("\n");
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "已启动写入失败诊断修复",
+      label: "fs",
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于写入失败证据启动修复。");
+    submitPromptForm();
+  });
+  log.lastElementChild?.appendChild(actions);
+  return context;
+}
+
+function buildWorkspaceSafetyFailureContext(error, {
+  action = "workspace",
+  workspace = workspaceInput?.value.trim() || "",
+  checkpointId = "",
+  currentWorkspace = workspaceStatus?.textContent || "",
+  checkpoints = state.checkpoints || [],
+  pendingDiff = state.pendingDiff || "",
+  pendingPatches = state.pendingPatches || [],
+  lastPrompt = state.lastPrompt || ""
+} = {}) {
+  const message = error?.message || String(error || "unknown error");
+  return [
+    "请基于这次工作区安全操作失败证据继续修复当前项目。",
+    "",
+    `动作：${action}`,
+    `错误信息：${message}`,
+    currentWorkspace ? `当前工作区：${currentWorkspace}` : "",
+    workspace ? `目标工作区：${workspace}` : "",
+    checkpointId ? `checkpoint：${checkpointId}` : "",
+    `可用 checkpoint 数：${checkpoints.length}`,
+    `待审批 diff 字节数：${String(pendingDiff || "").length}`,
+    `待审批文件数：${pendingPatches.length}`,
+    "",
+    "上一轮需求：",
+    String(lastPrompt || "").slice(0, 6000),
+    "",
+    "待审批文件：",
+    pendingPatches.length ? pendingPatches.map((patch) => `- ${patch.path || ""}`).join("\n") : "- 无",
+    "",
+    "要求：先判断失败是路径不存在、权限不足、checkpoint 不属于当前工作区、回滚文件写入失败，还是 UI 状态恢复问题；需要改代码时输出最小 diff；不要绕过工作区和 checkpoint 安全校验。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendWorkspaceSafetyFailureEvidence(error, options = {}) {
+  const context = buildWorkspaceSafetyFailureContext(error, options);
+  appendToolCall({
+    title: options.title || "工作区安全操作失败证据",
+    label: options.label || "safe",
+    state: "失败",
+    body: context.slice(0, 12000)
+  });
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">诊断修复</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    const current = input.value.trim();
+    input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "工作区安全失败证据已加入提示词",
+      label: options.label || "safe",
+      state: "ready",
+      body: context.slice(0, 12000)
+    });
+    showToast("工作区安全失败证据已加入提示词。");
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再启动安全诊断修复。");
+      return;
+    }
+    const prompt = [
+      context,
+      "",
+      "请现在直接基于这次安全操作失败证据继续修复：优先补齐工作区切换、checkpoint 回滚、状态恢复或错误提示链路，并给出安全验证命令。"
+    ].join("\n");
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "已启动工作区安全失败诊断修复",
+      label: options.label || "safe",
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于工作区安全失败证据启动修复。");
+    submitPromptForm();
+  });
+  log.lastElementChild?.appendChild(actions);
+  return context;
+}
+
 async function createConflictResolutionDraftFromPanel() {
   const conflicts = state.conflictPreview?.conflictPreviews || [];
   if (!state.pendingDiff || !conflicts.length || !conflictResolutionPanel) {
     showToast("当前没有可解决的冲突。");
     return;
   }
-  const rows = [...conflictResolutionPanel.querySelectorAll(".conflict-resolution-row")];
-  const resolutions = rows.map((row) => {
-    const index = Number(row.dataset.index || 0);
-    const conflict = conflicts[index] || {};
-    return {
-      path: conflict.path,
-      hunk: conflict.hunk,
-      oldStart: conflict.oldStart,
-      resolved: row.querySelector("textarea")?.value || ""
-    };
-  }).filter((item) => item.path);
+  const resolutions = collectConflictResolutionsFromPanel();
   if (!resolutions.length) {
     showToast("请先填写 resolved 内容。");
     return;
@@ -459,15 +4161,40 @@ async function createConflictResolutionDraftFromPanel() {
     setBusy(false, "待解决审批");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "生成冲突解决草稿失败", label: "merge", state: "失败", body: error.message });
+    appendActionFailureEvidence({
+      kind: "merge",
+      action: "conflict-resolution-draft",
+      targetName: "conflict-resolution-draft",
+      endpoint: "/api/conflict-resolution-draft",
+      request: {
+        prompt: state.lastPrompt,
+        resolutions: resolutions.map((item) => ({
+          path: item.path,
+          conflictIndex: item.conflictIndex,
+          resolvedBytes: String(item.resolved || "").length
+        }))
+      },
+      item: {
+        conflictCount: conflicts.length,
+        resolutionCount: resolutions.length,
+        conflictPreview: state.conflictPreview
+      },
+      error
+    }, {
+      title: "生成冲突解决草稿失败",
+      label: "merge",
+      retry: createConflictResolutionDraftFromPanel,
+      safe: () => appendConflictResolutionToPrompt()
+    });
     setBusy(false, "冲突解决失败");
   }
 }
 
 function renderCommands(commands = []) {
-  state.pendingCommands = commands;
+  const commandItems = normalizeCommandItems(commands);
+  state.pendingCommands = commandItems;
   checksList.innerHTML = "";
-  if (!commands.length) {
+  if (!commandItems.length) {
     checksList.innerHTML = `
       <div class="check-row queued">
         <span></span>
@@ -476,18 +4203,65 @@ function renderCommands(commands = []) {
     `;
     return;
   }
-  commands.forEach((command) => {
+  const toolbar = renderCommandToolbar(commandItems, { title: "建议命令" });
+  if (toolbar) checksList.appendChild(toolbar);
+  commandItems.forEach((command) => {
+    const commandText = command.command;
+    const commandKey = commandResultKey(commandText);
     const row = document.createElement("div");
     row.className = "check-row queued command-row";
-    row.innerHTML = `<span></span><code></code><small></small>`;
-    row.querySelector("code").textContent = command.command || command;
+    row.dataset.commandKey = commandKey;
+    row.innerHTML = `<span></span><code></code><small></small><button type="button" data-action="copy-command">复制</button><button type="button" data-action="detail" hidden>详情</button><button type="button" data-action="copy-output" hidden>复制输出</button><button type="button" data-action="prompt-command" hidden>加入提示词</button><button type="button" data-action="reference-command-files" hidden>引用文件</button><button type="button" data-action="run">运行</button>`;
+    row.querySelector("code").textContent = commandText;
     const policy = command.policy;
-    row.querySelector("small").textContent = [
+    row.dataset.meta = [
       command.reason || "",
       policy ? `policy: ${policy.risk} · ${policy.reason}` : ""
     ].filter(Boolean).join(" · ");
+    renderCommandRowStatus(row, commandText, state.commandResults[commandKey] || null);
+    row.querySelector("[data-action='copy-command']").addEventListener("click", async () => {
+      const copied = await copyText(commandText);
+      appendToolCall({
+        title: copied ? `已复制命令：${commandText}` : `复制命令失败：${commandText}`,
+        label: "$",
+        state: copied ? "完成" : "失败",
+        body: copyLogBody(copied, commandText)
+      });
+      showToast(copied ? "命令已复制。" : copyFailureSummary());
+    });
+    row.querySelector("[data-action='run']").addEventListener("click", async () => {
+      await runSuggestedCommand(commandText, { single: true });
+    });
     checksList.appendChild(row);
   });
+}
+
+function stageRepairVerificationCommands(commands = [], { title = "修复验证命令", successTitle = "", source = "repair", note = "" } = {}) {
+  const items = normalizeCommandItems(commands);
+  if (!items.length) {
+    appendToolCall({
+      title: `${title}未生成`,
+      label: "$",
+      state: "跳过",
+      body: note || "修复候选没有提供下一步验证命令。"
+    });
+    return [];
+  }
+  renderCommands(items);
+  items.forEach((item) => {
+    rememberCommand(item.command, {
+      reason: item.reason || title,
+      source
+    });
+  });
+  appendToolCall({
+    title: successTitle || `${title}已放入命令面板`,
+    label: "$",
+    state: `${items.length} 条`,
+    body: items.map((item) => `$ ${item.command}${item.reason ? `\n  ${item.reason}` : ""}`).join("\n")
+  });
+  showToast(`${items.length} 条${title}已放入命令面板。`);
+  return items;
 }
 
 function renderReview(review = []) {
@@ -499,12 +4273,403 @@ function renderReview(review = []) {
   review.forEach((item) => {
     const row = document.createElement("div");
     row.className = `review-row ${item.severity || "info"}`;
-    row.innerHTML = `<strong></strong><p></p><small></small>`;
+    row.innerHTML = `<strong></strong><p></p><small></small><div class="review-actions"><button type="button" data-review-action="draft-fix">生成修复提示</button><button type="button" data-review-action="run-fix">直接修复</button></div>`;
     row.querySelector("strong").textContent = item.severity || "info";
     row.querySelector("p").textContent = item.message || "";
     row.querySelector("small").textContent = [item.file, item.line].filter(Boolean).join(":");
+    row.querySelector("[data-review-action='draft-fix']").addEventListener("click", () => {
+      const prompt = buildReviewFixPrompt(item);
+      input.value = prompt;
+      input.focus();
+      scheduleReferencePreview({ immediate: true });
+      appendToolCall({
+        title: "已生成审查修复提示",
+        label: "review",
+        state: "ready",
+        body: prompt
+      });
+      showToast("审查修复提示已填入输入框。");
+    });
+    row.querySelector("[data-review-action='run-fix']").addEventListener("click", () => {
+      if (state.busy) {
+        showToast("代理正在运行，请稍后再发起修复。");
+        return;
+      }
+      const prompt = buildReviewFixPrompt(item);
+      input.value = prompt;
+      scheduleReferencePreview({ immediate: true });
+      appendToolCall({
+        title: "已启动审查修复",
+        label: "review",
+        state: "running",
+        body: prompt
+      });
+      showToast("正在启动审查修复代理。");
+      submitPromptForm();
+    });
     reviewList.appendChild(row);
   });
+}
+
+function reviewArtifactFiles(artifact = {}) {
+  const files = [
+    ...(artifact.changedFiles || []),
+    ...(artifact.git?.changedFiles || []),
+    ...(artifact.patches || []).map((patch) => patch.path),
+    ...(artifact.review || []).map((item) => item.file)
+  ];
+  return [...new Set(files.map((file) => String(file || "").trim()).filter(Boolean))].slice(0, 16);
+}
+
+function buildReviewArtifactPromptContext(artifact = {}) {
+  if (!artifact?.id) return "";
+  const files = reviewArtifactFiles(artifact);
+  const findings = (artifact.review || [])
+    .slice(0, 12)
+    .map((item, index) => {
+      const location = [item.file, item.line].filter(Boolean).join(":");
+      return `${index + 1}. [${item.severity || "info"}] ${location ? `${location} ` : ""}${item.message || ""}`;
+    })
+    .join("\n");
+  const commands = normalizeCommandItems(artifact.commands || [])
+    .slice(0, 10)
+    .map((item) => `- $ ${item.command}${item.reason ? `\n  ${item.reason}` : ""}`)
+    .join("\n");
+  return [
+    "请基于这条历史审查证据继续修复当前项目。",
+    "",
+    `审查 ID：${artifact.id}`,
+    artifact.prompt ? `原始需求：${artifact.prompt}` : "",
+    artifact.reply ? `审查摘要：${artifact.reply}` : artifact.summary ? `审查摘要：${artifact.summary}` : "",
+    files.length ? `优先读取相关文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
+    findings ? `审查发现：\n${findings}` : "",
+    commands ? `建议验证命令：\n${commands}` : "",
+    artifact.git?.status?.length ? `Git 状态：${artifact.git.status.length} 个改动` : "",
+    "",
+    "要求：先读取相关文件；逐条处理审查发现；生成最小 diff；给出下一轮安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendReviewArtifactContextToPrompt(artifact = {}) {
+  const context = buildReviewArtifactPromptContext(artifact);
+  if (!context) {
+    showToast("暂无可加入提示词的审查证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `审查证据已加入提示词：${artifact.id}`,
+    label: "review",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("审查证据已加入提示词。");
+  return context;
+}
+
+function runReviewArtifactRepair(artifact = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动审查修复。");
+    return "";
+  }
+  const context = buildReviewArtifactPromptContext(artifact);
+  if (!context) {
+    showToast("暂无可用于修复的审查证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这条历史审查证据启动修复：优先处理高风险发现，输出最小 diff，并给出下一轮安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动历史审查修复：${artifact.id}`,
+    label: "review",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于历史审查证据启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function buildReviewArtifactVerificationPrompt(artifact = {}) {
+  const context = buildReviewArtifactPromptContext(artifact);
+  if (!context) return "";
+  const commands = normalizeCommandItems(artifact.commands || []);
+  const fallbackCommands = [
+    "node --check app.js",
+    "node --check server.js",
+    "node server.js --ui-smoke-test",
+    "node server.js --api-smoke-section=coding"
+  ];
+  const commandLines = (commands.length ? commands.map((item) => item.command) : fallbackCommands)
+    .filter(Boolean)
+    .slice(0, 8);
+  return [
+    context,
+    "",
+    "目标：把这条审查证据转成可验证修复闭环。",
+    "",
+    "建议验证命令：",
+    ...commandLines.map((command) => `- ${command}`),
+    "",
+    "输出要求：",
+    "1. 先按 severity 和真实风险排序审查发现。",
+    "2. 如果需要改代码，请生成最小 diff，避免无关重构。",
+    "3. 修复后必须说明每条审查发现的处理结果：已修复、误报或需要后续输入。",
+    "4. 必须给出可在当前工作区安全运行的验证命令，并优先复用上面的命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendReviewArtifactVerificationPromptToPrompt(artifact = {}) {
+  const prompt = buildReviewArtifactVerificationPrompt(artifact);
+  if (!prompt) {
+    showToast("暂无可生成验证提示的审查证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `审查验证提示已加入提示词：${artifact.id || "review"}`,
+    label: "review",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("审查验证提示已加入提示词。");
+  return prompt;
+}
+
+function runReviewArtifactVerificationFix(artifact = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动审查验证修复。");
+    return "";
+  }
+  const prompt = buildReviewArtifactVerificationPrompt(artifact);
+  if (!prompt) {
+    showToast("暂无可运行的审查验证修复提示。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动审查验证修复：${artifact.id || "review"}`,
+    label: "review",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动带验证要求的审查修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendReviewArtifactFailureEvidence(artifact = {}, error, {
+  title = "历史审查动作失败",
+  action = "review-artifact-action",
+  endpoint = "/api/review-artifact",
+  request = null,
+  retry = null,
+  safe = null
+} = {}) {
+  return appendActionFailureEvidence({
+    kind: "review",
+    action,
+    targetName: artifact.id || artifact.summary || "review-artifact",
+    endpoint,
+    request: request || { id: artifact.id || "" },
+    item: {
+      id: artifact.id || "",
+      summary: artifact.summary || artifact.prompt || "",
+      findingCount: artifact.findingCount || 0,
+      commandCount: artifact.commandCount || 0,
+      createdAt: artifact.createdAt || ""
+    },
+    error
+  }, { title, label: "review", retry, safe });
+}
+
+function buildReviewCommentsContext(draft = {}) {
+  if (!draft?.id && !draft?.comments?.length && !draft?.body) return "";
+  const ready = (draft.comments || []).filter((item) => item.ready);
+  const needsMapping = (draft.comments || []).filter((item) => !item.ready);
+  const readyLines = ready
+    .slice(0, 12)
+    .map((item, index) => `${index + 1}. [${item.severity || "info"}] ${item.path}:${item.line} ${item.body || ""}`)
+    .join("\n");
+  const mappingLines = needsMapping
+    .slice(0, 8)
+    .map((item, index) => `${index + 1}. [${item.severity || "info"}] ${item.path || "(missing file)"}:${item.sourceLine || "(missing line)"} ${item.body || ""}`)
+    .join("\n");
+  return [
+    "请基于这份 PR 评论草稿继续修复当前项目。",
+    "",
+    `审查 ID：${draft.id || draft.artifact?.id || ""}`,
+    draft.status ? `草稿状态：${draft.status}` : "",
+    draft.summary ? `摘要：${JSON.stringify(draft.summary)}` : "",
+    draft.artifact?.prompt ? `原始需求：${draft.artifact.prompt}` : "",
+    draft.artifact?.summary ? `审查摘要：${draft.artifact.summary}` : "",
+    "",
+    readyLines ? `可映射行级评论：\n${readyLines}` : "可映射行级评论：(无)",
+    mappingLines ? `需要补映射的评论：\n${mappingLines}` : "",
+    "",
+    draft.body ? `评论草稿正文：\n${String(draft.body).slice(0, 8000)}` : "",
+    "",
+    "要求：先读取涉及文件；优先修复 ready comments 对应的真实问题；对 needs_mapping 项补充文件/行号或说明无法映射原因；生成最小 diff，并给出安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendReviewCommentsToPrompt(draft = {}) {
+  const context = buildReviewCommentsContext(draft);
+  if (!context) {
+    showToast("暂无可加入提示词的 PR 评论草稿。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `PR 评论草稿已加入提示词：${draft.id || draft.artifact?.id || "review"}`,
+    label: "review",
+    state: draft.status || "drafted",
+    body: context.slice(0, 12000)
+  });
+  showToast("PR 评论草稿已加入提示词。");
+  return context;
+}
+
+function runReviewCommentsRepair(draft = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再按评论修复。");
+    return "";
+  }
+  const context = buildReviewCommentsContext(draft);
+  if (!context) {
+    showToast("暂无可用于修复的 PR 评论草稿。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接按这份 PR 评论草稿修复：优先处理 error/warning，补齐无法映射的评论线索，输出最小可审批 diff 和验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动 PR 评论修复：${draft.id || draft.artifact?.id || "review"}`,
+    label: "review",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于 PR 评论草稿启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function buildReviewCommentsVerificationPrompt(draft = {}) {
+  const context = buildReviewCommentsContext(draft);
+  if (!context) return "";
+  const commands = normalizeCommandItems(draft.artifact?.commands || draft.commands || []);
+  const fallbackCommands = [
+    "node --check app.js",
+    "node --check server.js",
+    "node server.js --ui-smoke-test",
+    "node server.js --api-smoke-section=coding"
+  ];
+  const commandLines = (commands.length ? commands.map((item) => item.command) : fallbackCommands)
+    .filter(Boolean)
+    .slice(0, 8);
+  return [
+    context,
+    "",
+    "目标：把这份 PR 评论草稿转成可验证修复闭环。",
+    "",
+    "建议验证命令：",
+    ...commandLines.map((command) => `- ${command}`),
+    "",
+    "输出要求：",
+    "1. 先处理 ready comments 中已能定位到文件和行号的问题。",
+    "2. 对 needs_mapping 评论补充文件/行号线索，或说明无法映射原因。",
+    "3. 如果需要改代码，请生成最小 diff，避免无关重构。",
+    "4. 修复后必须给出安全验证命令，并说明哪些评论已经闭环。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendReviewCommentsVerificationPromptToPrompt(draft = {}) {
+  const prompt = buildReviewCommentsVerificationPrompt(draft);
+  if (!prompt) {
+    showToast("暂无可生成验证提示的 PR 评论草稿。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `PR 评论验证提示已加入提示词：${draft.id || draft.artifact?.id || "review"}`,
+    label: "review",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("PR 评论验证提示已加入提示词。");
+  return prompt;
+}
+
+function runReviewCommentsVerificationFix(draft = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动 PR 评论验证修复。");
+    return "";
+  }
+  const prompt = buildReviewCommentsVerificationPrompt(draft);
+  if (!prompt) {
+    showToast("暂无可运行的 PR 评论验证修复提示。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动 PR 评论验证修复：${draft.id || draft.artifact?.id || "review"}`,
+    label: "review",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动带验证要求的 PR 评论修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendReviewCommentsCard(draft = {}) {
+  appendToolCall({
+    title: `PR 评论草稿：${draft.id || draft.artifact?.id || "review"}`,
+    label: "review",
+    state: draft.status || "drafted",
+    body: JSON.stringify(draft, null, 2).slice(0, 12000)
+  });
+  const article = log.lastElementChild;
+  if (!article) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="repair">按评论修复</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendReviewCommentsToPrompt(draft);
+  });
+  actions.querySelector("[data-action='verification-prompt']").addEventListener("click", () => {
+    appendReviewCommentsVerificationPromptToPrompt(draft);
+  });
+  actions.querySelector("[data-action='verification-fix']").addEventListener("click", () => {
+    runReviewCommentsVerificationFix(draft);
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    runReviewCommentsRepair(draft);
+  });
+  article.appendChild(actions);
 }
 
 function renderReviewArtifacts(reviews = []) {
@@ -517,36 +4682,108 @@ function renderReviewArtifacts(reviews = []) {
   reviews.slice(0, 6).forEach((artifact) => {
     const row = document.createElement("div");
     row.className = `queue-row ${artifact.findingCount ? "active" : "done"}`;
-    row.innerHTML = `<strong></strong><small></small><button type="button" data-action="view">查看</button><button type="button" data-action="comments">评论草稿</button>`;
+    row.innerHTML = `<strong></strong><small></small><span class="queue-row-actions"><button type="button" data-action="view">查看</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="run-fix">直接修复</button><button type="button" data-action="comments">评论草稿</button></span>`;
     row.querySelector("strong").textContent = artifact.summary || artifact.prompt || artifact.id;
     row.querySelector("small").textContent = `${artifact.findingCount || 0} 条发现 · ${artifact.commandCount || 0} 条命令 · ${artifact.createdAt?.slice(0, 19) || ""}`;
+    const getDetail = async () => await api(`/api/review-artifact?id=${encodeURIComponent(artifact.id)}`);
     row.querySelector("[data-action='view']").addEventListener("click", async () => {
-      try {
-        const detail = await api(`/api/review-artifact?id=${encodeURIComponent(artifact.id)}`);
+      const viewReviewArtifact = async () => {
+        const detail = await getDetail();
         appendToolCall({
           title: `审查记录：${artifact.id}`,
           label: "review",
           state: "完成",
           body: JSON.stringify(detail, null, 2).slice(0, 12000)
         });
+      };
+      try {
+        await viewReviewArtifact();
       } catch (error) {
         showToast(error.message);
+        appendReviewArtifactFailureEvidence(artifact, error, {
+          title: `查看审查记录失败：${artifact.id}`,
+          action: "review-artifact-view",
+          retry: viewReviewArtifact,
+          safe: () => appendReviewArtifactContextToPrompt(artifact)
+        });
+      }
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", async () => {
+      const promptReviewArtifact = async () => appendReviewArtifactContextToPrompt(await getDetail());
+      try {
+        await promptReviewArtifact();
+      } catch (error) {
+        showToast(error.message);
+        appendReviewArtifactFailureEvidence(artifact, error, {
+          title: `审查证据加入提示词失败：${artifact.id}`,
+          action: "review-artifact-prompt",
+          retry: promptReviewArtifact,
+          safe: () => appendReviewArtifactContextToPrompt(artifact)
+        });
+      }
+    });
+    row.querySelector("[data-action='verification-prompt']").addEventListener("click", async () => {
+      const promptReviewArtifactVerification = async () => appendReviewArtifactVerificationPromptToPrompt(await getDetail());
+      try {
+        await promptReviewArtifactVerification();
+      } catch (error) {
+        showToast(error.message);
+        appendReviewArtifactFailureEvidence(artifact, error, {
+          title: `审查验证提示生成失败：${artifact.id}`,
+          action: "review-artifact-verification-prompt",
+          retry: promptReviewArtifactVerification,
+          safe: () => appendReviewArtifactContextToPrompt(artifact)
+        });
+      }
+    });
+    row.querySelector("[data-action='verification-fix']").addEventListener("click", async () => {
+      const repairReviewArtifactVerification = async () => runReviewArtifactVerificationFix(await getDetail());
+      try {
+        await repairReviewArtifactVerification();
+      } catch (error) {
+        showToast(error.message);
+        appendReviewArtifactFailureEvidence(artifact, error, {
+          title: `审查验证修复启动失败：${artifact.id}`,
+          action: "review-artifact-verification-fix",
+          retry: repairReviewArtifactVerification,
+          safe: () => appendReviewArtifactContextToPrompt(artifact)
+        });
+      }
+    });
+    row.querySelector("[data-action='run-fix']").addEventListener("click", async () => {
+      const repairReviewArtifact = async () => runReviewArtifactRepair(await getDetail());
+      try {
+        await repairReviewArtifact();
+      } catch (error) {
+        showToast(error.message);
+        appendReviewArtifactFailureEvidence(artifact, error, {
+          title: `历史审查直接修复失败：${artifact.id}`,
+          action: "review-artifact-run-fix",
+          retry: repairReviewArtifact,
+          safe: () => appendReviewArtifactContextToPrompt(artifact)
+        });
       }
     });
     row.querySelector("[data-action='comments']").addEventListener("click", async () => {
-      try {
+      const draftReviewComments = async () => {
         const draft = await api("/api/review-comments", {
           method: "POST",
           body: JSON.stringify({ id: artifact.id })
         });
-        appendToolCall({
-          title: `PR 评论草稿：${artifact.id}`,
-          label: "review",
-          state: draft.status || "drafted",
-          body: JSON.stringify(draft, null, 2).slice(0, 12000)
-        });
+        appendReviewCommentsCard(draft);
+      };
+      try {
+        await draftReviewComments();
       } catch (error) {
         showToast(error.message);
+        appendReviewArtifactFailureEvidence(artifact, error, {
+          title: `生成 PR 评论草稿失败：${artifact.id}`,
+          action: "review-comments-draft",
+          endpoint: "/api/review-comments",
+          request: { id: artifact.id || "" },
+          retry: draftReviewComments,
+          safe: () => appendReviewArtifactContextToPrompt(artifact)
+        });
       }
     });
     reviewArtifactList.appendChild(row);
@@ -555,6 +4792,7 @@ function renderReviewArtifacts(reviews = []) {
 
 function renderVerification(verification) {
   if (!verification?.checks?.length) {
+    state.pendingCommands = [];
     checksList.innerHTML = `
       <div class="check-row queued">
         <span></span>
@@ -563,22 +4801,60 @@ function renderVerification(verification) {
     `;
     return;
   }
+  const commandItems = normalizeCommandItems(verification.checks.map((check) => ({
+    command: check.command || "",
+    reason: "自动检查结果",
+    policy: check.policy || null
+  })));
+  state.pendingCommands = commandItems;
   checksList.innerHTML = "";
+  const toolbar = renderCommandToolbar(commandItems, { title: "自动检查命令" });
+  if (toolbar) checksList.appendChild(toolbar);
   verification.checks.forEach((check) => {
+    const commandText = check.command || "";
+    const commandKey = commandResultKey(commandText);
+    if (commandText) {
+      state.commandResults[commandKey] = { status: "done", result: check, error: "" };
+    }
     const row = document.createElement("div");
-    row.className = `check-row command-row ${check.exitCode === 0 ? "passed" : "failed"}`;
-    row.innerHTML = `<span></span><code></code><small></small>`;
-    row.querySelector("code").textContent = check.command;
-    row.querySelector("small").textContent = [
-      check.exitCode === 0 ? "通过" : `失败 exit ${check.exitCode}`,
-      check.policy ? `policy: ${check.policy.risk}` : ""
+    row.className = "check-row queued command-row";
+    row.dataset.commandKey = commandKey;
+    row.innerHTML = `<span></span><code></code><small></small><button type="button" data-action="copy-command">复制</button><button type="button" data-action="detail">详情</button><button type="button" data-action="copy-output">复制输出</button><button type="button" data-action="prompt-command">加入提示词</button><button type="button" data-action="reference-command-files">引用文件</button><button type="button" data-action="run">重跑</button>`;
+    row.querySelector("code").textContent = commandText || "检查命令";
+    row.dataset.meta = [
+      "自动检查结果",
+      check.policy ? `policy: ${check.policy.risk} · ${check.policy.reason || ""}` : ""
     ].filter(Boolean).join(" · ");
+    renderCommandRowStatus(row, commandText, commandText ? state.commandResults[commandKey] : { status: "done", result: check, error: "" });
+    row.querySelector("[data-action='copy-command']").addEventListener("click", async () => {
+      if (!commandText) {
+        showToast("这条检查没有可复制命令。");
+        return;
+      }
+      const copied = await copyText(commandText);
+      appendToolCall({
+        title: copied ? `已复制检查命令：${commandText}` : `复制检查命令失败：${commandText}`,
+        label: "$",
+        state: copied ? "完成" : "失败",
+        body: copyLogBody(copied, commandText)
+      });
+      showToast(copied ? "检查命令已复制。" : copyFailureSummary());
+    });
+    row.querySelector("[data-action='run']").addEventListener("click", async () => {
+      if (!commandText) {
+        showToast("这条检查没有可重跑命令。");
+        return;
+      }
+      await runSuggestedCommand(commandText, { single: true });
+    });
     checksList.appendChild(row);
   });
 }
 
-function renderVerificationPlan(plan) {
-  if (!plan?.gates?.length) {
+function renderVerificationPlan(plan, { logCommands = false } = {}) {
+  const commandItems = normalizeCommandItems(plan?.commands || []);
+  if (!plan?.gates?.length && !commandItems.length) {
+    state.pendingCommands = [];
     checksList.innerHTML = `
       <div class="check-row queued">
         <span></span>
@@ -588,10 +4864,57 @@ function renderVerificationPlan(plan) {
     return;
   }
   checksList.innerHTML = "";
-  plan.gates.forEach((gate) => {
+  state.pendingCommands = commandItems;
+  if (commandItems.length) {
+    const toolbar = renderCommandToolbar(commandItems, { title: "快捷检查命令" });
+    if (toolbar) checksList.appendChild(toolbar);
+    commandItems.forEach((command) => {
+      const commandText = command.command;
+      const commandKey = commandResultKey(commandText);
+      const row = document.createElement("div");
+      row.className = "check-row queued command-row";
+      row.dataset.commandKey = commandKey;
+      row.innerHTML = `<span></span><code></code><small></small><button type="button" data-action="copy-command">复制</button><button type="button" data-action="detail" hidden>详情</button><button type="button" data-action="copy-output" hidden>复制输出</button><button type="button" data-action="prompt-command" hidden>加入提示词</button><button type="button" data-action="reference-command-files" hidden>引用文件</button><button type="button" data-action="run">运行</button>`;
+      row.querySelector("code").textContent = commandText;
+      row.dataset.meta = [
+        command.reason || "验证门禁建议",
+        command.policy ? `policy: ${command.policy.risk} · ${command.policy.reason || ""}` : ""
+      ].filter(Boolean).join(" · ");
+      renderCommandRowStatus(row, commandText, state.commandResults[commandKey] || null);
+      row.querySelector("[data-action='copy-command']").addEventListener("click", async () => {
+        const copied = await copyText(commandText);
+        appendToolCall({
+          title: copied ? `已复制快捷检查命令：${commandText}` : `复制快捷检查命令失败：${commandText}`,
+          label: "$",
+          state: copied ? "完成" : "失败",
+          body: copyLogBody(copied, commandText)
+        });
+        showToast(copied ? "快捷检查命令已复制。" : copyFailureSummary());
+      });
+      row.querySelector("[data-action='run']").addEventListener("click", async () => {
+        await runSuggestedCommand(commandText, { single: true });
+      });
+      checksList.appendChild(row);
+      if (logCommands) {
+        rememberCommand(commandText, {
+          reason: command.reason || "验证门禁建议",
+          source: "verification-plan"
+        });
+      }
+    });
+    if (logCommands) {
+      appendToolCall({
+        title: "快捷检查命令已发现",
+        label: "$",
+        state: `${commandItems.length} 条`,
+        body: commandItems.map((item) => `$ ${item.command}${item.reason ? `\n  ${item.reason}` : ""}`).join("\n")
+      });
+    }
+  }
+  (plan.gates || []).forEach((gate) => {
     const row = document.createElement("div");
     const ok = ["ready", "passing", "clean"].includes(gate.status);
-    row.className = `check-row command-row ${ok ? "passed" : "failed"}`;
+    row.className = `check-row verification-gate-row ${ok ? "passed" : "failed"}`;
     row.innerHTML = `<span></span><code></code><small></small>`;
     row.querySelector("code").textContent = gate.label || gate.id;
     row.querySelector("small").textContent = `${gate.status || "unknown"} · ${gate.evidence?.length || 0} evidence`;
@@ -611,6 +4934,765 @@ function renderGit(git) {
   if (worktreeBtn) worktreeBtn.disabled = state.busy || Boolean(git.status?.length);
 }
 
+function taskEvidenceFiles(task = {}) {
+  const files = [
+    ...(task.changedFiles || []),
+    ...(task.repairContext?.repair?.files || []),
+    ...(task.repairContext?.apply?.changedFiles || []),
+    ...(task.conflicts || []).map((item) => item.path).filter(Boolean)
+  ];
+  return [...new Set(files.map((file) => String(file || "").trim()).filter(Boolean))].slice(0, 16);
+}
+
+function buildTaskPromptContext(task = {}) {
+  if (!task?.id) return "";
+  const files = taskEvidenceFiles(task);
+  const recommendedCapability = recommendedCapabilityFromState();
+  const recommendedCapabilityContext = recommendedCapability ? buildCapabilityGapContext(recommendedCapability) : "";
+  const checks = (task.checks || [])
+    .slice(0, 12)
+    .map((check, index) => `${index + 1}. ${check.exitCode === 0 ? "PASS" : "FAIL"} $ ${check.command || ""}${check.reason ? `\n   ${check.reason}` : ""}${check.output ? `\n   输出：${summarizeCommandOutput(check.output)}` : ""}`)
+    .join("\n");
+  const selectedHunks = Array.isArray(task.selectedHunks) && task.selectedHunks.length
+    ? task.selectedHunks
+      .slice(0, 12)
+      .map((item) => `- ${item.path || "unknown"}：${item.selectedHunks || 0}/${item.totalHunks || "?"} hunk`)
+      .join("\n")
+    : "";
+  const failedCommands = (task.failedCommands || [])
+    .filter(Boolean)
+    .slice(0, 8)
+    .map((command) => `- $ ${command}`)
+    .join("\n");
+  const verificationCommands = [
+    ...(task.verificationCommands || []),
+    ...(task.checks || []).map((check) => check.command)
+  ]
+    .filter(Boolean)
+    .filter((command, index, list) => list.indexOf(command) === index)
+    .slice(0, 8)
+    .map((command) => `- ${command}`)
+    .join("\n");
+  const repair = task.repairContext ? [
+    `修复链：${task.repairContext.status || "unknown"}`,
+    task.repairContext.recommendedAction?.command ? `推荐动作：${task.repairContext.recommendedAction.label || task.repairContext.recommendedAction.id || "debug action"} · $ ${task.repairContext.recommendedAction.command}` : "",
+    task.repairContext.commandRun?.status ? `命令运行：${task.repairContext.commandRun.status} · exit ${task.repairContext.commandRun.exitCode ?? "?"} · ${task.repairContext.commandRun.outputSummary || ""}` : "",
+    task.repairContext.command ? `失败命令：$ ${task.repairContext.command}` : "",
+    task.repairContext.failure?.outputSummary ? `失败摘要：${task.repairContext.failure.outputSummary}` : "",
+    task.repairContext.diagnostics?.summary ? `诊断摘要：${JSON.stringify(task.repairContext.diagnostics.summary)}` : ""
+  ].filter(Boolean).join("\n") : "";
+  return [
+    "请基于这条历史任务证据继续推进当前代码修改或调试。",
+    "",
+    `任务 ID：${task.id}`,
+    `任务状态：${task.status || "unknown"}`,
+    task.prompt ? `原始需求：${task.prompt}` : "",
+    task.checkpointId ? `Checkpoint：${task.checkpointId}` : "",
+    files.length ? `相关文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
+    selectedHunks ? `部分应用 hunk：\n${selectedHunks}` : "",
+    checks ? `检查记录：\n${checks}` : "",
+    failedCommands ? `失败命令：\n${failedCommands}` : "",
+    verificationCommands ? `可重跑验证命令：\n${verificationCommands}` : "",
+    repair ? `修复证据：\n${repair}` : "",
+    recommendedCapabilityContext ? `推荐能力缺口：\n${recommendedCapabilityContext}` : "",
+    task.git?.status?.length ? `Git 状态：${task.git.status.length} 个改动` : "",
+    "",
+    "要求：先读取相关文件；保留已有正确改动；优先结合推荐能力缺口和任务检查记录继续；给出最小 diff 和可运行验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendTaskContextToPrompt(task = {}) {
+  const context = buildTaskPromptContext(task);
+  if (!context) {
+    showToast("暂无可加入提示词的任务证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `任务证据已加入提示词：${task.id}`,
+    label: "log",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("任务证据已加入提示词。");
+  return context;
+}
+
+function runTaskContinuation(task = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再继续历史任务。");
+    return "";
+  }
+  const context = buildTaskPromptContext(task);
+  if (!context) {
+    showToast("暂无可用于继续的任务证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这条历史任务证据继续推进：先读取相关文件，保留已有正确改动，生成最小 diff，并给出下一轮安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动任务证据继续：${task.id}`,
+    label: "log",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于历史任务证据继续。");
+  submitPromptForm();
+  return prompt;
+}
+
+function referenceTaskFilesInPrompt(task = {}) {
+  const files = taskEvidenceFiles(task);
+  if (!files.length) {
+    showToast("这条任务没有可引用的变更文件。");
+    return [];
+  }
+  const current = input.value.trim();
+  const currentLower = current.toLowerCase();
+  const refs = files
+    .map((file) => `@${file}`)
+    .filter((ref) => !currentLower.includes(ref.toLowerCase()));
+  input.value = [current, refs.join(" ")].filter(Boolean).join(current ? "\n" : "");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已引用任务文件：${task.id}`,
+    label: "ctx",
+    state: `${files.length} files`,
+    body: files.map((file) => `@${file}`).join("\n")
+  });
+  showToast(`已引用 ${files.length} 个任务相关文件。`);
+  return files;
+}
+
+async function stageTaskVerificationCommands(task = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再生成任务验证命令。");
+    return [];
+  }
+  const previousCommands = (task.checks || [])
+    .map((check) => check.command)
+    .filter(Boolean);
+  const commands = [
+    ...(task.verificationCommands || []),
+    ...(task.failedCommands || []),
+    ...previousCommands,
+    ...state.pendingCommands.map((item) => item.command || item)
+  ].filter((command, index, list) => command && list.indexOf(command) === index);
+  setBusy(true, "生成任务验证命令");
+  try {
+    const result = await api("/api/verification-plan", {
+      method: "POST",
+      body: JSON.stringify({ limit: 12, commands })
+    });
+    const planCommands = verificationPlanCommands(result.plan);
+    if (!planCommands.length) {
+      appendToolCall({
+        title: `历史任务验证命令未生成：${task.id || "task"}`,
+        label: "$",
+        state: "跳过",
+        body: JSON.stringify(result.plan || {}, null, 2).slice(0, 8000)
+      });
+      showToast("当前历史任务没有可复用验证命令。");
+      setBusy(false, "无验证命令");
+      return [];
+    }
+    renderVerificationPlan(result.plan, { logCommands: true });
+    stageRepairVerificationCommands(planCommands, {
+      title: "历史任务验证命令",
+      successTitle: `历史任务验证命令已放入面板：${task.id || "task"}`,
+      source: "task-history"
+    });
+    appendToolCall({
+      title: `历史任务验证上下文：${task.id || "task"}`,
+      label: "log",
+      state: result.plan?.status || "ready",
+      body: [
+        task.prompt ? `任务：${task.prompt}` : "",
+        task.status ? `状态：${task.status}` : "",
+        recommendedCapabilityFromState()?.area ? `推荐缺口：${recommendedCapabilityFromState().area}` : "",
+        "",
+        commandItemsToText(planCommands)
+      ].filter(Boolean).join("\n").slice(0, 12000)
+    });
+    setBusy(false, "任务验证命令已加入");
+    return planCommands;
+  } catch (error) {
+    showToast(error.message);
+    appendTaskFailureEvidence(task, error, {
+      title: `历史任务验证命令生成失败：${task.id || "task"}`,
+      action: "task-verification-commands",
+      endpoint: "/api/verification-plan",
+      request: {
+        id: task.id || "",
+        commands
+      },
+      retry: () => stageTaskVerificationCommands(task),
+      safe: () => appendTaskContextToPrompt(task)
+    });
+    setBusy(false, "任务验证命令失败");
+    return [];
+  }
+}
+
+function buildTaskVerificationPrompt(task = {}) {
+  const context = buildTaskPromptContext(task);
+  if (!context) return "";
+  const previousCommands = (task.checks || [])
+    .map((check) => check.command)
+    .filter(Boolean);
+  const taskRecoveryCommands = [
+    ...(task.verificationCommands || []),
+    ...(task.failedCommands || [])
+  ].filter(Boolean);
+  const pendingCommands = (state.pendingCommands || [])
+    .map((item) => item.command || item)
+    .filter(Boolean);
+  const fallbackCommands = [
+    "node --check app.js",
+    "node --check server.js",
+    "node server.js --ui-smoke-test",
+    "node server.js --api-smoke-section=debug"
+  ];
+  const commandLines = [...new Set([...taskRecoveryCommands, ...previousCommands, ...pendingCommands])]
+    .filter(Boolean)
+    .slice(0, 8);
+  const commands = commandLines.length ? commandLines : fallbackCommands;
+  return [
+    context,
+    "",
+    "目标：把这条历史任务证据转成可验证修复闭环。",
+    "",
+    "建议验证命令：",
+    ...commands.map((command) => `- ${command}`),
+    "",
+    "输出要求：",
+    "1. 先判断历史任务中哪些改动、检查结果或失败输出仍然影响当前工作区。",
+    "2. 如果需要改代码，请生成最小 diff，保留已有正确改动。",
+    "3. 修复后必须说明历史检查、推荐能力缺口和当前验证命令的处理结果。",
+    "4. 必须给出可在当前工作区安全运行的验证命令，并优先复用上面的命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendTaskVerificationPromptToPrompt(task = {}) {
+  const prompt = buildTaskVerificationPrompt(task);
+  if (!prompt) {
+    showToast("暂无可生成验证提示的任务证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `任务验证提示已加入提示词：${task.id || "task"}`,
+    label: "log",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("任务验证提示已加入提示词。");
+  return prompt;
+}
+
+function runTaskVerificationFix(task = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动任务验证修复。");
+    return "";
+  }
+  const prompt = buildTaskVerificationPrompt(task);
+  if (!prompt) {
+    showToast("暂无可运行的任务验证修复提示。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动任务验证修复：${task.id || "task"}`,
+    label: "log",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动带验证要求的历史任务修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendTaskFailureEvidence(task = {}, error, {
+  title = "历史任务动作失败",
+  action = "task-action",
+  endpoint = "/api/task",
+  request = null,
+  retry = null,
+  safe = null
+} = {}) {
+  return appendActionFailureEvidence({
+    kind: "task",
+    action,
+    targetName: task.id || task.prompt || "task",
+    endpoint,
+    request: request || { id: task.id || "" },
+    item: {
+      id: task.id || "",
+      status: task.status || "",
+      prompt: task.prompt || "",
+      changedFiles: (task.changedFiles || []).slice(0, 12),
+      checksOk: Boolean(task.checksOk),
+      checkpointId: task.checkpointId || "",
+      createdAt: task.createdAt || ""
+    },
+    error
+  }, { title, label: "log", retry, safe });
+}
+
+function compactApprovalJson(value, max = 4000) {
+  if (!value) return "";
+  try {
+    const text = JSON.stringify(value, null, 2);
+    return text.length > max ? `${text.slice(0, max)}\n...` : text;
+  } catch {
+    return String(value).slice(0, max);
+  }
+}
+
+function approvalTargetSummary(approval = {}) {
+  const lines = [];
+  if (approval.command) lines.push(`命令：$ ${approval.command}`);
+  if (approval.mcp) {
+    const serverName = approval.mcp.serverName || approval.mcp.server || "unknown-server";
+    const toolName = approval.mcp.toolName || approval.mcp.tool || "unknown-tool";
+    lines.push(`MCP 工具：${serverName}.${toolName}`);
+  }
+  if (approval.extension) {
+    const extensionName = approval.extension.name || approval.extension.extensionName || "unknown-extension";
+    const toolName = approval.extension.toolName || approval.extension.tool || "unknown-tool";
+    lines.push(`扩展工具：${extensionName}.${toolName}`);
+  }
+  if (approval.packageId) lines.push(`发布包：${approval.packageId}`);
+  if (approval.title) lines.push(`标题：${approval.title}`);
+  return lines.join("\n");
+}
+
+function buildApprovalPromptContext(approval = {}) {
+  if (!approval?.id) return "";
+  const target = approvalTargetSummary(approval);
+  const policy = approval.policy || approval.risk || approval.reason
+    ? compactApprovalJson({
+      risk: approval.risk || approval.policy?.risk || "unknown",
+      reason: approval.reason || approval.policy?.reason || "",
+      policy: approval.policy || null
+    }, 3000)
+    : "";
+  const execution = approval.execution ? compactApprovalJson(approval.execution, 3000) : "";
+  const argumentsContext = [
+    approval.mcp?.arguments ? `MCP 参数：\n${compactApprovalJson(approval.mcp.arguments, 2500)}` : "",
+    approval.extension?.arguments ? `扩展参数：\n${compactApprovalJson(approval.extension.arguments, 2500)}` : ""
+  ].filter(Boolean).join("\n\n");
+  return [
+    "请基于这条审批/策略拦截记录继续推进当前编程或调试任务。",
+    "",
+    `审批 ID：${approval.id}`,
+    `类型：${approval.type || "command"}`,
+    `状态：${approval.status || "blocked"}`,
+    approval.createdAt ? `创建时间：${approval.createdAt}` : "",
+    approval.decidedAt ? `决策时间：${approval.decidedAt}` : "",
+    approval.decisionNote ? `决策备注：${approval.decisionNote}` : "",
+    target ? `目标动作：\n${target}` : "",
+    approval.reason ? `拦截原因：${approval.reason}` : "",
+    policy ? `策略证据：\n${policy}` : "",
+    argumentsContext ? `调用参数：\n${argumentsContext}` : "",
+    execution ? `执行/升级记录：\n${execution}` : "",
+    `审批原始记录（截断）：\n${compactApprovalJson(approval, 8000)}`,
+    "",
+    "要求：",
+    "1. 不要绕过本地安全策略，不要建议直接执行被拦截的危险命令。",
+    "2. 优先生成等价的安全检查命令、只读诊断步骤或更小权限的替代方案。",
+    "3. 如果确实需要外部授权，请列出人工确认清单、风险点和执行后应回填的证据。",
+    "4. 给出下一步可在当前项目中继续验证的命令或代码修改方案。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendApprovalContextToPrompt(approval = {}) {
+  const context = buildApprovalPromptContext(approval);
+  if (!context) {
+    showToast("暂无可加入提示词的审批上下文。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `审批上下文已加入提示词：${approval.id}`,
+    label: "policy",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("审批上下文已加入提示词，可继续生成安全替代方案。");
+  return context;
+}
+
+function runApprovalSafeAlternative(approval = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再生成安全替代方案。");
+    return "";
+  }
+  const context = buildApprovalPromptContext(approval);
+  if (!context) {
+    showToast("暂无可用于生成安全替代方案的审批上下文。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接生成安全替代方案：如果需要改代码，请输出最小 diff；如果只需要排查，请输出可运行的安全检查命令和预期证据。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动审批安全替代：${approval.id}`,
+    label: "policy",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动安全替代方案代理。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendApprovalEscalationEvidence(result = {}, approval = {}) {
+  const mergedApproval = {
+    ...approval,
+    id: result.id || approval.id,
+    type: result.type || approval.type,
+    status: result.status || approval.status,
+    execution: result.execution || approval.execution,
+    escalation: result.escalation || approval.escalation
+  };
+  appendToolCall({
+    title: `审批升级证据包：${mergedApproval.id || "unknown"}`,
+    label: "policy",
+    state: result.escalation?.status || "requires_external_escalation",
+    body: JSON.stringify({
+      approval: {
+        id: mergedApproval.id,
+        type: mergedApproval.type,
+        status: mergedApproval.status,
+        target: approvalTargetSummary(mergedApproval)
+      },
+      escalation: result.escalation || null,
+      execution: result.execution || null,
+      policy: result.policy || null
+    }, null, 2).slice(0, 12000)
+  });
+  const article = log.lastElementChild;
+  if (!article || !mergedApproval.id) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="safe">安全替代</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendApprovalContextToPrompt(mergedApproval);
+  });
+  actions.querySelector("[data-action='safe']").addEventListener("click", () => {
+    runApprovalSafeAlternative(mergedApproval);
+  });
+  article.appendChild(actions);
+}
+
+async function createApprovalEscalationEvidence(approval = {}) {
+  const detail = approval.policy ? approval : await api(`/api/approval?id=${encodeURIComponent(approval.id)}`);
+  const result = await api("/api/approval-escalation", {
+    method: "POST",
+    body: JSON.stringify({
+      id: detail.id,
+      reason: "用户从审批卡片生成外部受控沙箱升级证据包。"
+    })
+  });
+  appendApprovalEscalationEvidence(result, detail);
+  await refreshHealth();
+  return result;
+}
+
+function appendApprovalPlanCard(plan = {}, {
+  title = "工具调用审批",
+  label = "policy"
+} = {}) {
+  appendToolCall({
+    title,
+    label,
+    state: plan.status || plan.approval?.status || "approval_required",
+    body: JSON.stringify(plan, null, 2).slice(0, 12000)
+  });
+  const approval = plan.approval || plan;
+  const article = log.lastElementChild;
+  if (!article || !approval?.id) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="safe">安全替代</button><button type="button" data-action="escalate">升级证据</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendApprovalContextToPrompt(approval);
+  });
+  actions.querySelector("[data-action='safe']").addEventListener("click", () => {
+    runApprovalSafeAlternative(approval);
+  });
+  actions.querySelector("[data-action='escalate']").addEventListener("click", async () => {
+    try {
+      await createApprovalEscalationEvidence(approval);
+    } catch (error) {
+      showToast(error.message);
+      appendActionFailureEvidence({
+        kind: "approval",
+        action: "approval-escalation",
+        targetName: approval.id,
+        endpoint: "/api/approval-escalation",
+        request: { id: approval.id },
+        approval,
+        error
+      }, {
+        title: `审批升级证据生成失败：${approval.id}`,
+        label: "policy",
+        retry: () => createApprovalEscalationEvidence(approval),
+        safe: () => runApprovalSafeAlternative(approval)
+      });
+    }
+  });
+  article.appendChild(actions);
+}
+
+function appendApprovalExecutionCard(result = {}, approval = {}) {
+  const mergedApproval = {
+    ...approval,
+    id: result.id || approval.id,
+    type: result.type || approval.type,
+    status: result.status || approval.status,
+    execution: result.execution || approval.execution
+  };
+  appendToolCall({
+    title: `审批执行结果：${mergedApproval.id || "unknown"}`,
+    label: "policy",
+    state: result.execution?.executed ? "executed" : "blocked",
+    body: JSON.stringify({
+      approval: {
+        id: mergedApproval.id,
+        type: mergedApproval.type,
+        status: mergedApproval.status,
+        target: approvalTargetSummary(mergedApproval)
+      },
+      execution: result.execution || null
+    }, null, 2).slice(0, 12000)
+  });
+  const article = log.lastElementChild;
+  if (!article || !mergedApproval.id) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="safe">安全替代</button><button type="button" data-action="escalate">升级证据</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendApprovalContextToPrompt(mergedApproval);
+  });
+  actions.querySelector("[data-action='safe']").addEventListener("click", () => {
+    runApprovalSafeAlternative(mergedApproval);
+  });
+  actions.querySelector("[data-action='escalate']").addEventListener("click", async () => {
+    try {
+      await createApprovalEscalationEvidence(mergedApproval);
+    } catch (error) {
+      showToast(error.message);
+      appendActionFailureEvidence({
+        kind: "approval",
+        action: "approval-escalation",
+        targetName: mergedApproval.id,
+        endpoint: "/api/approval-escalation",
+        request: { id: mergedApproval.id },
+        approval: mergedApproval,
+        error
+      }, {
+        title: `审批升级证据生成失败：${mergedApproval.id}`,
+        label: "policy",
+        retry: () => createApprovalEscalationEvidence(mergedApproval),
+        safe: () => runApprovalSafeAlternative(mergedApproval)
+      });
+    }
+  });
+  article.appendChild(actions);
+}
+
+function normalizeActionFailureError(error) {
+  if (!error) return null;
+  return {
+    name: error.name || "",
+    message: error.message || String(error),
+    stack: error.stack ? String(error.stack).slice(0, 4000) : ""
+  };
+}
+
+function compactActionFailureEvidence(evidence = {}, max = 12000) {
+  return JSON.stringify({
+    kind: evidence.kind || "action",
+    action: evidence.action || "",
+    targetName: evidence.targetName || "",
+    endpoint: evidence.endpoint || evidence.request?.endpoint || "",
+    request: evidence.request || null,
+    error: evidence.error || null,
+    approval: evidence.approval ? {
+      id: evidence.approval.id,
+      type: evidence.approval.type,
+      status: evidence.approval.status,
+      risk: evidence.approval.risk,
+      reason: evidence.approval.reason,
+      target: approvalTargetSummary(evidence.approval)
+    } : null,
+    item: evidence.item || null,
+    pendingDiff: state.pendingDiff?.patches?.length ? {
+      patches: state.pendingDiff.patches.length,
+      commands: (state.pendingCommands || []).map((item) => item.command || item).slice(0, 8)
+    } : null
+  }, null, 2).slice(0, max);
+}
+
+function buildActionFailureContext(evidence = {}) {
+  const kind = evidence.kind || "action";
+  const targetName = evidence.targetName || evidence.approval?.id || evidence.item?.name || "unknown";
+  const errorMessage = evidence.error?.message || evidence.error || "unknown error";
+  const requestContext = evidence.request || evidence.endpoint
+    ? compactJson({
+      endpoint: evidence.endpoint || evidence.request?.endpoint || "",
+      request: evidence.request || null
+    }, 4000)
+    : "";
+  const relatedContext = kind === "approval"
+    ? buildApprovalPromptContext(evidence.approval || {})
+    : kind === "extension" || kind === "mcp" || kind === "tool"
+      ? buildCatalogEvidenceContext(kind === "tool" ? "tool" : kind, evidence.item || {})
+      : "";
+  return [
+    "请基于这次界面动作失败证据继续推进当前编程或调试任务。",
+    "",
+    `失败类型：${kind}`,
+    `动作：${evidence.action || "unknown"}`,
+    `对象：${targetName}`,
+    evidence.endpoint ? `接口：${evidence.endpoint}` : "",
+    `失败原因：${errorMessage}`,
+    requestContext ? `请求上下文：\n${requestContext}` : "",
+    relatedContext ? `相关目录/审批上下文：\n${relatedContext.slice(0, 8000)}` : "",
+    "",
+    "失败证据 JSON：",
+    compactActionFailureEvidence(evidence, 8000),
+    "",
+    "要求：先判断失败属于接口参数、审批状态、策略拒绝、目录过期、后端异常还是 UI 状态恢复问题；需要改代码时输出最小 diff；需要验证时优先给出可在当前项目安全运行的命令；不要绕过审批和本地安全策略。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendActionFailureEvidenceToPrompt(evidence = {}) {
+  const context = buildActionFailureContext(evidence);
+  if (!context) {
+    showToast("暂无可加入提示词的动作失败证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `动作失败证据已加入提示词：${evidence.action || evidence.targetName || "action"}`,
+    label: evidence.kind === "mcp" ? "mcp" : evidence.kind === "extension" ? "extension" : evidence.kind === "approval" ? "policy" : "debug",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("动作失败证据已加入提示词。");
+  return context;
+}
+
+function runActionFailureRepair(evidence = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动动作失败诊断修复。");
+    return "";
+  }
+  const context = buildActionFailureContext(evidence);
+  if (!context) {
+    showToast("暂无可用于修复的动作失败证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这次动作失败证据修复交互闭环：优先补齐失败恢复、参数提示、审批安全替代、证据复用或可重试动作，并给出下一轮安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动动作失败诊断修复：${evidence.action || evidence.targetName || "action"}`,
+    label: evidence.kind === "mcp" ? "mcp" : evidence.kind === "extension" ? "extension" : evidence.kind === "approval" ? "policy" : "debug",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于动作失败证据启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendActionFailureEvidence(evidence = {}, {
+  title = "动作失败证据",
+  label = "debug",
+  retry = null,
+  safe = null
+} = {}) {
+  const normalizedEvidence = {
+    ...evidence,
+    error: normalizeActionFailureError(evidence.error)
+  };
+  appendToolCall({
+    title,
+    label,
+    state: "失败",
+    body: buildActionFailureContext(normalizedEvidence).slice(0, 12000)
+  });
+  const article = log.lastElementChild;
+  if (!article) return normalizedEvidence;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="retry" ${retry ? "" : "disabled"}>重试</button><button type="button" data-action="safe" ${safe ? "" : "disabled"}>安全替代</button><button type="button" data-action="repair">直接修复</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendActionFailureEvidenceToPrompt(normalizedEvidence);
+  });
+  actions.querySelector("[data-action='retry']").addEventListener("click", async () => {
+    if (!retry) return;
+    try {
+      showToast("正在重试失败动作。");
+      await retry();
+    } catch (retryError) {
+      appendActionFailureEvidence({
+        ...normalizedEvidence,
+        action: `${normalizedEvidence.action || "action"} retry`,
+        error: retryError
+      }, { title: `${title} · 重试失败`, label, retry, safe });
+    }
+  });
+  actions.querySelector("[data-action='safe']").addEventListener("click", async () => {
+    if (!safe) return;
+    try {
+      await safe();
+    } catch (safeError) {
+      appendActionFailureEvidence({
+        ...normalizedEvidence,
+        action: `${normalizedEvidence.action || "action"} safe-alternative`,
+        error: safeError
+      }, { title: `${title} · 安全替代失败`, label, retry, safe });
+    }
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    runActionFailureRepair(normalizedEvidence);
+  });
+  article.appendChild(actions);
+  return normalizedEvidence;
+}
+
 function renderTasks(tasks = []) {
   if (!taskList) return;
   taskList.innerHTML = "";
@@ -621,20 +5703,122 @@ function renderTasks(tasks = []) {
   tasks.slice(0, 6).forEach((task) => {
     const row = document.createElement("div");
     row.className = `task-row ${task.checksOk ? "passed" : ""}`;
-    row.innerHTML = `<strong></strong><small></small>`;
+    row.innerHTML = `<div><strong></strong><small></small></div><span class="task-row-actions"><button type="button" data-action="detail">详情</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="commands">验证命令</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="continue">直接继续</button><button type="button" data-action="reference">引用文件</button></span>`;
     row.querySelector("strong").textContent = task.prompt || "(无提示词)";
-    row.querySelector("small").textContent = `${task.status || "unknown"} · ${(task.changedFiles || []).join(", ") || "无文件"}`;
-    row.addEventListener("click", async () => {
-      try {
-        const detail = await api(`/api/task?id=${encodeURIComponent(task.id)}`);
+    const selectedHunkCount = (task.selectedHunks || []).reduce((sum, item) => sum + Number(item.selectedHunks || 0), 0);
+    const taskMeta = [
+      task.status || "unknown",
+      (task.changedFiles || []).length ? `${task.changedFiles.length} file(s)` : "无文件",
+      selectedHunkCount ? `${selectedHunkCount} hunk(s)` : "",
+      (task.failedCommands || []).length ? `${task.failedCommands.length} failed` : "",
+      (task.verificationCommands || []).length ? `${task.verificationCommands.length} check(s)` : ""
+    ].filter(Boolean).join(" · ");
+    row.querySelector("small").textContent = taskMeta;
+    const getDetail = async () => await api(`/api/task?id=${encodeURIComponent(task.id)}`);
+    row.querySelector("[data-action='detail']").addEventListener("click", async () => {
+      const viewTaskDetail = async () => {
+        const detail = await getDetail();
         appendToolCall({
           title: `任务详情：${task.id}`,
           label: "log",
           state: "完成",
           body: JSON.stringify(detail, null, 2).slice(0, 12000)
         });
+      };
+      try {
+        await viewTaskDetail();
       } catch (error) {
         showToast(error.message);
+        appendTaskFailureEvidence(task, error, {
+          title: `查看任务详情失败：${task.id || "task"}`,
+          action: "task-detail",
+          retry: viewTaskDetail,
+          safe: () => appendTaskContextToPrompt(task)
+        });
+      }
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", async () => {
+      const promptTaskDetail = async () => appendTaskContextToPrompt(await getDetail());
+      try {
+        await promptTaskDetail();
+      } catch (error) {
+        showToast(error.message);
+        appendTaskFailureEvidence(task, error, {
+          title: `任务证据加入提示词失败：${task.id || "task"}`,
+          action: "task-prompt",
+          retry: promptTaskDetail,
+          safe: () => appendTaskContextToPrompt(task)
+        });
+      }
+    });
+    row.querySelector("[data-action='commands']").addEventListener("click", async () => {
+      const stageCommands = async () => stageTaskVerificationCommands(await getDetail());
+      try {
+        await stageCommands();
+      } catch (error) {
+        showToast(error.message);
+        appendTaskFailureEvidence(task, error, {
+          title: `历史任务验证命令失败：${task.id || "task"}`,
+          action: "task-verification-commands",
+          retry: stageCommands,
+          safe: () => appendTaskContextToPrompt(task)
+        });
+      }
+    });
+    row.querySelector("[data-action='verification-prompt']").addEventListener("click", async () => {
+      const promptTaskVerification = async () => appendTaskVerificationPromptToPrompt(await getDetail());
+      try {
+        await promptTaskVerification();
+      } catch (error) {
+        showToast(error.message);
+        appendTaskFailureEvidence(task, error, {
+          title: `任务验证提示生成失败：${task.id || "task"}`,
+          action: "task-verification-prompt",
+          retry: promptTaskVerification,
+          safe: () => appendTaskContextToPrompt(task)
+        });
+      }
+    });
+    row.querySelector("[data-action='verification-fix']").addEventListener("click", async () => {
+      const repairTaskVerification = async () => runTaskVerificationFix(await getDetail());
+      try {
+        await repairTaskVerification();
+      } catch (error) {
+        showToast(error.message);
+        appendTaskFailureEvidence(task, error, {
+          title: `任务验证修复启动失败：${task.id || "task"}`,
+          action: "task-verification-fix",
+          retry: repairTaskVerification,
+          safe: () => appendTaskContextToPrompt(task)
+        });
+      }
+    });
+    row.querySelector("[data-action='continue']").addEventListener("click", async () => {
+      const continueTask = async () => runTaskContinuation(await getDetail());
+      try {
+        await continueTask();
+      } catch (error) {
+        showToast(error.message);
+        appendTaskFailureEvidence(task, error, {
+          title: `历史任务继续失败：${task.id || "task"}`,
+          action: "task-continue",
+          retry: continueTask,
+          safe: () => appendTaskContextToPrompt(task)
+        });
+      }
+    });
+    row.querySelector("[data-action='reference']").addEventListener("click", async () => {
+      const referenceTaskFiles = async () => referenceTaskFilesInPrompt(await getDetail());
+      try {
+        await referenceTaskFiles();
+      } catch (error) {
+        showToast(error.message);
+        appendTaskFailureEvidence(task, error, {
+          title: `引用任务文件失败：${task.id || "task"}`,
+          action: "task-reference-files",
+          retry: referenceTaskFiles,
+          safe: () => appendTaskContextToPrompt(task)
+        });
       }
     });
     taskList.appendChild(row);
@@ -645,6 +5829,7 @@ function renderThreads(threads = []) {
   if (!threadList) return;
   threadList.innerHTML = "";
   if (!threads.length) {
+    state.activeThreadId = "";
     const row = document.createElement("button");
     row.type = "button";
     row.className = "thread active";
@@ -655,20 +5840,90 @@ function renderThreads(threads = []) {
     threadList.appendChild(row);
     return;
   }
+  if (!state.activeThreadId) {
+    state.activeThreadId = threads[0]?.id || "";
+  }
   threads.slice(0, 8).forEach((thread, index) => {
     const row = document.createElement("div");
     row.className = `thread ${thread.id === state.activeThreadId || (!state.activeThreadId && index === 0) ? "active" : ""}`;
     row.tabIndex = 0;
     row.setAttribute("role", "button");
-    row.innerHTML = `<span class="status-dot ${thread.status === "awaiting_approval" ? "live" : "idle"}"></span><span><strong></strong><small></small></span><span class="thread-actions"><button type="button" data-action="rename">重命名</button><button type="button" data-action="fork">分叉</button><button type="button" data-action="pin"></button><button type="button" data-action="archive">归档</button></span>`;
+    row.innerHTML = `<span class="status-dot ${thread.status === "awaiting_approval" ? "live" : "idle"}"></span><span><strong></strong><small></small></span><form class="thread-rename-form" hidden><input type="text" maxlength="120" aria-label="会话标题"><button type="submit">保存</button><button type="button" data-action="cancel-rename">取消</button></form><span class="thread-actions"><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="continue">直接继续</button><button type="button" data-action="rename">重命名</button><button type="button" data-action="fork">分叉</button><button type="button" data-action="pin"></button><button type="button" data-action="archive">归档</button></span>`;
     row.querySelector("strong").textContent = thread.title || "未命名会话";
     row.querySelector("small").textContent = `${thread.pinned ? "置顶 · " : ""}${thread.status || "active"} · ${thread.messageCount || 0} 条消息`;
     row.querySelector("[data-action='pin']").textContent = thread.pinned ? "取消置顶" : "置顶";
+    const titleBlock = row.querySelector("span:nth-child(2)");
+    const renameForm = row.querySelector(".thread-rename-form");
+    const renameInput = renameForm?.querySelector("input");
+    const renameButton = row.querySelector("[data-action='rename']");
+    const cancelRenameButton = row.querySelector("[data-action='cancel-rename']");
+    const setRenameMode = (enabled) => {
+      if (!renameForm || !titleBlock || !renameInput) return;
+      renameForm.hidden = !enabled;
+      titleBlock.hidden = enabled;
+      row.classList.toggle("renaming", enabled);
+      if (enabled) {
+        renameInput.value = thread.title || "未命名会话";
+        setTimeout(() => {
+          renameInput.focus();
+          renameInput.select();
+        }, 0);
+      }
+    };
+    const submitRename = async () => {
+      if (!renameInput) return;
+      const title = renameInput.value.trim();
+      if (!title) {
+        showToast("会话标题不能为空。");
+        renameInput.focus();
+        return;
+      }
+      if (title === (thread.title || "未命名会话")) {
+        setRenameMode(false);
+        return;
+      }
+      if (renameButton) renameButton.disabled = true;
+      try {
+        const result = await api("/api/thread", {
+          method: "PATCH",
+          body: JSON.stringify({ id: thread.id, title })
+        });
+        renderThreads(result.threads || []);
+        appendToolCall({
+          title: `已重命名会话：${title}`,
+          label: "thread",
+          state: "完成",
+          body: JSON.stringify(result.thread?.summary || {}, null, 2).slice(0, 12000)
+        });
+      } catch (error) {
+        showToast(error.message);
+        appendThreadFailureEvidence(thread, error, {
+          title: `重命名会话失败：${thread.title || thread.id || "thread"}`,
+          action: "thread-rename",
+          endpoint: "/api/thread",
+          request: { id: thread.id, title },
+          retry: async () => {
+            const result = await api("/api/thread", {
+              method: "PATCH",
+              body: JSON.stringify({ id: thread.id, title })
+            });
+            renderThreads(result.threads || []);
+          }
+        });
+      } finally {
+        if (renameButton) renameButton.disabled = false;
+      }
+    };
     const restoreThread = async () => {
       try {
         const detail = await api(`/api/thread?id=${encodeURIComponent(thread.id)}`);
+        const previousThreadId = state.activeThreadId;
         state.activeThreadId = detail.id;
         renderMessages(detail.messages || []);
+        if (previousThreadId !== state.activeThreadId) {
+          clearCommandDebugState({ persist: false });
+        }
+        restoreCommandDebugState();
         renderThreads(threads);
         appendToolCall({
           title: `已恢复会话：${detail.title}`,
@@ -678,6 +5933,13 @@ function renderThreads(threads = []) {
         });
       } catch (error) {
         showToast(error.message);
+        appendThreadFailureEvidence(thread, error, {
+          title: `恢复会话失败：${thread.title || thread.id || "thread"}`,
+          action: "thread-restore",
+          endpoint: "/api/thread",
+          request: { id: thread.id || "" },
+          retry: restoreThread
+        });
       }
     };
     row.addEventListener("click", restoreThread);
@@ -686,6 +5948,14 @@ function renderThreads(threads = []) {
         event.preventDefault();
         restoreThread();
       }
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendThreadContextToPrompt(thread);
+    });
+    row.querySelector("[data-action='continue']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      runThreadContinuation(thread);
     });
     row.querySelector("[data-action='pin']").addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -697,27 +5967,41 @@ function renderThreads(threads = []) {
         renderThreads(result.threads || []);
       } catch (error) {
         showToast(error.message);
+        appendThreadFailureEvidence(thread, error, {
+          title: `置顶会话失败：${thread.title || thread.id || "thread"}`,
+          action: "thread-pin",
+          endpoint: "/api/thread",
+          request: { id: thread.id, pinned: !thread.pinned },
+          retry: async () => {
+            const result = await api("/api/thread", {
+              method: "PATCH",
+              body: JSON.stringify({ id: thread.id, pinned: !thread.pinned })
+            });
+            renderThreads(result.threads || []);
+          }
+        });
       }
     });
     row.querySelector("[data-action='rename']").addEventListener("click", async (event) => {
       event.stopPropagation();
-      const title = window.prompt("重命名会话", thread.title || "未命名会话");
-      if (!title || !title.trim()) return;
-      try {
-        const result = await api("/api/thread", {
-          method: "PATCH",
-          body: JSON.stringify({ id: thread.id, title: title.trim() })
-        });
-        renderThreads(result.threads || []);
-        appendToolCall({
-          title: `已重命名会话：${title.trim()}`,
-          label: "thread",
-          state: "完成",
-          body: JSON.stringify(result.thread?.summary || {}, null, 2).slice(0, 12000)
-        });
-      } catch (error) {
-        showToast(error.message);
+      setRenameMode(true);
+    });
+    renameForm?.addEventListener("click", (event) => event.stopPropagation());
+    renameForm?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      submitRename();
+    });
+    renameInput?.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setRenameMode(false);
       }
+    });
+    cancelRenameButton?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setRenameMode(false);
     });
     row.querySelector("[data-action='fork']").addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -737,6 +6021,21 @@ function renderThreads(threads = []) {
         });
       } catch (error) {
         showToast(error.message);
+        appendThreadFailureEvidence(thread, error, {
+          title: `分叉会话失败：${thread.title || thread.id || "thread"}`,
+          action: "thread-fork",
+          endpoint: "/api/thread-fork",
+          request: { id: thread.id },
+          retry: async () => {
+            const result = await api("/api/thread-fork", {
+              method: "POST",
+              body: JSON.stringify({ id: thread.id })
+            });
+            state.activeThreadId = result.thread?.id || "";
+            renderMessages(result.thread?.messages || []);
+            renderThreads(result.threads || []);
+          }
+        });
       }
     });
     row.querySelector("[data-action='archive']").addEventListener("click", async (event) => {
@@ -750,26 +6049,553 @@ function renderThreads(threads = []) {
         renderThreads(result.threads || []);
       } catch (error) {
         showToast(error.message);
+        appendThreadFailureEvidence(thread, error, {
+          title: `归档会话失败：${thread.title || thread.id || "thread"}`,
+          action: "thread-archive",
+          endpoint: "/api/thread",
+          request: { id: thread.id, archived: true, status: "archived" },
+          retry: async () => {
+            const result = await api("/api/thread", {
+              method: "PATCH",
+              body: JSON.stringify({ id: thread.id, archived: true, status: "archived" })
+            });
+            if (state.activeThreadId === thread.id) state.activeThreadId = "";
+            renderThreads(result.threads || []);
+          }
+        });
       }
     });
     threadList.appendChild(row);
   });
 }
 
+function buildCapabilityGapContext(capability = {}) {
+  if (!capability?.area) return "";
+  return [
+    "请基于这条 Codex 对标能力项继续改进当前项目，让它更适合真实写代码和调试程序。",
+    "",
+    `能力领域：${capability.area}`,
+    `当前状态：${capability.status || "unknown"}`,
+    capability.recommendationReason ? `推荐理由：${capability.recommendationReason}` : "",
+    capability.next ? `下一步建议：${capability.next}` : "",
+    "",
+    "已有证据：",
+    (capability.evidence || []).map((item) => `- ${item}`).join("\n") || "(无证据)",
+    "",
+    "要求：如果该能力未完全实现，请优先补齐最影响编码/调试体验的最小闭环；需要改代码时输出最小 diff；需要验证时给出安全检查命令；不要为了标记完成而绕开真实缺口。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendCapabilityGapToPrompt(capability = {}) {
+  const context = buildCapabilityGapContext(capability);
+  if (!context) {
+    showToast("暂无可加入提示词的能力差距。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `能力差距已加入提示词：${capability.area}`,
+    label: "audit",
+    state: capability.status || "unknown",
+    body: context.slice(0, 12000)
+  });
+  showToast("能力差距已加入提示词。");
+  return context;
+}
+
+function runCapabilityGapRepair(capability = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动能力补齐。");
+    return "";
+  }
+  const context = buildCapabilityGapContext(capability);
+  if (!context) {
+    showToast("暂无可用于补齐的能力差距。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这条能力差距继续改进：先判断当前项目相对 Codex 的真实缺口，优先补齐最小可验证闭环，更新必要文档，并给出/执行安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动能力差距补齐：${capability.area}`,
+    label: "audit",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于能力差距启动补齐任务。");
+  submitPromptForm();
+  return prompt;
+}
+
+function buildCapabilityGapListContext(gaps = [], {
+  title = "能力缺口",
+  mode = "local"
+} = {}) {
+  const list = Array.isArray(gaps) ? gaps.filter((gap) => gap?.area) : [];
+  if (!list.length) return "";
+  const externalMode = mode === "external";
+  return [
+    `请基于这组 ${title} 继续推进 Codex 对标。`,
+    "",
+    `缺口类型：${externalMode ? "外部授权/凭据阻塞" : "本地可继续补齐"}`,
+    `缺口数量：${list.length}`,
+    "",
+    "缺口清单：",
+    ...list.map((gap, index) => [
+      `${index + 1}. ${gap.area} (${gap.status || "unknown"})`,
+      gap.externalDependency ? "   - 需要外部授权/凭据或远端平台能力" : "   - 可优先在本地继续补齐",
+      gap.next ? `   - 下一步：${gap.next}` : "",
+      gap.evidence?.length ? `   - 证据：${gap.evidence.slice(0, 5).join(" / ")}` : ""
+    ].filter(Boolean).join("\n")),
+    "",
+    externalMode
+      ? "要求：不要假装已经具备外部权限；请整理需要用户授权、凭据、CLI 登录或远端平台配置的清单，并给出本地可替代验证路径。"
+      : "要求：优先选择最影响写代码/调试体验的一项，做最小可验证改动；需要改代码时输出最小 diff，并给出或执行安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendCapabilityGapListToPrompt(gaps = [], options = {}) {
+  const context = buildCapabilityGapListContext(gaps, options);
+  if (!context) {
+    showToast("暂无可加入提示词的能力缺口清单。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `${options.title || "能力缺口"}已加入提示词`,
+    label: "audit",
+    state: options.mode === "external" ? "blocked" : "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("能力缺口清单已加入提示词。");
+  return context;
+}
+
+function runCapabilityGapListRepair(gaps = [], options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动能力缺口补齐。");
+    return "";
+  }
+  const context = buildCapabilityGapListContext(gaps, options);
+  if (!context) {
+    showToast("暂无可用于补齐的能力缺口清单。");
+    return "";
+  }
+  const externalMode = options.mode === "external";
+  const prompt = [
+    context,
+    "",
+    externalMode
+      ? "请现在把这些外部阻塞项整理成可执行授权清单：列出需要用户提供的凭据/CLI 登录/远端权限、当前本地替代能力，以及拿到授权后的验证命令。"
+      : "请现在直接基于这些本地可补齐缺口继续改进：先选最影响编码/调试体验的一项，做最小可验证闭环，更新必要文档，并给出/执行安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: externalMode ? "已启动外部阻塞授权清单" : "已启动本地能力缺口补齐",
+    label: "audit",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast(externalMode ? "正在生成外部阻塞授权清单。" : "正在启动本地能力缺口补齐。");
+  submitPromptForm();
+  return prompt;
+}
+
+function recommendedCapabilityFromState() {
+  const audit = state.lastCapabilityAudit || null;
+  const capabilities = audit?.capabilities || [];
+  const recommendedNext = audit?.recommendedNext?.capability ? audit.recommendedNext : selectCapabilityRecommendation(capabilities);
+  return recommendedNext?.capability ? {
+    ...recommendedNext.capability,
+    recommendationReason: recommendedNext.reason || ""
+  } : null;
+}
+
+function buildGoalContinuationPrompt(goal = {}, capability = recommendedCapabilityFromState()) {
+  const verification = goal?.lastVerification
+    ? `${goal.lastVerification.skipped ? "skipped" : goal.lastVerification.ok ? "passed" : "failed"} · ${goal.lastVerification.checkCount || 0} checks`
+    : "none";
+  const capabilityContext = capability ? buildCapabilityGapContext(capability) : "";
+  const recovery = state.lastRecoverySummary || {};
+  const recoveryLines = [
+    ...(recovery.cues || []).map((item) => `- ${item}`),
+    ...(recovery.blockers || []).map((item) => `- blocker: ${item}`),
+    ...(recovery.nextActions || []).map((item) => `- next: ${item}`)
+  ].slice(0, 12);
+  const recoveryDetails = [
+    recovery.lastFailedCommand ? `最近失败命令：\n$ ${recovery.lastFailedCommand}` : "",
+    recovery.changedFiles?.length ? `最近变更文件：\n${recovery.changedFiles.map((file) => `@${file}`).join("\n")}` : "",
+    recovery.selectedHunks?.length ? `最近部分应用 hunk：\n${recovery.selectedHunks.map((item) => `- ${item.path || "unknown"}：${item.selectedHunks || 0}/${item.totalHunks || "?"}`).join("\n")}` : "",
+    recovery.failedCommands?.length ? `失败命令：\n${recovery.failedCommands.map((command) => `- ${command}`).join("\n")}` : "",
+    recovery.verificationCommands?.length ? `可重跑验证命令：\n${recovery.verificationCommands.map((command) => `- ${command}`).join("\n")}` : ""
+  ].filter(Boolean);
+  return [
+    "请基于当前可恢复状态继续推进，让这个项目更适合真实写代码和调试程序。",
+    "",
+    `目标：${goal?.objective || state.lastPrompt || "当前 Codex 对标改进目标"}`,
+    `阶段：${goal?.phase || "idle"} / ${goal?.status || "idle"}`,
+    `上次任务：${goal?.lastTaskId || "(无)"}`,
+    `上次验证：${verification}`,
+    goal?.pendingProposal?.id ? `待审批提案：${goal.pendingProposal.id}` : "",
+    goal?.nextStep ? `记录的下一步：${goal.nextStep}` : "",
+    recoveryLines.length ? "恢复摘要：" : "",
+    recoveryLines.join("\n"),
+    recoveryDetails.length ? "\n恢复明细：" : "",
+    recoveryDetails.join("\n\n"),
+    "",
+    capabilityContext ? "推荐能力缺口：" : "",
+    capabilityContext,
+    "",
+    "要求：先核对当前工作树和必要文件；如果已有待审批 diff，先判断它是否仍适用；优先补齐推荐缺口中最影响编码/调试体验的最小闭环；需要改代码时输出最小 diff，并给出或执行安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendGoalContinuationToPrompt(goal = {}) {
+  const prompt = buildGoalContinuationPrompt(goal);
+  if (!prompt) {
+    showToast("暂无可继续的目标状态。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "可恢复状态已加入提示词",
+    label: "goal",
+    state: goal?.status || "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("可恢复状态已加入提示词。");
+  return prompt;
+}
+
+function runGoalContinuation(goal = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再继续目标。");
+    return "";
+  }
+  const prompt = buildGoalContinuationPrompt(goal);
+  if (!prompt) {
+    showToast("暂无可继续的目标状态。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "已启动可恢复状态继续",
+    label: "goal",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于可恢复状态继续。");
+  submitPromptForm();
+  return prompt;
+}
+
+async function stageCapabilityVerificationCommands(capability = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再生成能力验证命令。");
+    return [];
+  }
+  setBusy(true, "生成能力验证命令");
+  try {
+    const result = await api("/api/verification-plan", {
+      method: "POST",
+      body: JSON.stringify({ limit: 12, commands: state.pendingCommands.map((item) => item.command || item) })
+    });
+    const commands = verificationPlanCommands(result.plan);
+    if (!commands.length) {
+      appendToolCall({
+        title: `能力验证命令未生成：${capability.area || "能力差距"}`,
+        label: "$",
+        state: "跳过",
+        body: JSON.stringify(result.plan || {}, null, 2).slice(0, 8000)
+      });
+      showToast("当前验证计划没有可复用命令。");
+      setBusy(false, "无验证命令");
+      return [];
+    }
+    renderVerificationPlan(result.plan, { logCommands: true });
+    stageRepairVerificationCommands(commands, {
+      title: "能力补齐验证命令",
+      successTitle: `能力补齐验证命令已放入面板：${capability.area || "能力差距"}`,
+      source: "capability-gap"
+    });
+    appendToolCall({
+      title: `能力补齐验证上下文：${capability.area || "能力差距"}`,
+      label: "audit",
+      state: result.plan?.status || "ready",
+      body: [
+        capability.recommendationReason ? `推荐理由：${capability.recommendationReason}` : "",
+        capability.next ? `下一步建议：${capability.next}` : "",
+        "",
+        commandItemsToText(commands)
+      ].filter(Boolean).join("\n").slice(0, 12000)
+    });
+    setBusy(false, "验证命令已加入");
+    return commands;
+  } catch (error) {
+    showToast(error.message);
+    appendGateFailureEvidence(error, {
+      title: `能力验证命令生成失败：${capability.area || "能力差距"}`,
+      kind: "capability",
+      endpoint: "/api/verification-plan",
+      request: {
+        capability: {
+          area: capability.area || "",
+          status: capability.status || "",
+          next: capability.next || ""
+        },
+        commands: state.pendingCommands.map((item) => item.command || item)
+      }
+    });
+    setBusy(false, "验证命令失败");
+    return [];
+  }
+}
+
+function selectCapabilityRecommendation(capabilities = []) {
+  const impactRank = new Map([
+    ["验证与修复闭环", 120],
+    ["可恢复状态", 115],
+    ["长任务管理", 110],
+    ["外部工具与浏览器自动化", 105],
+    ["浏览器自动化与视觉回归", 100],
+    ["真实浏览器交互与截图", 98],
+    ["浏览器 DOM 交互", 96],
+    ["代码审查证据", 94],
+    ["上下文索引", 92],
+    ["权限与命令策略", 90],
+    ["工具生态", 88],
+    ["模型运行层", 84],
+    ["远端 PR 与 CI 集成", 82],
+    ["真实远端发布与平台同步", 78],
+    ["多模态与浏览器执行", 74]
+  ]);
+  const scored = (Array.isArray(capabilities) ? capabilities : [])
+    .filter((item) => item && item.status !== "implemented")
+    .map((item) => {
+      const statusScore = item.status === "missing" ? 1000 : item.status === "partial" ? 500 : 100;
+      const impact = impactRank.get(item.area) || 50;
+      return {
+        capability: item,
+        score: statusScore + impact,
+        reason: [
+          item.status === "missing" ? "缺失能力优先补齐" : "部分实现能力优先闭环",
+          "按真实写代码、调试程序的日常影响排序",
+          item.next || ""
+        ].filter(Boolean).join("；")
+      };
+    })
+    .sort((a, b) => b.score - a.score || String(a.capability.area || "").localeCompare(String(b.capability.area || ""), "zh-Hans-CN"));
+  const top = scored[0] || null;
+  return top ? {
+    status: top.capability.status || "partial",
+    area: top.capability.area || "",
+    score: top.score,
+    reason: top.reason,
+    capability: top.capability
+  } : null;
+}
+
+function renderCapabilityComparison(audit) {
+  const comparison = audit?.comparison;
+  if (!comparison?.requirements?.length) return null;
+  const card = document.createElement("div");
+  card.className = `capability-scorecard ${comparison.status || "partial"}`;
+  const header = document.createElement("div");
+  header.className = "capability-scorecard-header";
+  const title = document.createElement("strong");
+  title.textContent = "写代码/调试覆盖";
+  const summary = document.createElement("span");
+  summary.textContent = [
+    `covered ${comparison.summary?.implemented || 0}`,
+    `partial ${comparison.summary?.partial || 0}`,
+    `missing ${comparison.summary?.missing || 0}`
+  ].join(" · ");
+  header.append(title, summary);
+  const grid = document.createElement("div");
+  grid.className = "capability-score-grid";
+  comparison.requirements.slice(0, 5).forEach((requirement) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `capability-requirement ${requirement.status || "partial"}`;
+    const reqTitle = document.createElement("strong");
+    reqTitle.textContent = requirement.title || "对标需求";
+    const reqMeta = document.createElement("small");
+    const gapNames = (requirement.gaps || []).map((gap) => gap.area).slice(0, 2);
+    reqMeta.textContent = gapNames.length
+      ? `缺口：${gapNames.join("、")}`
+      : "本地证据已覆盖";
+    button.append(reqTitle, reqMeta);
+    button.addEventListener("click", () => {
+      appendToolCall({
+        title: `Codex 对标需求：${requirement.title || requirement.id}`,
+        label: "audit",
+        state: requirement.status || "unknown",
+        body: JSON.stringify(requirement, null, 2).slice(0, 12000)
+      });
+    });
+    grid.appendChild(button);
+  });
+  const footer = document.createElement("small");
+  footer.className = "capability-scorecard-footer";
+  footer.textContent = comparison.externalBlockedGaps?.length
+    ? `外部授权相关缺口 ${comparison.externalBlockedGaps.length} 个；本地可继续补齐 ${comparison.localActionableGaps?.length || 0} 个。`
+    : "剩余缺口均可在本地继续收敛。";
+  const actions = document.createElement("div");
+  actions.className = "capability-score-actions";
+  actions.innerHTML = `<button type="button" data-action="local-gaps" ${comparison.localActionableGaps?.length ? "" : "disabled"}>本地补齐</button><button type="button" data-action="external-gaps" ${comparison.externalBlockedGaps?.length ? "" : "disabled"}>授权清单</button>`;
+  actions.querySelector("[data-action='local-gaps']").addEventListener("click", () => {
+    runCapabilityGapListRepair(comparison.localActionableGaps || [], {
+      title: "本地可补齐能力缺口",
+      mode: "local"
+    });
+  });
+  actions.querySelector("[data-action='external-gaps']").addEventListener("click", () => {
+    appendCapabilityGapListToPrompt(comparison.externalBlockedGaps || [], {
+      title: "外部授权阻塞能力缺口",
+      mode: "external"
+    });
+  });
+  card.append(header, grid, footer, actions);
+  return card;
+}
+
 function renderCapabilities(audit) {
   if (!capabilityList) return;
+  state.lastCapabilityAudit = audit || null;
   capabilityList.innerHTML = "";
   const capabilities = audit?.capabilities || [];
   if (!capabilities.length) {
     capabilityList.textContent = "暂无能力矩阵";
     return;
   }
-  capabilities.slice(0, 8).forEach((capability) => {
+  const statusRank = { missing: 0, partial: 1, implemented: 2 };
+  const visibleCapabilities = [...capabilities]
+    .sort((a, b) => {
+      const aRank = statusRank[a.status] ?? 1;
+      const bRank = statusRank[b.status] ?? 1;
+      if (aRank !== bRank) return aRank - bRank;
+      return String(a.area || "").localeCompare(String(b.area || ""), "zh-Hans-CN");
+    })
+    .slice(0, 10);
+  const summary = audit?.summary || capabilities.reduce((acc, item) => {
+    const status = item.status || "unknown";
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  const summaryRow = document.createElement("div");
+  summaryRow.className = "capability-summary";
+  summaryRow.innerHTML = `<strong>缺口优先</strong><span></span>`;
+  summaryRow.querySelector("span").textContent = [
+    `partial ${summary.partial || 0}`,
+    `missing ${summary.missing || 0}`,
+    `implemented ${summary.implemented || 0}`
+  ].join(" · ");
+  capabilityList.appendChild(summaryRow);
+  const comparisonCard = renderCapabilityComparison(audit);
+  if (comparisonCard) capabilityList.appendChild(comparisonCard);
+  const recommendedNext = audit?.recommendedNext?.capability ? audit.recommendedNext : selectCapabilityRecommendation(capabilities);
+  const recommendedCapability = recommendedNext?.capability
+    ? {
+      ...recommendedNext.capability,
+      recommendationReason: recommendedNext.reason || ""
+    }
+    : null;
+  if (recommendedCapability) {
+    const recommendation = document.createElement("div");
+    recommendation.className = `capability-recommendation ${recommendedCapability.status || "partial"}`;
+    recommendation.innerHTML = `
+      <div>
+        <strong></strong>
+        <small></small>
+      </div>
+      <span class="capability-actions">
+        <button type="button" data-action="detail">详情</button>
+        <button type="button" data-action="prompt">加入提示词</button>
+        <button type="button" data-action="commands">验证命令</button>
+        <button type="button" data-action="repair">直接补齐</button>
+      </span>
+    `;
+    recommendation.querySelector("strong").textContent = `推荐下一步 · ${recommendedCapability.area || "能力差距"}`;
+    recommendation.querySelector("small").textContent = recommendedCapability.recommendationReason || recommendedCapability.next || "优先补齐最影响编码/调试体验的闭环。";
+    recommendation.querySelector("[data-action='detail']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendToolCall({
+        title: `推荐能力差距：${recommendedCapability.area}`,
+        label: "audit",
+        state: recommendedCapability.status || "unknown",
+        body: JSON.stringify({
+          recommendedNext: audit?.recommendedNext || null,
+          capability: recommendedCapability
+        }, null, 2)
+      });
+    });
+    recommendation.querySelector("[data-action='prompt']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendCapabilityGapToPrompt(recommendedCapability);
+    });
+    recommendation.querySelector("[data-action='commands']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await stageCapabilityVerificationCommands(recommendedCapability);
+    });
+    recommendation.querySelector("[data-action='repair']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      runCapabilityGapRepair(recommendedCapability);
+    });
+    recommendation.addEventListener("click", () => {
+      appendToolCall({
+        title: `推荐能力差距：${recommendedCapability.area}`,
+        label: "audit",
+        state: recommendedCapability.status || "unknown",
+        body: JSON.stringify({
+          recommendedNext: audit?.recommendedNext || null,
+          capability: recommendedCapability
+        }, null, 2)
+      });
+    });
+    capabilityList.appendChild(recommendation);
+  }
+  visibleCapabilities.forEach((capability) => {
     const row = document.createElement("div");
     row.className = `capability-row ${capability.status || "partial"}`;
-    row.innerHTML = `<strong></strong><small></small>`;
+    row.innerHTML = `<strong></strong><small></small><span class="capability-actions"><button type="button" data-action="detail">详情</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="commands">验证命令</button><button type="button" data-action="repair">直接补齐</button></span>`;
     row.querySelector("strong").textContent = capability.area || "能力";
     row.querySelector("small").textContent = `${capability.status || "unknown"} · ${capability.next || ""}`;
+    row.querySelector("[data-action='detail']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendToolCall({
+        title: `能力详情：${capability.area}`,
+        label: "audit",
+        state: capability.status || "unknown",
+        body: JSON.stringify(capability, null, 2)
+      });
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendCapabilityGapToPrompt(capability);
+    });
+    row.querySelector("[data-action='commands']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await stageCapabilityVerificationCommands(capability);
+    });
+    row.querySelector("[data-action='repair']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      runCapabilityGapRepair(capability);
+    });
     row.addEventListener("click", () => {
       appendToolCall({
         title: `能力详情：${capability.area}`,
@@ -779,6 +6605,223 @@ function renderCapabilities(audit) {
       });
     });
     capabilityList.appendChild(row);
+  });
+}
+
+function catalogEvidenceTitle(kind, item = {}) {
+  if (kind === "tool") return `工具目录证据：${item.name || "tool"}`;
+  if (kind === "extension") return `扩展目录证据：${item.name || "extension"}`;
+  if (kind === "mcp") return `MCP 目录证据：${item.name || "mcp-server"}`;
+  return `目录证据：${item.name || "item"}`;
+}
+
+function catalogEvidenceLabel(kind) {
+  if (kind === "tool") return "tool";
+  if (kind === "extension") return "extension";
+  if (kind === "mcp") return "mcp";
+  return "catalog";
+}
+
+function compactCatalogEvidence(kind, item = {}, max = 12000) {
+  return JSON.stringify({ kind, item }, null, 2).slice(0, max);
+}
+
+function buildCatalogEvidenceContext(kind, item = {}) {
+  const name = item.name || (kind === "mcp" ? "mcp-server" : kind);
+  const description = item.description || item.probe?.serverInfo?.name || "";
+  const status = item.status || item.type || item.policy?.access || item.probe?.status || "unknown";
+  const source = item.source || item.policy?.source || item.transport || "";
+  const toolCount = kind === "mcp"
+    ? item.probe?.counts?.tools || 0
+    : Array.isArray(item.tools) ? item.tools.length : 0;
+  const resourceCount = item.probe?.counts?.resources || 0;
+  const promptCount = item.probe?.counts?.prompts || 0;
+  const trustStatus = item.trust?.status || "";
+  const requiresApproval = item.policy?.requiresApproval !== undefined
+    ? item.policy.requiresApproval
+    : kind === "mcp" || kind === "extension";
+  return [
+    "请基于这条工具/扩展/MCP 目录证据继续改进当前项目，让它更接近 Codex 的可操作编码与调试体验。",
+    "",
+    `类型：${kind}`,
+    `名称：${name}`,
+    `状态：${status}`,
+    description ? `说明：${description}` : "",
+    source ? `来源：${source}` : "",
+    trustStatus ? `信任状态：${trustStatus}` : "",
+    `审批要求：${requiresApproval ? "需要审批" : "无需审批"}`,
+    toolCount ? `工具数量：${toolCount}` : "",
+    resourceCount ? `资源数量：${resourceCount}` : "",
+    promptCount ? `提示词数量：${promptCount}` : "",
+    "",
+    "目录证据 JSON：",
+    compactCatalogEvidence(kind, item),
+    "",
+    "要求：优先判断这项能力是否已经能支撑真实写代码/调试；如有缺口，补齐最小可验证闭环；需要调用工具时保留审批边界；需要改代码时输出最小 diff，并给出安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendCatalogEvidenceToPrompt(kind, item = {}) {
+  const context = buildCatalogEvidenceContext(kind, item);
+  if (!context) {
+    showToast("暂无可加入提示词的目录证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `${catalogEvidenceTitle(kind, item)}已加入提示词`,
+    label: catalogEvidenceLabel(kind),
+    state: item.status || item.policy?.access || item.probe?.status || "catalog",
+    body: context.slice(0, 12000)
+  });
+  showToast("目录证据已加入提示词。");
+  return context;
+}
+
+function runCatalogEvidenceRepair(kind, item = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动目录证据修复。");
+    return "";
+  }
+  const context = buildCatalogEvidenceContext(kind, item);
+  if (!context) {
+    showToast("暂无可用于修复的目录证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这条目录证据继续改进：补齐工具/扩展/MCP 在真实编码、调试、证据复用或审批闭环上的最大短板；保留安全边界，更新必要文档，并执行或给出安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动目录证据修复：${item.name || kind}`,
+    label: catalogEvidenceLabel(kind),
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于目录证据启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function mcpResourceTitle(detail = {}) {
+  return `${detail.serverName || "mcp"} ${detail.uri || "resource"}`.trim();
+}
+
+function compactMcpResourceEvidence(detail = {}, max = 12000) {
+  return JSON.stringify({
+    serverName: detail.serverName,
+    uri: detail.uri,
+    policy: detail.policy,
+    contents: detail.contents,
+    errors: detail.errors
+  }, null, 2).slice(0, max);
+}
+
+function buildMcpResourceEvidenceContext(detail = {}) {
+  const contents = detail.contents || [];
+  if (!detail.serverName && !detail.uri && !contents.length) return "";
+  const textBlocks = contents
+    .map((item, index) => {
+      const text = item.text || item.blob || item.mimeType || "";
+      return text ? `### content ${index + 1}\n${String(text).slice(0, 6000)}` : "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+  return [
+    "请基于这份 MCP resource 内容继续排查、集成或修复当前项目。",
+    "",
+    `MCP server：${detail.serverName || ""}`,
+    `Resource URI：${detail.uri || ""}`,
+    detail.policy ? `策略：${JSON.stringify(detail.policy)}` : "",
+    "",
+    "Resource 内容：",
+    textBlocks || compactMcpResourceEvidence(detail, 8000),
+    "",
+    "要求：先判断这份 resource 是否包含代码、配置、接口 schema、文档或调试线索；如果需要改当前项目，请输出最小 diff；如果需要调用 MCP tool，必须保留审批边界；给出安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendMcpResourceEvidenceToPrompt(detail = {}) {
+  const context = buildMcpResourceEvidenceContext(detail);
+  if (!context) {
+    showToast("暂无可加入提示词的 MCP 资源证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `MCP 资源证据已加入提示词：${mcpResourceTitle(detail)}`,
+    label: "mcp",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("MCP 资源证据已加入提示词。");
+  return context;
+}
+
+function runMcpResourceEvidenceRepair(detail = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再处理 MCP 资源。");
+    return "";
+  }
+  const context = buildMcpResourceEvidenceContext(detail);
+  if (!context) {
+    showToast("暂无可用于处理的 MCP 资源证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这份 MCP resource 继续处理：优先把 resource 中的可用线索转成代码修复、配置补齐、接口适配或下一步安全验证。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动 MCP 资源处理：${mcpResourceTitle(detail)}`,
+    label: "mcp",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于 MCP 资源启动处理。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendMcpResourceEvidenceCard(detail = {}) {
+  appendToolCall({
+    title: `MCP 资源读取：${mcpResourceTitle(detail)}`,
+    label: "mcp",
+    state: detail.contents?.length ? "完成" : "empty",
+    body: compactMcpResourceEvidence(detail)
+  });
+  const article = log.lastElementChild;
+  if (!article) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">直接处理</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendMcpResourceEvidenceToPrompt(detail);
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    runMcpResourceEvidenceRepair(detail);
+  });
+  article.appendChild(actions);
+}
+
+function appendCatalogDetailCard(kind, item = {}) {
+  appendToolCall({
+    title: catalogEvidenceTitle(kind, item),
+    label: catalogEvidenceLabel(kind),
+    state: item.status || item.policy?.source || item.type || item.probe?.status || "catalog",
+    body: JSON.stringify(item, null, 2).slice(0, 12000)
   });
 }
 
@@ -793,17 +6836,22 @@ function renderToolCatalog(catalog) {
   tools.slice(0, 8).forEach((tool) => {
     const row = document.createElement("div");
     row.className = "capability-row implemented";
-    row.innerHTML = `<strong></strong><small></small>`;
+    row.innerHTML = `<strong></strong><small></small><span class="capability-actions"><button type="button" data-action="detail">详情</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">直接补齐</button></span>`;
     row.querySelector("strong").textContent = tool.name || "tool";
     row.querySelector("small").textContent = `${tool.policy?.access || "unknown"} · ${tool.description || ""}`;
-    row.addEventListener("click", () => {
-      appendToolCall({
-        title: `工具详情：${tool.name}`,
-        label: "tool",
-        state: tool.policy?.source || "builtin",
-        body: JSON.stringify(tool, null, 2)
-      });
+    row.querySelector("[data-action='detail']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendCatalogDetailCard("tool", tool);
     });
+    row.querySelector("[data-action='prompt']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendCatalogEvidenceToPrompt("tool", tool);
+    });
+    row.querySelector("[data-action='repair']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      runCatalogEvidenceRepair("tool", tool);
+    });
+    row.addEventListener("click", () => appendCatalogDetailCard("tool", tool));
     toolCatalogList.appendChild(row);
   });
 }
@@ -819,56 +6867,57 @@ function renderExtensionCatalog(catalog) {
   extensions.slice(0, 8).forEach((extension) => {
     const row = document.createElement("div");
     row.className = "capability-row partial";
-    row.innerHTML = `<strong></strong><small></small><button type="button" data-action="resource">读资源</button><button type="button" data-action="call">调用示例</button>`;
+    row.innerHTML = `<strong></strong><small></small><span class="capability-actions"><button type="button" data-action="detail">详情</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">直接补齐</button><button type="button" data-action="call">调用示例</button></span>`;
     row.querySelector("strong").textContent = extension.name || "extension";
     row.querySelector("small").textContent = `${extension.type || "extension"} · ${extension.policy?.access || "declared"} · ${extension.trust?.status || "trust-unknown"} · ${(extension.tools || []).length} 工具 · ${extension.description || ""}`;
-    row.addEventListener("click", () => {
-      appendToolCall({
-        title: `扩展详情：${extension.name}`,
-        label: "extension",
-        state: extension.type || "local",
-        body: JSON.stringify(extension, null, 2)
-      });
-    });
-    const resourceButton = row.querySelector("[data-action='resource']");
-    resourceButton.disabled = probe.status !== "probed" || !probe.resources?.length;
-    resourceButton.addEventListener("click", async (event) => {
+    row.querySelector("[data-action='detail']").addEventListener("click", (event) => {
       event.stopPropagation();
-      try {
-        const resource = probe.resources[0];
-        const detail = await api("/api/mcp-resource", {
-          method: "POST",
-          body: JSON.stringify({ serverName: server.name, uri: resource.uri })
-        });
-        appendToolCall({
-          title: `MCP 资源读取：${server.name}`,
-          label: "mcp",
-          state: detail.contents?.length ? "完成" : "empty",
-          body: JSON.stringify(detail, null, 2).slice(0, 12000)
-        });
-      } catch (error) {
-        appendToolCall({ title: `MCP 资源读取失败：${server.name}`, label: "mcp", state: "失败", body: error.message });
-      }
+      appendCatalogDetailCard("extension", extension);
     });
+    row.querySelector("[data-action='prompt']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendCatalogEvidenceToPrompt("extension", extension);
+    });
+    row.querySelector("[data-action='repair']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      runCatalogEvidenceRepair("extension", extension);
+    });
+    row.addEventListener("click", () => appendCatalogDetailCard("extension", extension));
     const callButton = row.querySelector("[data-action='call']");
     callButton.disabled = !(extension.tools || []).length;
     callButton.addEventListener("click", async (event) => {
       event.stopPropagation();
-      try {
-        const tool = extension.tools[0];
+      const tool = (extension.tools || [])[0] || {};
+      const request = { extensionName: extension.name, toolName: tool.name, arguments: {} };
+      const runCall = async () => {
         const plan = await api("/api/extension-tool-call", {
           method: "POST",
-          body: JSON.stringify({ extensionName: extension.name, toolName: tool.name, arguments: {} })
+          body: JSON.stringify(request)
         });
-        appendToolCall({
+        appendApprovalPlanCard(plan, {
           title: `扩展工具调用审批：${extension.name}.${tool.name}`,
           label: "extension",
-          state: plan.status || "approval_required",
-          body: JSON.stringify(plan, null, 2).slice(0, 12000)
         });
         await refreshHealth();
+      };
+      try {
+        await runCall();
       } catch (error) {
-        appendToolCall({ title: `扩展工具调用失败：${extension.name}`, label: "extension", state: "失败", body: error.message });
+        showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "extension",
+          action: "extension-tool-call",
+          targetName: `${extension.name || "extension"}.${tool.name || "tool"}`,
+          endpoint: "/api/extension-tool-call",
+          request,
+          item: extension,
+          error
+        }, {
+          title: `扩展工具调用失败：${extension.name}`,
+          label: "extension",
+          retry: runCall,
+          safe: () => runCatalogEvidenceRepair("extension", extension)
+        });
       }
     });
     extensionCatalogList.appendChild(row);
@@ -887,43 +6936,223 @@ function renderMcpCatalog(catalog) {
     const row = document.createElement("div");
     const probe = server.probe || {};
     row.className = `capability-row ${server.disabled ? "missing" : probe.status === "probed" ? "implemented" : "partial"}`;
-    row.innerHTML = `<strong></strong><small></small><button type="button" data-action="call">调用示例</button>`;
+    row.innerHTML = `<strong></strong><small></small><span class="capability-actions"><button type="button" data-action="detail">详情</button><button type="button" data-action="resource">读资源</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">直接补齐</button><button type="button" data-action="call">调用示例</button></span>`;
     row.querySelector("strong").textContent = server.name || "mcp-server";
     const probeText = probe.status
       ? ` · ${probe.status}${probe.counts ? ` · ${probe.counts.tools || 0} 工具 / ${probe.counts.resources || 0} 资源` : ""}`
       : "";
     row.querySelector("small").textContent = `${server.transport || "stdio"} · ${server.status || "configured"}${probeText} · ${server.source || ""}`;
-    row.addEventListener("click", () => {
-      appendToolCall({
-        title: `MCP 详情：${server.name}`,
-        label: "mcp",
-        state: server.status || "configured",
-        body: JSON.stringify(server, null, 2)
-      });
+    row.querySelector("[data-action='detail']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendCatalogDetailCard("mcp", server);
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      appendCatalogEvidenceToPrompt("mcp", server);
+    });
+    row.querySelector("[data-action='repair']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      runCatalogEvidenceRepair("mcp", server);
+    });
+    row.addEventListener("click", () => appendCatalogDetailCard("mcp", server));
+    const resourceButton = row.querySelector("[data-action='resource']");
+    resourceButton.disabled = probe.status !== "probed" || !probe.resources?.length;
+    resourceButton.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const resource = (probe.resources || [])[0] || {};
+      const request = { serverName: server.name, uri: resource.uri };
+      const readResource = async () => {
+        const detail = await api("/api/mcp-resource", {
+          method: "POST",
+          body: JSON.stringify(request)
+        });
+        appendMcpResourceEvidenceCard({
+          ...detail,
+          serverName: server.name,
+          uri: resource.uri
+        });
+      };
+      try {
+        await readResource();
+      } catch (error) {
+        showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "mcp",
+          action: "mcp-resource-read",
+          targetName: `${server.name || "mcp"}.${resource.uri || "resource"}`,
+          endpoint: "/api/mcp-resource",
+          request,
+          item: server,
+          error
+        }, {
+          title: `MCP 资源读取失败：${server.name}`,
+          label: "mcp",
+          retry: readResource,
+          safe: () => runCatalogEvidenceRepair("mcp", server)
+        });
+      }
     });
     const callButton = row.querySelector("[data-action='call']");
     callButton.disabled = probe.status !== "probed" || !probe.tools?.length;
     callButton.addEventListener("click", async (event) => {
       event.stopPropagation();
-      try {
-        const tool = probe.tools[0];
+      const tool = (probe.tools || [])[0] || {};
+      const request = { serverName: server.name, toolName: tool.name, arguments: {} };
+      const runCall = async () => {
         const plan = await api("/api/mcp-tool-call", {
           method: "POST",
-          body: JSON.stringify({ serverName: server.name, toolName: tool.name, arguments: {} })
+          body: JSON.stringify(request)
         });
-        appendToolCall({
+        appendApprovalPlanCard(plan, {
           title: `MCP 工具调用审批：${server.name}.${tool.name}`,
           label: "mcp",
-          state: plan.status || "approval_required",
-          body: JSON.stringify(plan, null, 2).slice(0, 12000)
         });
         await refreshHealth();
+      };
+      try {
+        await runCall();
       } catch (error) {
-        appendToolCall({ title: `MCP 工具调用失败：${server.name}`, label: "mcp", state: "失败", body: error.message });
+        showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "mcp",
+          action: "mcp-tool-call",
+          targetName: `${server.name || "mcp"}.${tool.name || "tool"}`,
+          endpoint: "/api/mcp-tool-call",
+          request,
+          item: server,
+          error
+        }, {
+          title: `MCP 工具调用失败：${server.name}`,
+          label: "mcp",
+          retry: runCall,
+          safe: () => runCatalogEvidenceRepair("mcp", server)
+        });
       }
     });
     mcpCatalogList.appendChild(row);
   });
+}
+
+function compactAssetEvidence(asset = {}, detail = null, max = 12000) {
+  return JSON.stringify({
+    asset,
+    detail
+  }, null, 2).slice(0, max);
+}
+
+async function inspectAsset(asset = {}) {
+  if (!asset?.path) throw new Error("资产缺少 path。");
+  return api(`/api/asset-inspect?path=${encodeURIComponent(asset.path)}`);
+}
+
+function buildAssetEvidenceContext(asset = {}, detail = null) {
+  if (!asset?.path) return "";
+  return [
+    "请基于这个工作区资产继续排查、解释或修改当前项目。",
+    "",
+    `资产路径：${asset.path}`,
+    `资产类型：${asset.type || "unknown"}`,
+    asset.ext ? `扩展名：${asset.ext}` : "",
+    asset.size ? `大小：${formatBytes(asset.size)}` : "",
+    "",
+    "资产检查摘要：",
+    compactAssetEvidence(asset, detail),
+    "",
+    "要求：优先使用 @file 引用读取原始资产；如果资产暴露 UI、数据、文档或多媒体处理问题，请输出最小 diff 或下一步安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendAssetFailureEvidence(asset = {}, error, {
+  title = "资产处理失败",
+  action = "asset-inspect",
+  retry = null
+} = {}) {
+  return appendActionFailureEvidence({
+    kind: "asset",
+    action,
+    targetName: asset.path || "asset",
+    endpoint: asset.path ? `/api/asset-inspect?path=${encodeURIComponent(asset.path)}` : "/api/asset-inspect",
+    request: { path: asset.path || "" },
+    item: asset,
+    error
+  }, {
+    title,
+    label: "asset",
+    retry,
+    safe: asset.path ? () => referenceFileInPrompt(asset.path, { titlePrefix: "已引用资产文件" }) : null
+  });
+}
+
+async function appendAssetEvidenceToPrompt(asset = {}) {
+  const retry = () => appendAssetEvidenceToPrompt(asset);
+  try {
+    const detail = await inspectAsset(asset);
+    const context = buildAssetEvidenceContext(asset, detail);
+    if (!context) {
+      showToast("暂无可加入提示词的资产证据。");
+      return "";
+    }
+    const current = input.value.trim();
+    input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: `资产证据已加入提示词：${asset.path}`,
+      label: "asset",
+      state: detail.type || asset.type || "ready",
+      body: context.slice(0, 12000)
+    });
+    showToast("资产证据已加入提示词。");
+    return context;
+  } catch (error) {
+    showToast(error.message);
+    appendAssetFailureEvidence(asset, error, {
+      title: `资产证据加入失败：${asset.path || "asset"}`,
+      action: "asset-prompt",
+      retry
+    });
+    return "";
+  }
+}
+
+async function runAssetEvidenceRepair(asset = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动资产处理。");
+    return "";
+  }
+  const retry = () => runAssetEvidenceRepair(asset);
+  try {
+    const detail = await inspectAsset(asset);
+    const context = buildAssetEvidenceContext(asset, detail);
+    if (!context) {
+      showToast("暂无可用于处理的资产证据。");
+      return "";
+    }
+    const prompt = [
+      context,
+      "",
+      "请现在直接基于这个资产继续处理：判断它对当前编码/调试任务的价值，必要时修改代码接入、解析、展示或验证该资产，并给出安全验证命令。"
+    ].join("\n");
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: `已启动资产证据处理：${asset.path}`,
+      label: "asset",
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于资产证据启动处理任务。");
+    submitPromptForm();
+    return prompt;
+  } catch (error) {
+    showToast(error.message);
+    appendAssetFailureEvidence(asset, error, {
+      title: `资产证据处理失败：${asset.path || "asset"}`,
+      action: "asset-repair",
+      retry
+    });
+    return "";
+  }
 }
 
 function renderAssetCatalog(catalog) {
@@ -937,12 +7166,12 @@ function renderAssetCatalog(catalog) {
   assets.slice(0, 8).forEach((asset) => {
     const row = document.createElement("div");
     row.className = "capability-row partial";
-    row.innerHTML = `<strong></strong><small></small>`;
+    row.innerHTML = `<strong></strong><small></small><span class="capability-actions"><button type="button" data-action="detail">详情</button><button type="button" data-action="reference">引用文件</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">直接处理</button></span>`;
     row.querySelector("strong").textContent = asset.path || "asset";
     row.querySelector("small").textContent = `${asset.type || "asset"} · ${asset.ext || ""} · ${Math.round((asset.size || 0) / 1024)} KB`;
-    row.addEventListener("click", async () => {
+    const showDetail = async () => {
       try {
-        const detail = await api(`/api/asset-inspect?path=${encodeURIComponent(asset.path)}`);
+        const detail = await inspectAsset(asset);
         appendToolCall({
           title: `资产检查：${asset.path}`,
           label: "asset",
@@ -950,13 +7179,32 @@ function renderAssetCatalog(catalog) {
           body: JSON.stringify(detail, null, 2).slice(0, 12000)
         });
       } catch (error) {
-        appendToolCall({
+        showToast(error.message);
+        appendAssetFailureEvidence(asset, error, {
           title: `资产检查失败：${asset.path}`,
-          label: "asset",
-          state: "失败",
-          body: error.message
+          action: "asset-detail",
+          retry: showDetail
         });
       }
+    };
+    row.querySelector("[data-action='detail']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await showDetail();
+    });
+    row.querySelector("[data-action='reference']").addEventListener("click", (event) => {
+      event.stopPropagation();
+      referenceFileInPrompt(asset.path, { titlePrefix: "已引用资产文件" });
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await appendAssetEvidenceToPrompt(asset);
+    });
+    row.querySelector("[data-action='repair']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await runAssetEvidenceRepair(asset);
+    });
+    row.addEventListener("click", async () => {
+      await showDetail();
     });
     assetCatalogList.appendChild(row);
   });
@@ -968,11 +7216,64 @@ function renderGoal(goal) {
   const phase = goal?.phase || "idle";
   const status = goal?.status || "idle";
   const nextStep = goal?.nextStep || "输入任务并运行代理。";
+  const recovery = state.lastRecoverySummary || {};
   const verification = goal?.lastVerification
     ? `验证：${goal.lastVerification.skipped ? "跳过" : goal.lastVerification.ok ? "通过" : "失败"} · ${goal.lastVerification.checkCount || 0} 项`
     : "验证：暂无";
   goalState.querySelector("p").textContent = objective;
   goalState.querySelector("small").textContent = `${phase} / ${status} · ${verification} · 下一步：${nextStep}`;
+  let recoveryBox = goalState.querySelector(".goal-recovery-summary");
+  if (!recoveryBox) {
+    recoveryBox = document.createElement("div");
+    recoveryBox.className = "goal-recovery-summary";
+    goalState.appendChild(recoveryBox);
+  }
+  const recoveryItems = [
+    ...(recovery.cues || []),
+    recovery.lastFailedCommand ? `失败命令：${recovery.lastFailedCommand}` : "",
+    recovery.changedFiles?.length ? `变更文件：${recovery.changedFiles.length}` : "",
+    recovery.verificationCommands?.length ? `验证命令：${recovery.verificationCommands.length}` : "",
+    ...(recovery.nextActions || []).slice(0, 2).map((item) => `下一步：${item}`)
+  ].filter(Boolean).slice(0, 6);
+  recoveryBox.innerHTML = recoveryItems.length
+    ? recoveryItems.map((item) => `<span></span>`).join("")
+    : `<span>暂无恢复线索</span>`;
+  recoveryBox.querySelectorAll("span").forEach((item, index) => {
+    item.textContent = recoveryItems[index] || "暂无恢复线索";
+  });
+  let actions = goalState.querySelector(".goal-actions");
+  if (!actions) {
+    actions = document.createElement("div");
+    actions.className = "goal-actions";
+    actions.innerHTML = `
+      <button type="button" data-goal-action="prompt">加入提示词</button>
+      <button type="button" data-goal-action="commands">验证命令</button>
+      <button type="button" data-goal-action="continue">继续目标</button>
+    `;
+    goalState.appendChild(actions);
+  }
+  const capability = recommendedCapabilityFromState();
+  const canContinue = Boolean(goal?.objective || state.lastPrompt || capability);
+  const recoveryCommands = normalizeCommandItems((recovery.verificationCommands || []).map((command) => ({
+    command,
+    reason: "从可恢复状态恢复的最近验证命令。"
+  })));
+  actions.querySelector("[data-goal-action='prompt']").disabled = !canContinue;
+  actions.querySelector("[data-goal-action='commands']").disabled = !capability && !recoveryCommands.length;
+  actions.querySelector("[data-goal-action='continue']").disabled = !canContinue;
+  actions.querySelector("[data-goal-action='prompt']").onclick = () => appendGoalContinuationToPrompt(goal);
+  actions.querySelector("[data-goal-action='commands']").onclick = async () => {
+    if (recoveryCommands.length) {
+      stageRepairVerificationCommands(recoveryCommands, {
+        title: "可恢复状态验证命令",
+        successTitle: "可恢复状态验证命令已放入面板",
+        source: "goal-recovery"
+      });
+      return;
+    }
+    await stageCapabilityVerificationCommands(capability || {});
+  };
+  actions.querySelector("[data-goal-action='continue']").onclick = () => runGoalContinuation(goal);
 }
 
 function restorePendingProposal(goal) {
@@ -988,6 +7289,177 @@ function restorePendingProposal(goal) {
   appendMessage("agent", `已恢复待审批方案：${proposal.type === "repair" ? "修复 diff" : "代理 diff"}。`);
 }
 
+function buildQueuePromptContext(item = {}) {
+  if (!item?.id && !item?.prompt) return "";
+  const recommendedCapability = recommendedCapabilityFromState();
+  const recommendedCapabilityContext = recommendedCapability ? buildCapabilityGapContext(recommendedCapability) : "";
+  return [
+    "请基于这条队列任务继续当前编码/调试工作。",
+    "",
+    `队列 ID：${item.id || ""}`,
+    `状态：${item.status || "queued"}`,
+    `隔离组：${item.isolationGroup || "default"}`,
+    `优先级：${item.priority || 0}`,
+    `重试：${item.retryCount || 0}/${item.retryLimit || 0}`,
+    item.createdAt ? `创建时间：${item.createdAt}` : "",
+    "",
+    "队列任务提示词：",
+    item.prompt || "(无提示词)",
+    recommendedCapabilityContext ? `推荐能力缺口：\n${recommendedCapabilityContext}` : "",
+    "",
+    "队列证据 JSON：",
+    JSON.stringify(item, null, 2).slice(0, 8000),
+    "",
+    "要求：先核对当前工作树和必要文件；如果队列任务已经过期，请以当前状态为准调整；优先结合推荐能力缺口完成最小可验证改动，并给出或执行安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendQueueContextToPrompt(item = {}) {
+  const context = buildQueuePromptContext(item);
+  if (!context) {
+    showToast("暂无可加入提示词的队列任务。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `队列任务已加入提示词：${item.id || "queued"}`,
+    label: "queue",
+    state: item.status || "queued",
+    body: context.slice(0, 12000)
+  });
+  showToast("队列任务已加入提示词。");
+  return context;
+}
+
+async function runQueueContinuation(item = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再继续队列任务。");
+    return "";
+  }
+  let activeItem = item;
+  try {
+    if (item.status === "queued" && item.id) {
+      activeItem = await api("/api/queue", {
+        method: "PATCH",
+        body: JSON.stringify({ id: item.id, status: "active" })
+      });
+      await refreshHealth();
+    }
+    const context = buildQueuePromptContext(activeItem);
+    if (!context) {
+      showToast("暂无可用于继续的队列任务。");
+      return "";
+    }
+    const prompt = [
+      context,
+      "",
+      "请现在直接基于这条队列任务继续推进：读取必要文件，保留已有正确改动，完成下一步最小可验证修复或增强。"
+    ].join("\n");
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: `已启动队列任务继续：${activeItem.id || "queued"}`,
+      label: "queue",
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于队列任务启动继续任务。");
+    submitPromptForm();
+    return prompt;
+  } catch (error) {
+    showToast(error.message);
+    appendActionFailureEvidence({
+      kind: "queue",
+      action: "queue-continuation",
+      targetName: item.id || item.prompt || "queued",
+      endpoint: "/api/queue",
+      request: { id: item.id || "", status: item.status || "" },
+      item,
+      error
+    }, {
+      title: "队列任务继续失败",
+      label: "queue",
+      retry: () => runQueueContinuation(item),
+      safe: () => appendQueueContextToPrompt(item)
+    });
+    return "";
+  }
+}
+
+async function stageQueueVerificationCommands(item = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再生成队列验证命令。");
+    return [];
+  }
+  const commands = [
+    ...state.pendingCommands.map((command) => command.command || command)
+  ];
+  setBusy(true, "生成队列验证命令");
+  try {
+    const result = await api("/api/verification-plan", {
+      method: "POST",
+      body: JSON.stringify({ limit: 12, commands })
+    });
+    const planCommands = verificationPlanCommands(result.plan);
+    if (!planCommands.length) {
+      appendToolCall({
+        title: `队列任务验证命令未生成：${item.id || "queued"}`,
+        label: "$",
+        state: "跳过",
+        body: JSON.stringify(result.plan || {}, null, 2).slice(0, 8000)
+      });
+      showToast("当前队列任务没有可复用验证命令。");
+      setBusy(false, "无验证命令");
+      return [];
+    }
+    renderVerificationPlan(result.plan, { logCommands: true });
+    stageRepairVerificationCommands(planCommands, {
+      title: "队列任务验证命令",
+      successTitle: `队列任务验证命令已放入面板：${item.id || "queued"}`,
+      source: "queue-task"
+    });
+    const recommendedCapability = recommendedCapabilityFromState();
+    appendToolCall({
+      title: `队列任务验证上下文：${item.id || "queued"}`,
+      label: "queue",
+      state: result.plan?.status || "ready",
+      body: [
+        item.prompt ? `队列任务：${item.prompt}` : "",
+        item.status ? `状态：${item.status}` : "",
+        recommendedCapability?.area ? `推荐缺口：${recommendedCapability.area}` : "",
+        "",
+        commandItemsToText(planCommands)
+      ].filter(Boolean).join("\n").slice(0, 12000)
+    });
+    setBusy(false, "队列验证命令已加入");
+    return planCommands;
+  } catch (error) {
+    showToast(error.message);
+    appendActionFailureEvidence({
+      kind: "queue",
+      action: "queue-verification-commands",
+      targetName: item.id || item.prompt || "queued",
+      endpoint: "/api/verification-plan",
+      request: {
+        id: item.id || "",
+        commands
+      },
+      item,
+      error
+    }, {
+      title: `队列验证命令生成失败：${item.id || "queued"}`,
+      label: "queue",
+      retry: () => stageQueueVerificationCommands(item),
+      safe: () => appendQueueContextToPrompt(item)
+    });
+    setBusy(false, "队列验证命令失败");
+    return [];
+  }
+}
+
 function renderQueue(queue = []) {
   if (!queueList) return;
   queueList.innerHTML = "";
@@ -998,10 +7470,19 @@ function renderQueue(queue = []) {
   queue.slice(0, 6).forEach((item) => {
     const row = document.createElement("div");
     row.className = `queue-row ${item.status || "queued"}`;
-    row.innerHTML = `<strong></strong><small></small><button type="button" data-action="toggle"></button><button type="button" data-action="retry">重试</button>`;
+    row.innerHTML = `<strong></strong><small></small><span class="queue-row-actions"><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="commands">验证命令</button><button type="button" data-action="continue">直接继续</button><button type="button" data-action="toggle"></button><button type="button" data-action="retry">重试</button></span>`;
     row.querySelector("strong").textContent = item.prompt || "(无提示词)";
     row.querySelector("small").textContent = `${item.status || "queued"} · ${item.isolationGroup || "default"} · P${item.priority || 0} · retry ${item.retryCount || 0}/${item.retryLimit || 0} · ${item.createdAt?.slice(0, 19) || ""}`;
     row.querySelector("[data-action='toggle']").textContent = item.status === "active" ? "完成+下个" : "激活";
+    row.querySelector("[data-action='prompt']").addEventListener("click", () => {
+      appendQueueContextToPrompt(item);
+    });
+    row.querySelector("[data-action='continue']").addEventListener("click", () => {
+      runQueueContinuation(item);
+    });
+    row.querySelector("[data-action='commands']").addEventListener("click", async () => {
+      await stageQueueVerificationCommands(item);
+    });
     row.querySelector("[data-action='toggle']").addEventListener("click", async () => {
       const nextStatus = item.status === "active" ? "done" : "active";
       try {
@@ -1016,6 +7497,26 @@ function renderQueue(queue = []) {
         await refreshHealth();
       } catch (error) {
         showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "queue",
+          action: "queue-toggle",
+          targetName: item.id || item.prompt || "queued",
+          endpoint: "/api/queue",
+          request: { id: item.id, status: nextStatus, autoNext: nextStatus === "done" },
+          item,
+          error
+        }, {
+          title: `队列状态更新失败：${item.id || "queued"}`,
+          label: "queue",
+          retry: async () => {
+            await api("/api/queue", {
+              method: "PATCH",
+              body: JSON.stringify({ id: item.id, status: nextStatus, autoNext: nextStatus === "done" })
+            });
+            await refreshHealth();
+          },
+          safe: () => appendQueueContextToPrompt(item)
+        });
       }
     });
     row.querySelector("[data-action='retry']").addEventListener("click", async () => {
@@ -1027,10 +7528,1367 @@ function renderQueue(queue = []) {
         await refreshHealth();
       } catch (error) {
         showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "queue",
+          action: "queue-retry",
+          targetName: item.id || item.prompt || "queued",
+          endpoint: "/api/queue",
+          request: { id: item.id, status: "retry" },
+          item,
+          error
+        }, {
+          title: `队列重试失败：${item.id || "queued"}`,
+          label: "queue",
+          retry: async () => {
+            await api("/api/queue", {
+              method: "PATCH",
+              body: JSON.stringify({ id: item.id, status: "retry" })
+            });
+            await refreshHealth();
+          },
+          safe: () => appendQueueContextToPrompt(item)
+        });
       }
     });
     queueList.appendChild(row);
   });
+}
+
+function buildProcessEvidenceContext(item = {}, { title = "受管进程证据" } = {}) {
+  if (!item?.id && !item?.command && !item?.processId) return "";
+  const probe = item.probe ? [
+    `probe status: ${item.probe.status || ""}`,
+    item.probe.url ? `probe url: ${item.probe.url}` : "",
+    item.probe.statusCode ? `probe HTTP: ${item.probe.statusCode}` : "",
+    item.probe.error ? `probe error: ${item.probe.error}` : ""
+  ].filter(Boolean).join("\n") : "";
+  const health = item.health || item.rules ? JSON.stringify({
+    health: item.health || null,
+    ok: item.ok,
+    rules: item.rules || null
+  }, null, 2).slice(0, 4000) : "";
+  return [
+    "请基于这条受管进程/开发服务证据继续排查并修复当前项目。",
+    "",
+    `证据类型：${title}`,
+    `进程 ID：${item.id || item.processId || ""}`,
+    item.command ? `命令：$ ${item.command}` : "",
+    `状态：${item.status || "unknown"}`,
+    item.pid ? `PID：${item.pid}` : "",
+    item.exitCode === null || item.exitCode === undefined ? "" : `退出码：${item.exitCode}`,
+    item.active === undefined ? "" : `active：${Boolean(item.active)}`,
+    item.policy ? `策略：${item.policy.risk || ""} · ${item.policy.reason || ""}` : "",
+    probe ? `探针：\n${probe}` : "",
+    health ? `健康规则：\n${health}` : "",
+    item.logPath ? `日志：${item.logPath}` : "",
+    item.artifactPath ? `artifact：${item.artifactPath}` : "",
+    item.outputBytes ? `输出大小：${formatBytes(item.outputBytes)}` : "",
+    "",
+    "输出尾部：",
+    (item.outputTail || item.context || item.text || "(无输出)").slice(0, 8000),
+    "",
+    "要求：先判断开发服务失败或不健康的根因；需要改代码时输出最小 diff；需要排查时给出安全命令；不要绕过本地进程策略。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendProcessEvidenceToPrompt(item = {}, options = {}) {
+  const context = buildProcessEvidenceContext(item, options);
+  if (!context) {
+    showToast("暂无可加入提示词的进程证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `进程证据已加入提示词：${item.command || item.id || item.processId}`,
+    label: "proc",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("进程证据已加入提示词。");
+  return context;
+}
+
+function runProcessEvidenceRepair(item = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动进程修复。");
+    return "";
+  }
+  const context = buildProcessEvidenceContext(item, options);
+  if (!context) {
+    showToast("暂无可用于修复的进程证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这条进程证据继续修复：优先解释服务失败/探针异常原因，输出最小 diff 或下一步安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动进程证据修复：${item.command || item.id || item.processId}`,
+    label: "proc",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于进程证据启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendProcessFailureEvidence(error, {
+  title = "受管进程操作失败",
+  action = "process-action",
+  endpoint = "",
+  request = null,
+  item = {},
+  retry = null
+} = {}) {
+  const evidence = {
+    ...item,
+    id: item.id || item.processId || "",
+    processId: item.processId || item.id || "",
+    command: item.command || request?.command || "",
+    status: item.status || "failed",
+    policy: item.policy || null,
+    probe: item.probe || null,
+    outputTail: item.outputTail || "",
+    error: normalizeActionFailureError(error),
+    endpoint,
+    request,
+    action,
+    workspace: workspaceStatus?.textContent || ""
+  };
+  return appendActionFailureEvidence({
+    kind: "process",
+    action,
+    targetName: evidence.command || evidence.id || "process",
+    endpoint,
+    request,
+    item: evidence,
+    error
+  }, {
+    title,
+    label: "proc",
+    retry,
+    safe: () => appendProcessEvidenceToPrompt(evidence, { title })
+  });
+}
+
+function processProbeUrl(item = {}) {
+  return item.probe?.url || item.url || item.finalUrl || "";
+}
+
+async function runProcessBrowserEvidence(item = {}, { mode = "check", title = "受管进程" } = {}) {
+  const targetUrl = processProbeUrl(item);
+  if (!targetUrl) {
+    showToast("这条进程证据没有可检查的页面 URL。");
+    appendToolCall({
+      title: `进程页面调试跳过：${item.command || item.id || title}`,
+      label: "proc",
+      state: "跳过",
+      body: JSON.stringify({
+        id: item.id || item.processId || "",
+        command: item.command || "",
+        probe: item.probe || null
+      }, null, 2).slice(0, 4000)
+    });
+    return null;
+  }
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再做页面调试。");
+    return null;
+  }
+  if (browserCheckUrlInput) browserCheckUrlInput.value = targetUrl;
+  if (mode === "debug") {
+    setBusy(true, "一键调试进程页面");
+    try {
+      const [health, check, trace] = await Promise.all([
+        item.id
+          ? api(`/api/process-health?id=${encodeURIComponent(item.id)}&limit=20`).catch((error) => ({ ok: false, error: error.message }))
+          : Promise.resolve(null),
+        api("/api/browser-check", {
+          method: "POST",
+          body: JSON.stringify({ url: targetUrl })
+        }),
+        api("/api/browser-trace", {
+          method: "POST",
+          body: JSON.stringify({ url: targetUrl, waitMs: 1500 })
+        })
+      ]);
+      const result = {
+        ok: Boolean(check?.ok && trace?.ok),
+        url: targetUrl,
+        finalUrl: trace?.finalUrl || check?.finalUrl || targetUrl,
+        title: trace?.title || check?.title || "进程页面调试",
+        status: check?.status || trace?.status || "",
+        process: {
+          id: item.id || item.processId || "",
+          command: item.command || "",
+          status: item.status || "",
+          probe: item.probe || null
+        },
+        health,
+        check,
+        trace,
+        summary: {
+          healthy: health?.summary?.healthy || 0,
+          processRows: health?.rows?.length || 0,
+          httpStatus: check?.status || "",
+          traceConsole: trace?.summary?.console || 0,
+          traceExceptions: trace?.summary?.exceptions || 0,
+          traceNetwork: trace?.summary?.network || 0
+        },
+        artifactPath: trace?.artifactPath || check?.artifactPath || "",
+        policy: {
+          access: "managed-process-browser-debug",
+          executesCommands: false,
+          startsProcesses: false,
+          localUrlOnly: true
+        }
+      };
+      renderBrowserEvidenceRow(result, {
+        title: "进程页面一键调试",
+        kind: "process-browser-debug",
+        label: "debug",
+        state: result.ok ? "完成" : "异常",
+        heading: item.command || targetUrl,
+        summary: [
+          health ? `${health.summary?.healthy || 0} healthy` : "no health",
+          `HTTP ${check?.status || "-"}`,
+          `${trace?.summary?.console || 0} console`,
+          `${trace?.summary?.exceptions || 0} exceptions`,
+          trace?.artifactPath || "no trace"
+        ]
+      });
+      appendToolCall({
+        title: `进程页面一键调试：${item.command || item.id || targetUrl}`,
+        label: "debug",
+        state: result.ok ? "完成" : "异常",
+        body: JSON.stringify(result, null, 2).slice(0, 12000)
+      });
+      setBusy(false, result.ok ? "页面调试完成" : "页面调试异常");
+      return result;
+    } catch (error) {
+      showToast(error.message);
+      appendBrowserFailureEvidence(error, {
+        title: "进程页面一键调试失败",
+        kind: "process-browser-debug-failure",
+        label: "debug",
+        url: targetUrl,
+        body: {
+          process: {
+            id: item.id || item.processId || "",
+            command: item.command || "",
+            status: item.status || "",
+            probe: item.probe || null
+          }
+        }
+      });
+      setBusy(false, "页面调试失败");
+      return null;
+    }
+  }
+  const isTrace = mode === "trace";
+  setBusy(true, isTrace ? "采集进程页面 Trace" : "检查进程页面");
+  try {
+    const result = await api(isTrace ? "/api/browser-trace" : "/api/browser-check", {
+      method: "POST",
+      body: JSON.stringify({ url: targetUrl })
+    });
+    if (isTrace) {
+      renderBrowserTrace(result);
+    } else {
+      renderBrowserCheck(result);
+    }
+    appendToolCall({
+      title: `${isTrace ? "进程页面 Trace" : "进程页面检查"}：${item.command || item.id || targetUrl}`,
+      label: isTrace ? "trace" : "browser",
+      state: result.ok ? "完成" : "异常",
+      body: JSON.stringify({
+        process: {
+          id: item.id || item.processId || "",
+          command: item.command || "",
+          status: item.status || "",
+          probe: item.probe || null
+        },
+        browser: result
+      }, null, 2).slice(0, 12000)
+    });
+    setBusy(false, result.ok ? (isTrace ? "Trace 完成" : "页面正常") : (isTrace ? "Trace 异常" : "页面异常"));
+    return result;
+  } catch (error) {
+    showToast(error.message);
+    appendBrowserFailureEvidence(error, {
+      title: isTrace ? "进程页面 Trace 失败" : "进程页面检查失败",
+      kind: isTrace ? "process-browser-trace-failure" : "process-browser-check-failure",
+      label: isTrace ? "trace" : "browser",
+      url: targetUrl,
+      body: {
+        process: {
+          id: item.id || item.processId || "",
+          command: item.command || "",
+          status: item.status || "",
+          probe: item.probe || null
+        }
+      }
+    });
+    setBusy(false, isTrace ? "Trace 失败" : "检查失败");
+    return null;
+  }
+}
+
+function browserEvidenceUrl(result = {}) {
+  return result.finalUrl || result.url || result.targetUrl || "";
+}
+
+function browserEvidenceArtifactFiles(result = {}) {
+  return [
+    result.artifactPath,
+    result.path,
+    result.diffPath,
+    result.comparison?.diffPath
+  ]
+    .filter(Boolean)
+    .map((file) => String(file).replaceAll("\\", "/"))
+    .filter((file, index, files) => files.indexOf(file) === index)
+    .slice(0, 6);
+}
+
+function compactBrowserEvidence(result = {}) {
+  const traceFailures = Array.isArray(result.network)
+    ? result.network.filter((item) => item.failed || Number(item.status) >= 400).slice(0, 12)
+    : [];
+  const nestedTrace = result.trace && typeof result.trace === "object" ? result.trace : null;
+  const nestedCheck = result.check && typeof result.check === "object" ? result.check : null;
+  const nestedHealth = result.health && typeof result.health === "object" ? result.health : null;
+  const nestedTraceFailures = Array.isArray(nestedTrace?.network)
+    ? nestedTrace.network.filter((item) => item.failed || Number(item.status) >= 400).slice(0, 12)
+    : [];
+  return {
+    ok: result.ok,
+    status: result.status || result.audit?.status || "",
+    url: result.url || "",
+    finalUrl: result.finalUrl || "",
+    title: result.title || result.name || "",
+    elapsedMs: result.elapsedMs,
+    dimensions: result.width || result.height ? `${result.width || "-"}x${result.height || "-"}` : "",
+    bytes: result.bytes,
+    size: result.size,
+    artifactPath: result.artifactPath || "",
+    path: result.path || "",
+    diffPath: result.diffPath || result.comparison?.diffPath || "",
+    counts: result.counts || null,
+    selectors: Array.isArray(result.selectors) ? result.selectors.slice(0, 20) : [],
+    summary: result.summary || null,
+    audit: result.audit || null,
+    diffs: Array.isArray(result.diffs) ? result.diffs.slice(0, 20) : [],
+    actions: Array.isArray(result.actions) ? result.actions.slice(0, 20) : [],
+    comparison: result.comparison || null,
+    console: Array.isArray(result.console) ? result.console.slice(0, 12) : [],
+    exceptions: Array.isArray(result.exceptions) ? result.exceptions.slice(0, 12) : [],
+    failedNetwork: traceFailures,
+    process: result.process || null,
+    health: nestedHealth ? {
+      summary: nestedHealth.summary || null,
+      rules: nestedHealth.rules || null,
+      rows: Array.isArray(nestedHealth.rows)
+        ? nestedHealth.rows.slice(0, 6).map((row) => ({
+          id: row.id,
+          command: row.command,
+          status: row.status,
+          ok: row.ok,
+          health: row.health,
+          probe: row.probe,
+          rules: row.rules
+        }))
+        : [],
+      error: nestedHealth.error || ""
+    } : null,
+    browserCheck: nestedCheck ? {
+      ok: nestedCheck.ok,
+      status: nestedCheck.status || "",
+      finalUrl: nestedCheck.finalUrl || nestedCheck.url || "",
+      title: nestedCheck.title || "",
+      counts: nestedCheck.counts || null,
+      error: nestedCheck.error || nestedCheck.reason || ""
+    } : null,
+    browserTrace: nestedTrace ? {
+      ok: nestedTrace.ok,
+      status: nestedTrace.status || "",
+      finalUrl: nestedTrace.finalUrl || nestedTrace.url || "",
+      title: nestedTrace.title || "",
+      artifactPath: nestedTrace.artifactPath || "",
+      summary: nestedTrace.summary || null,
+      console: Array.isArray(nestedTrace.console) ? nestedTrace.console.slice(0, 12) : [],
+      exceptions: Array.isArray(nestedTrace.exceptions) ? nestedTrace.exceptions.slice(0, 12) : [],
+      failedNetwork: nestedTraceFailures,
+      error: nestedTrace.error || nestedTrace.reason || ""
+    } : null,
+    errors: Array.isArray(result.errors) ? result.errors.slice(0, 20) : [],
+    error: result.error || result.reason || "",
+    policy: result.policy || null
+  };
+}
+
+function buildBrowserEvidenceContext(result = {}, { title = "浏览器证据", kind = "browser" } = {}) {
+  if (!result || typeof result !== "object") return "";
+  const url = browserEvidenceUrl(result);
+  const compact = compactBrowserEvidence(result);
+  const statusText = result.ok ? "通过/完成" : "失败/异常";
+  const body = JSON.stringify(compact, null, 2).slice(0, 10000);
+  return [
+    "请基于这条本地浏览器调试证据继续排查并修复当前项目。",
+    "",
+    `证据类型：${title}`,
+    `证据分类：${kind}`,
+    url ? `页面 URL：${url}` : "",
+    `状态：${statusText}`,
+    result.artifactPath ? `artifact：${result.artifactPath}` : "",
+    result.path ? `截图/文件：${result.path}` : "",
+    result.diffPath || result.comparison?.diffPath ? `视觉 diff：${result.diffPath || result.comparison?.diffPath}` : "",
+    "",
+    "浏览器证据摘要：",
+    body,
+    "",
+    "要求：先判断页面、DOM、Trace、截图或视觉断言暴露的根因；需要改代码时输出最小 diff；需要验证时给出安全的本地命令或浏览器检查；不要绕过本地 URL 与浏览器策略。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendBrowserEvidenceToPrompt(result = {}, options = {}) {
+  const context = buildBrowserEvidenceContext(result, options);
+  if (!context) {
+    showToast("暂无可加入提示词的浏览器证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `浏览器证据已加入提示词：${options.title || browserEvidenceUrl(result) || "页面证据"}`,
+    label: options.kind || "browser",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("浏览器证据已加入提示词。");
+  return context;
+}
+
+function runBrowserEvidenceRepair(result = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动浏览器证据修复。");
+    return "";
+  }
+  const context = buildBrowserEvidenceContext(result, options);
+  if (!context) {
+    showToast("暂无可用于修复的浏览器证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这条浏览器证据继续修复：优先定位前端运行时异常、DOM/可访问性缺口、视觉回归或截图问题，并输出最小 diff 或下一步安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动浏览器证据修复：${options.title || browserEvidenceUrl(result) || "页面证据"}`,
+    label: options.kind || "browser",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于浏览器证据启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function buildBrowserVerificationPrompt(result = {}, options = {}) {
+  const context = buildBrowserEvidenceContext(result, options);
+  if (!context) return "";
+  const url = browserEvidenceUrl(result);
+  const artifactFiles = browserEvidenceArtifactFiles(result);
+  const commands = [
+    "node --check app.js",
+    "node --check server.js",
+    "node server.js --ui-smoke-test",
+    "node server.js --api-smoke-section=debug"
+  ];
+  return [
+    context,
+    "",
+    "目标：把这条页面/浏览器证据转成可验证修复闭环。",
+    artifactFiles.length ? `优先读取这些浏览器证据 artifact：\n${artifactFiles.map((file) => `@${file}`).join("\n")}` : "",
+    url ? `修复后优先复查页面：${url}` : "",
+    "",
+    "建议验证命令：",
+    ...commands.map((command) => `- ${command}`),
+    "",
+    "建议浏览器复查：",
+    url ? `- 页面检查：${url}` : "- 页面检查：复用本次证据里的本地 URL",
+    url ? `- 页面 Trace：${url}` : "- 页面 Trace：复用本次证据里的本地 URL",
+    "",
+    "输出要求：",
+    "1. 先判断页面异常来自前端运行时、DOM 结构、可访问性、网络请求、截图差异还是视觉回归。",
+    "2. 如果需要改代码，请生成最小 diff，避免无关重构。",
+    "3. 修复后必须说明应运行哪些本地命令和页面复查动作。",
+    "4. 如果证据是误报或环境问题，请说明依据，并给出下一步只读复查命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendBrowserVerificationPromptToPrompt(result = {}, options = {}) {
+  const prompt = buildBrowserVerificationPrompt(result, options);
+  if (!prompt) {
+    showToast("暂无可生成验证提示的浏览器证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `浏览器证据验证提示已加入提示词：${options.title || browserEvidenceUrl(result) || "页面证据"}`,
+    label: options.kind || "browser",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("浏览器证据验证提示已加入提示词。");
+  return prompt;
+}
+
+function runBrowserVerificationFix(result = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动浏览器验证修复。");
+    return "";
+  }
+  const prompt = buildBrowserVerificationPrompt(result, options);
+  if (!prompt) {
+    showToast("暂无可运行的浏览器验证修复提示。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动浏览器证据验证修复：${options.title || browserEvidenceUrl(result) || "页面证据"}`,
+    label: options.kind || "browser",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动带验证要求的页面修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+async function runBrowserEvidenceFollowup(result = {}, mode = "trace", options = {}) {
+  const targetUrl = browserEvidenceUrl(result);
+  if (!targetUrl) {
+    showToast("这条浏览器证据没有可继续检查的页面 URL。");
+    appendToolCall({
+      title: `浏览器后续检查跳过：${options.title || "浏览器证据"}`,
+      label: "browser",
+      state: "跳过",
+      body: JSON.stringify(compactBrowserEvidence(result), null, 2).slice(0, 4000)
+    });
+    return null;
+  }
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再做浏览器后续检查。");
+    return null;
+  }
+  if (browserCheckUrlInput) browserCheckUrlInput.value = targetUrl;
+  const selector = browserSelectorInput?.value.trim() || "";
+  const config = {
+    trace: {
+      endpoint: "/api/browser-trace",
+      label: "trace",
+      busy: "采集后续 Trace",
+      title: "后续 Trace",
+      body: { url: targetUrl, waitMs: 1500 },
+      render: renderBrowserTrace
+    },
+    screenshot: {
+      endpoint: "/api/browser-screenshot",
+      label: "visual",
+      busy: "生成后续截图",
+      title: "后续截图",
+      body: { url: targetUrl, selector },
+      render: renderBrowserScreenshot
+    },
+    visual: {
+      endpoint: "/api/browser-visual",
+      label: "visual",
+      busy: "运行后续视觉断言",
+      title: "后续视觉断言",
+      body: { url: targetUrl, selector, threshold: 0, maxMismatchRatio: 0 },
+      render: renderBrowserVisual
+    }
+  }[mode];
+  if (!config) return null;
+  setBusy(true, config.busy);
+  try {
+    const followup = await api(config.endpoint, {
+      method: "POST",
+      body: JSON.stringify(config.body)
+    });
+    const enriched = {
+      ...followup,
+      sourceEvidence: compactBrowserEvidence(result),
+      followup: {
+        mode,
+        endpoint: config.endpoint,
+        requestedAt: new Date().toISOString()
+      }
+    };
+    config.render(enriched);
+    appendToolCall({
+      title: `${config.title}：${targetUrl}`,
+      label: config.label,
+      state: enriched.ok ? "完成" : "异常",
+      body: JSON.stringify(enriched, null, 2).slice(0, 12000)
+    });
+    setBusy(false, enriched.ok ? `${config.title}完成` : `${config.title}异常`);
+    return enriched;
+  } catch (error) {
+    const failureKind = {
+      trace: "browser-followup-trace-failure",
+      screenshot: "browser-followup-screenshot-failure",
+      visual: "browser-followup-visual-failure"
+    }[mode] || `browser-followup-${mode}-failure`;
+    showToast(error.message);
+    appendBrowserFailureEvidence(error, {
+      title: `${config.title}失败`,
+      kind: failureKind,
+      label: config.label,
+      url: targetUrl,
+      selector,
+      body: {
+        sourceEvidence: compactBrowserEvidence(result),
+        request: config.body
+      }
+    });
+    setBusy(false, `${config.title}失败`);
+    return null;
+  }
+}
+
+function referenceBrowserEvidenceFilesInPrompt(result = {}, { title = "浏览器证据" } = {}) {
+  const files = browserEvidenceArtifactFiles(result);
+  if (!files.length) {
+    showToast("这条浏览器证据没有可引用的 artifact 文件。");
+    appendToolCall({
+      title: `浏览器证据未发现 artifact：${title}`,
+      label: "ctx",
+      state: "跳过",
+      body: JSON.stringify(compactBrowserEvidence(result), null, 2).slice(0, 4000)
+    });
+    return [];
+  }
+  const existing = input.value.trim();
+  const existingLower = existing.toLowerCase();
+  const additions = files
+    .map((file) => `@${file}`)
+    .filter((ref) => !existingLower.includes(ref.toLowerCase()));
+  input.value = [existing, additions.join(" ")].filter(Boolean).join(existing ? "\n" : "");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已引用浏览器证据文件：${title}`,
+    label: "ctx",
+    state: `${files.length} files`,
+    body: files.map((file) => `@${file}`).join("\n")
+  });
+  showToast(`已引用 ${files.length} 个浏览器证据文件。`);
+  return files;
+}
+
+function appendBrowserFailureEvidence(error, {
+  title = "浏览器检查失败",
+  kind = "browser-failure",
+  label = "browser",
+  url = "",
+  selector = "",
+  actions = [],
+  body = null
+} = {}) {
+  const message = error?.message || String(error || "unknown error");
+  const evidence = {
+    ok: false,
+    status: "request_failed",
+    url,
+    targetUrl: url,
+    selector,
+    actions,
+    error: message,
+    reason: message,
+    body,
+    generatedAt: new Date().toISOString()
+  };
+  renderBrowserEvidenceRow(evidence, {
+    title,
+    kind,
+    label,
+    state: "失败",
+    heading: `${title}${url ? `：${url}` : ""}`,
+    summary: [
+      "request failed",
+      selector ? `selector ${selector}` : "",
+      message
+    ]
+  });
+  appendToolCall({
+    title: `${title}${url ? `：${url}` : ""}`,
+    label,
+    state: "失败",
+    body: JSON.stringify(compactBrowserEvidence(evidence), null, 2).slice(0, 12000)
+  });
+  return evidence;
+}
+
+function semanticEvidenceFiles(evidence = {}) {
+  const files = new Map();
+  const visit = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value === "object") {
+      const pathValue = value.path || value.file || value.source || value.target;
+      if (typeof pathValue === "string" && /\.[A-Za-z0-9]+$/.test(pathValue)) {
+        const normalized = pathValue.replaceAll("\\", "/");
+        files.set(normalized.toLowerCase(), normalized);
+      }
+      Object.values(value).forEach(visit);
+    }
+  };
+  visit(evidence);
+  return [...files.values()].slice(0, 12);
+}
+
+function compactSemanticEvidence(evidence = {}, max = 12000) {
+  return JSON.stringify(evidence, null, 2).slice(0, max);
+}
+
+function buildSemanticEvidenceContext(evidence = {}, { title = "语义证据", kind = "semantic" } = {}) {
+  if (!evidence || typeof evidence !== "object") return "";
+  const files = semanticEvidenceFiles(evidence);
+  return [
+    "请基于这条代码智能/语义分析证据继续排查并修复当前项目。",
+    "",
+    `证据类型：${title}`,
+    `证据分类：${kind}`,
+    files.length ? `相关文件：${files.join(", ")}` : "",
+    "",
+    "语义证据摘要：",
+    compactSemanticEvidence(evidence),
+    "",
+    "要求：优先处理重复声明、未解析导入、缺失路由、循环依赖、影响面风险或 readiness blocker；需要改代码时输出最小 diff；需要验证时给出安全命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendSemanticEvidenceToPrompt(evidence = {}, options = {}) {
+  const context = buildSemanticEvidenceContext(evidence, options);
+  if (!context) {
+    showToast("暂无可加入提示词的语义证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `语义证据已加入提示词：${options.title || "代码智能"}`,
+    label: options.kind || "semantic",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("语义证据已加入提示词。");
+  return context;
+}
+
+function referenceSemanticEvidenceFilesInPrompt(evidence = {}, { title = "语义证据" } = {}) {
+  const files = semanticEvidenceFiles(evidence);
+  if (!files.length) {
+    showToast("这条语义证据没有识别到可引用文件。");
+    appendToolCall({
+      title: `语义证据未识别到文件：${title}`,
+      label: "ctx",
+      state: "跳过",
+      body: compactSemanticEvidence(evidence, 4000)
+    });
+    return [];
+  }
+  const existing = input.value.trim();
+  const existingLower = existing.toLowerCase();
+  const additions = files
+    .map((file) => `@${file}`)
+    .filter((ref) => !existingLower.includes(ref.toLowerCase()));
+  input.value = [existing, additions.join(" ")].filter(Boolean).join(existing ? "\n" : "");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已引用语义证据文件：${title}`,
+    label: "ctx",
+    state: `${files.length} files`,
+    body: files.map((file) => `@${file}`).join("\n")
+  });
+  showToast(`已引用 ${files.length} 个语义证据文件。`);
+  return files;
+}
+
+function runSemanticEvidenceRepair(evidence = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动语义证据修复。");
+    return "";
+  }
+  const context = buildSemanticEvidenceContext(evidence, options);
+  if (!context) {
+    showToast("暂无可用于修复的语义证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这条语义证据继续修复：先判断最可能影响写代码/调试体验的 blocker，输出最小 diff，并给出修复后的安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动语义证据修复：${options.title || "代码智能"}`,
+    label: options.kind || "semantic",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于语义证据启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function buildSemanticVerificationPrompt(evidence = {}, options = {}) {
+  const context = buildSemanticEvidenceContext(evidence, options);
+  if (!context) return "";
+  const files = semanticEvidenceFiles(evidence);
+  const commands = [
+    "node --check app.js",
+    "node --check server.js",
+    "node server.js --ui-smoke-test",
+    "node server.js --api-smoke-section=coding",
+    "node server.js --api-smoke-section=debug"
+  ];
+  return [
+    context,
+    "",
+    "目标：把这条语义诊断证据转成可验证修复闭环。",
+    files.length ? `优先读取这些相关文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
+    "",
+    "建议验证命令：",
+    ...commands.map((command) => `- ${command}`),
+    "",
+    "输出要求：",
+    "1. 先判断语义诊断是否代表真实 bug、重复实现、未解析依赖或前端/API 契约缺口。",
+    "2. 如果需要改代码，请生成最小 diff，避免无关重构。",
+    "3. 修复后必须说明应运行哪些验证命令，并优先复用上面的安全检查。",
+    "4. 如果诊断是误报，请说明证据，并给出保持现状的验证方式。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendSemanticVerificationPromptToPrompt(evidence = {}, options = {}) {
+  const prompt = buildSemanticVerificationPrompt(evidence, options);
+  if (!prompt) {
+    showToast("暂无可生成验证提示的语义证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `语义诊断验证提示已加入提示词：${options.title || "代码智能"}`,
+    label: options.kind || "semantic",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("语义诊断验证提示已加入提示词。");
+  return prompt;
+}
+
+function runSemanticVerificationFix(evidence = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动语义验证修复。");
+    return "";
+  }
+  const prompt = buildSemanticVerificationPrompt(evidence, options);
+  if (!prompt) {
+    showToast("暂无可运行的语义验证修复提示。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动语义诊断验证修复：${options.title || "代码智能"}`,
+    label: options.kind || "semantic",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动带验证要求的语义修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendSemanticEvidenceCard(evidence = {}, {
+  title = "语义证据",
+  kind = "semantic",
+  state: status = "完成",
+  body = ""
+} = {}) {
+  appendToolCall({
+    title,
+    label: kind,
+    state: status,
+    body: body || compactSemanticEvidence(evidence)
+  });
+  const article = log.lastElementChild;
+  if (!article) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference">引用文件</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="repair">直接修复</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendSemanticEvidenceToPrompt(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='reference']").addEventListener("click", () => {
+    referenceSemanticEvidenceFilesInPrompt(evidence, { title });
+  });
+  actions.querySelector("[data-action='verification-prompt']").addEventListener("click", () => {
+    appendSemanticVerificationPromptToPrompt(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='verification-fix']").addEventListener("click", () => {
+    runSemanticVerificationFix(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    runSemanticEvidenceRepair(evidence, { title, kind });
+  });
+  article.appendChild(actions);
+}
+
+function appendSemanticFailureEvidence(error, {
+  title = "语义分析失败证据",
+  kind = "semantic-failure",
+  endpoint = "",
+  request = null
+} = {}) {
+  const message = error?.message || String(error || "unknown error");
+  const evidence = {
+    status: "failed",
+    generatedAt: new Date().toISOString(),
+    endpoint,
+    request,
+    error: message,
+    workspace: workspaceStatus?.textContent || "",
+    lastPrompt: state.lastPrompt || input.value.trim(),
+    pendingDiff: {
+      bytes: String(state.pendingDiff || "").length,
+      files: (state.pendingPatches || []).map((patch) => ({ path: patch.path })).filter((item) => item.path).slice(0, 20)
+    },
+    context: {
+      activeThreadId: state.activeThreadId || "",
+      hasDebugDiagnostics: Boolean(state.lastDebugDiagnostics),
+      hasRepairChain: Boolean(state.activeRepairChain)
+    }
+  };
+  appendSemanticEvidenceCard(evidence, {
+    title,
+    kind,
+    state: "失败",
+    body: compactSemanticEvidence(evidence)
+  });
+  return evidence;
+}
+
+function compactGateEvidence(evidence = {}, max = 12000) {
+  return JSON.stringify(evidence, null, 2).slice(0, max);
+}
+
+function gateEvidenceCommands(evidence = {}) {
+  const commands = [];
+  const addCommand = (value) => {
+    const command = typeof value === "string" ? value : value?.command;
+    if (!command || typeof command !== "string") return;
+    if (!commands.some((item) => commandResultKey(item.command || item) === commandResultKey(command))) {
+      commands.push(typeof value === "string" ? { command } : { ...value, command });
+    }
+  };
+  const visit = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value === "object") {
+      if (value.command) addCommand(value);
+      Object.values(value).forEach(visit);
+    }
+  };
+  visit(evidence.verificationPlan || evidence.plan || evidence);
+  return normalizeCommandItems(commands).slice(0, 20);
+}
+
+function gateEvidenceArtifactFiles(evidence = {}) {
+  const files = new Set();
+  const addPath = (value) => {
+    const text = String(value || "").replaceAll("\\", "/").trim();
+    if (!text || /^[a-z]+:\/\//i.test(text)) return;
+    if (text.includes("..")) return;
+    if (/\.(?:md|json|txt|log|diff|patch)$/i.test(text)) files.add(text);
+  };
+  const visit = (value, key = "") => {
+    if (!value) return;
+    if (typeof value === "string") {
+      if (/path|file|body|summary|plan|artifact|dir/i.test(key)) addPath(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, key));
+      return;
+    }
+    if (typeof value === "object") {
+      Object.entries(value).forEach(([childKey, childValue]) => visit(childValue, childKey));
+    }
+  };
+  visit(evidence);
+  return [...files].slice(0, 12);
+}
+
+function referenceGateEvidenceFilesInPrompt(evidence = {}, { title = "门禁证据" } = {}) {
+  const files = gateEvidenceArtifactFiles(evidence);
+  if (!files.length) {
+    showToast("这条门禁证据没有可引用的本地文件。");
+    appendToolCall({
+      title: `门禁证据没有可引用文件：${title}`,
+      label: "ctx",
+      state: "跳过",
+      body: compactGateEvidence(evidence, 4000)
+    });
+    return [];
+  }
+  const current = input.value.trim();
+  const currentLower = current.toLowerCase();
+  const refs = files
+    .map((file) => `@${file}`)
+    .filter((ref) => !currentLower.includes(ref.toLowerCase()));
+  input.value = [current, refs.join(" ")].filter(Boolean).join(current ? "\n" : "");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已引用门禁证据文件：${title}`,
+    label: "ctx",
+    state: `${files.length} files`,
+    body: files.map((file) => `@${file}`).join("\n")
+  });
+  showToast(`已引用 ${files.length} 个门禁证据文件。`);
+  return files;
+}
+
+function buildGateEvidenceContext(evidence = {}, { title = "门禁证据", kind = "gate" } = {}) {
+  if (!evidence || typeof evidence !== "object") return "";
+  const commands = gateEvidenceCommands(evidence);
+  const artifactFiles = gateEvidenceArtifactFiles(evidence);
+  return [
+    "请基于这条验证门禁/CI/PR/权限证据继续排查并修复当前项目。",
+    "",
+    `证据类型：${title}`,
+    `证据分类：${kind}`,
+    commands.length ? `可复用检查命令：${commands.map((item) => item.command).join(" | ")}` : "",
+    artifactFiles.length ? `相关本地文件：\n${artifactFiles.map((file) => `@${file}`).join("\n")}` : "",
+    "",
+    "门禁证据摘要：",
+    compactGateEvidence(evidence),
+    "",
+    "要求：先判断 blockers、warnings、CI 失败、权限策略或 PR readiness 缺口；需要改代码时输出最小 diff；需要验证时优先复用证据中的安全检查命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendGateEvidenceToPrompt(evidence = {}, options = {}) {
+  const context = buildGateEvidenceContext(evidence, options);
+  if (!context) {
+    showToast("暂无可加入提示词的门禁证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `门禁证据已加入提示词：${options.title || "门禁证据"}`,
+    label: options.kind || "gate",
+    state: "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("门禁证据已加入提示词。");
+  return context;
+}
+
+function buildGateVerificationPrompt(evidence = {}, options = {}) {
+  const context = buildGateEvidenceContext(evidence, options);
+  if (!context) return "";
+  const commands = gateEvidenceCommands(evidence);
+  const defaultCommands = [
+    "node --check app.js",
+    "node --check server.js",
+    "node server.js --ui-smoke-test",
+    "node server.js --api-smoke-section=debug"
+  ];
+  const commandLines = [
+    ...commands.map((item) => item.command).filter(Boolean),
+    ...defaultCommands
+  ].filter((command, index, all) => all.indexOf(command) === index);
+  return [
+    context,
+    "",
+    "目标：把这条门禁/CI/PR/权限证据转成可验证修复闭环。",
+    "",
+    "建议验证命令：",
+    ...commandLines.map((command) => `- ${command}`),
+    "",
+    "输出要求：",
+    "1. 先判断 blocker 来自验证计划、CI 状态、PR readiness、审批、权限策略还是远端发布预检。",
+    "2. 如果需要改代码，请生成最小 diff，避免无关重构和真实远端写入。",
+    "3. 修复后必须说明应运行哪些本地验证命令，并优先复用上面的安全检查。",
+    "4. 如果门禁证据只是未授权或外部凭据缺失，请保留安全边界，输出可执行的本地替代验证。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendGateVerificationPromptToPrompt(evidence = {}, options = {}) {
+  const prompt = buildGateVerificationPrompt(evidence, options);
+  if (!prompt) {
+    showToast("暂无可生成验证提示的门禁证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `门禁验证提示已加入提示词：${options.title || "门禁证据"}`,
+    label: options.kind || "gate",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("门禁验证提示已加入提示词。");
+  return prompt;
+}
+
+function runGateVerificationFix(evidence = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动门禁验证修复。");
+    return "";
+  }
+  const prompt = buildGateVerificationPrompt(evidence, options);
+  if (!prompt) {
+    showToast("暂无可运行的门禁验证修复提示。");
+    return "";
+  }
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动门禁验证修复：${options.title || "门禁证据"}`,
+    label: options.kind || "gate",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在启动带验证要求的门禁修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function stageGateEvidenceCommands(evidence = {}, { title = "门禁证据" } = {}) {
+  const commands = gateEvidenceCommands(evidence);
+  if (!commands.length) {
+    showToast("这条门禁证据没有可复用检查命令。");
+    appendToolCall({
+      title: `门禁证据没有检查命令：${title}`,
+      label: "$",
+      state: "跳过",
+      body: compactGateEvidence(evidence, 4000)
+    });
+    return [];
+  }
+  const existing = normalizeCommandItems(state.pendingCommands || []);
+  const merged = [
+    ...commands,
+    ...existing.filter((item) => !commands.some((command) => commandResultKey(command.command) === commandResultKey(item.command)))
+  ];
+  renderCommands(merged);
+  commands.forEach((item) => rememberCommand(item.command, { reason: title, source: "gate-evidence" }));
+  appendToolCall({
+    title: `门禁检查命令已放入面板：${title}`,
+    label: "$",
+    state: `${commands.length} commands`,
+    body: commandItemsToText(commands)
+  });
+  showToast(`已加入 ${commands.length} 条门禁检查命令。`);
+  return commands;
+}
+
+function runGateEvidenceRepair(evidence = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动门禁证据修复。");
+    return "";
+  }
+  const context = buildGateEvidenceContext(evidence, options);
+  if (!context) {
+    showToast("暂无可用于修复的门禁证据。");
+    return "";
+  }
+  const prompt = [
+    context,
+    "",
+    "请现在直接基于这条门禁证据继续修复：优先解除 blocker、失败检查或 readiness 缺口，输出最小 diff，并给出修复后的安全验证命令。"
+  ].join("\n");
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动门禁证据修复：${options.title || "门禁证据"}`,
+    label: options.kind || "gate",
+    state: "running",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("正在基于门禁证据启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function appendGateEvidenceCard(evidence = {}, {
+  title = "门禁证据",
+  kind = "gate",
+  state: status = "完成",
+  body = "",
+  includeCommands = true
+} = {}) {
+  appendToolCall({
+    title,
+    label: kind,
+    state: status,
+    body: body || compactGateEvidence(evidence)
+  });
+  const article = log.lastElementChild;
+  if (!article) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference" ${gateEvidenceArtifactFiles(evidence).length ? "" : "disabled"}>引用文件</button><button type="button" data-action="stage" ${includeCommands && gateEvidenceCommands(evidence).length ? "" : "disabled"}>加入命令</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="repair">直接修复</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendGateEvidenceToPrompt(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='reference']").addEventListener("click", () => {
+    referenceGateEvidenceFilesInPrompt(evidence, { title });
+  });
+  actions.querySelector("[data-action='stage']").addEventListener("click", () => {
+    stageGateEvidenceCommands(evidence, { title });
+  });
+  actions.querySelector("[data-action='verification-prompt']").addEventListener("click", () => {
+    appendGateVerificationPromptToPrompt(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='verification-fix']").addEventListener("click", () => {
+    runGateVerificationFix(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='repair']").addEventListener("click", () => {
+    runGateEvidenceRepair(evidence, { title, kind });
+  });
+  article.appendChild(actions);
+}
+
+function buildGateFailureEvidence(error, {
+  title = "门禁请求失败",
+  kind = "gate",
+  endpoint = "",
+  request = null,
+  extra = {}
+} = {}) {
+  return {
+    status: "failed",
+    generatedAt: new Date().toISOString(),
+    title,
+    kind,
+    endpoint,
+    request,
+    error: normalizeActionFailureError(error),
+    workspace: workspaceStatus?.textContent || "",
+    lastPrompt: state.lastPrompt || input.value.trim(),
+    pendingCommands: (state.pendingCommands || []).map((item) => item.command || item).slice(0, 12),
+    pendingDiff: state.pendingDiff?.patches?.length ? {
+      patches: state.pendingDiff.patches.length,
+      commands: (state.pendingCommands || []).map((item) => item.command || item).slice(0, 8)
+    } : null,
+    ...extra
+  };
+}
+
+function appendGateFailureEvidence(error, options = {}) {
+  const evidence = buildGateFailureEvidence(error, options);
+  appendGateEvidenceCard(evidence, {
+    title: options.title || "门禁请求失败",
+    kind: options.kind || "gate",
+    state: "失败",
+    body: buildGateEvidenceContext(evidence, {
+      title: options.title || "门禁请求失败",
+      kind: options.kind || "gate"
+    }).slice(0, 12000),
+    includeCommands: false
+  });
+  return evidence;
+}
+
+function renderBrowserEvidenceRow(result, {
+  title,
+  kind = "browser",
+  label = "browser",
+  state,
+  heading,
+  summary = []
+} = {}) {
+  if (!browserCheckResult) return;
+  browserCheckResult.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
+  const artifactFiles = browserEvidenceArtifactFiles(result);
+  row.innerHTML = `<strong></strong><small></small><span class="queue-row-actions"><button type="button" data-action="detail">详情</button><button type="button" data-action="follow-trace">Trace</button><button type="button" data-action="follow-screenshot">截图</button><button type="button" data-action="follow-visual">视觉</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference" ${artifactFiles.length ? "" : "disabled"}>引用文件</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="repair">直接修复</button></span>`;
+  row.querySelector("strong").textContent = heading || result.title || result.name || browserEvidenceUrl(result) || title || "浏览器证据";
+  row.querySelector("small").textContent = summary.filter(Boolean).join(" · ");
+  row.querySelector("[data-action='detail']").addEventListener("click", () => {
+    appendToolCall({
+      title: `${title}：${browserEvidenceUrl(result) || result.path || result.name || ""}`,
+      label,
+      state: state || (result.ok ? "完成" : "失败"),
+      body: JSON.stringify(result, null, 2).slice(0, 12000)
+    });
+  });
+  row.querySelector("[data-action='follow-trace']").addEventListener("click", () => {
+    runBrowserEvidenceFollowup(result, "trace", { title, kind });
+  });
+  row.querySelector("[data-action='follow-screenshot']").addEventListener("click", () => {
+    runBrowserEvidenceFollowup(result, "screenshot", { title, kind });
+  });
+  row.querySelector("[data-action='follow-visual']").addEventListener("click", () => {
+    runBrowserEvidenceFollowup(result, "visual", { title, kind });
+  });
+  row.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    appendBrowserEvidenceToPrompt(result, { title, kind });
+  });
+  row.querySelector("[data-action='reference']").addEventListener("click", () => {
+    referenceBrowserEvidenceFilesInPrompt(result, { title });
+  });
+  row.querySelector("[data-action='verification-prompt']").addEventListener("click", () => {
+    appendBrowserVerificationPromptToPrompt(result, { title, kind });
+  });
+  row.querySelector("[data-action='verification-fix']").addEventListener("click", () => {
+    runBrowserVerificationFix(result, { title, kind });
+  });
+  row.querySelector("[data-action='repair']").addEventListener("click", () => {
+    runBrowserEvidenceRepair(result, { title, kind });
+  });
+  browserCheckResult.appendChild(row);
 }
 
 function renderProcesses(processes = []) {
@@ -1043,7 +8901,8 @@ function renderProcesses(processes = []) {
   processes.slice(0, 6).forEach((item) => {
     const row = document.createElement("div");
     row.className = `queue-row ${item.status === "running" ? "active" : "done"}`;
-    row.innerHTML = `<strong></strong><small></small><button type="button"></button>`;
+    const probeUrl = processProbeUrl(item);
+    row.innerHTML = `<strong></strong><small></small><span class="queue-row-actions"><button type="button" data-action="primary"></button><button type="button" data-action="browser-debug" ${probeUrl ? "" : "disabled"}>调试</button><button type="button" data-action="browser-check" ${probeUrl ? "" : "disabled"}>查页面</button><button type="button" data-action="browser-trace" ${probeUrl ? "" : "disabled"}>Trace</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">直接修复</button></span>`;
     row.querySelector("strong").textContent = item.command || item.id;
     row.querySelector("small").textContent = [
       item.status || "unknown",
@@ -1051,9 +8910,9 @@ function renderProcesses(processes = []) {
       `policy: ${item.policy?.risk || "-"}`,
       item.probe ? `probe: ${item.probe.status} ${item.probe.url}` : ""
     ].filter(Boolean).join(" · ");
-    const button = row.querySelector("button");
+    const button = row.querySelector("[data-action='primary']");
     button.textContent = item.status === "running" ? "停止" : "输出";
-    button.addEventListener("click", async () => {
+    const runPrimaryProcessAction = async () => {
       try {
         if (item.status === "running") {
           const stopped = await api(`/api/processes?id=${encodeURIComponent(item.id)}`, { method: "DELETE" });
@@ -1078,7 +8937,32 @@ function renderProcesses(processes = []) {
         }
       } catch (error) {
         showToast(error.message);
+        appendProcessFailureEvidence(error, {
+          title: `${item.status === "running" ? "停止进程失败" : "读取进程输出失败"}：${item.command || item.id || "process"}`,
+          action: item.status === "running" ? "process-stop" : "process-output",
+          endpoint: "/api/processes",
+          request: { id: item.id || "", method: item.status === "running" ? "DELETE" : "local-output" },
+          item,
+          retry: runPrimaryProcessAction,
+          safe: () => appendProcessEvidenceToPrompt(item, { title: "受管进程" })
+        });
       }
+    };
+    button.addEventListener("click", runPrimaryProcessAction);
+    row.querySelector("[data-action='browser-debug']").addEventListener("click", () => {
+      runProcessBrowserEvidence(item, { mode: "debug", title: "受管进程" });
+    });
+    row.querySelector("[data-action='browser-check']").addEventListener("click", () => {
+      runProcessBrowserEvidence(item, { mode: "check", title: "受管进程" });
+    });
+    row.querySelector("[data-action='browser-trace']").addEventListener("click", () => {
+      runProcessBrowserEvidence(item, { mode: "trace", title: "受管进程" });
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", () => {
+      appendProcessEvidenceToPrompt(item, { title: "受管进程" });
+    });
+    row.querySelector("[data-action='repair']").addEventListener("click", () => {
+      runProcessEvidenceRepair(item, { title: "受管进程" });
     });
     processList.appendChild(row);
   });
@@ -1095,16 +8979,30 @@ function renderProcessSearch(result) {
   matches.slice(0, 8).forEach((match) => {
     const row = document.createElement("div");
     row.className = "queue-row done";
-    row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
+    row.innerHTML = `<strong></strong><small></small><span class="queue-row-actions"><button type="button" data-action="detail">详情</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">直接修复</button></span>`;
     row.querySelector("strong").textContent = match.command || match.processId;
     row.querySelector("small").textContent = `${match.status || "unknown"} · index ${match.index}`;
-    row.querySelector("button").addEventListener("click", () => {
+    row.querySelector("[data-action='detail']").addEventListener("click", () => {
       appendToolCall({
         title: `进程日志搜索：${result.query}`,
         label: "proc",
         state: `${result.matchCount || 0} matches`,
         body: JSON.stringify(match, null, 2)
       });
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", () => {
+      appendProcessEvidenceToPrompt({
+        ...match,
+        id: match.processId,
+        outputTail: match.context || match.text || ""
+      }, { title: `进程日志搜索：${result.query}` });
+    });
+    row.querySelector("[data-action='repair']").addEventListener("click", () => {
+      runProcessEvidenceRepair({
+        ...match,
+        id: match.processId,
+        outputTail: match.context || match.text || ""
+      }, { title: `进程日志搜索：${result.query}` });
     });
     processList.appendChild(row);
   });
@@ -1121,7 +9019,8 @@ function renderProcessHistory(result) {
   history.slice(0, 8).forEach((item) => {
     const row = document.createElement("div");
     row.className = `queue-row ${item.active ? "active" : "done"}`;
-    row.innerHTML = `<strong></strong><small></small><button type="button">回放</button>`;
+    const probeUrl = processProbeUrl(item);
+    row.innerHTML = `<strong></strong><small></small><span class="queue-row-actions"><button type="button" data-action="replay">回放</button><button type="button" data-action="browser-check" ${probeUrl ? "" : "disabled"}>查页面</button><button type="button" data-action="browser-trace" ${probeUrl ? "" : "disabled"}>Trace</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="repair">直接修复</button></span>`;
     row.querySelector("strong").textContent = item.command || item.id;
     row.querySelector("small").textContent = [
       item.status || "unknown",
@@ -1129,7 +9028,7 @@ function renderProcessHistory(result) {
       item.updatedAt || item.stoppedAt || item.startedAt || "",
       item.logPath || ""
     ].filter(Boolean).join(" · ");
-    row.querySelector("button").addEventListener("click", () => {
+    row.querySelector("[data-action='replay']").addEventListener("click", () => {
       appendToolCall({
         title: `进程历史：${item.command || item.id}`,
         label: "hist",
@@ -1144,6 +9043,18 @@ function renderProcessHistory(result) {
         ].filter((line) => line !== "").join("\n")
       });
     });
+    row.querySelector("[data-action='browser-check']").addEventListener("click", () => {
+      runProcessBrowserEvidence(item, { mode: "check", title: "进程历史" });
+    });
+    row.querySelector("[data-action='browser-trace']").addEventListener("click", () => {
+      runProcessBrowserEvidence(item, { mode: "trace", title: "进程历史" });
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", () => {
+      appendProcessEvidenceToPrompt(item, { title: "进程历史" });
+    });
+    row.querySelector("[data-action='repair']").addEventListener("click", () => {
+      runProcessEvidenceRepair(item, { title: "进程历史" });
+    });
     processList.appendChild(row);
   });
 }
@@ -1154,189 +9065,406 @@ function renderBrowserCheck(result) {
     browserCheckResult.innerHTML = `<div class="empty-state">本地页面检查结果会显示在这里。</div>`;
     return;
   }
-  browserCheckResult.innerHTML = "";
-  const row = document.createElement("div");
-  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
-  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
-  row.querySelector("strong").textContent = result.title || result.finalUrl || result.url || "页面检查";
-  row.querySelector("small").textContent = [
-    `HTTP ${result.status || "-"}`,
-    `${result.elapsedMs || 0}ms`,
-    `${result.counts?.buttons || 0} buttons`,
-    `${result.counts?.forms || 0} forms`
-  ].join(" · ");
-  row.querySelector("button").addEventListener("click", () => {
-    appendToolCall({
-      title: `页面检查：${result.finalUrl || result.url}`,
-      label: "browser",
-      state: result.ok ? "通过" : "失败",
-      body: JSON.stringify(result, null, 2).slice(0, 12000)
-    });
+  renderBrowserEvidenceRow(result, {
+    title: "页面检查",
+    kind: "browser-check",
+    label: "browser",
+    state: result.ok ? "通过" : "失败",
+    heading: result.title || result.finalUrl || result.url || "页面检查",
+    summary: [
+      `HTTP ${result.status || "-"}`,
+      `${result.elapsedMs || 0}ms`,
+      `${result.counts?.buttons || 0} buttons`,
+      `${result.counts?.forms || 0} forms`
+    ]
   });
-  browserCheckResult.appendChild(row);
 }
 
 function renderBrowserBaseline(result) {
   if (!browserCheckResult) return;
-  browserCheckResult.innerHTML = "";
-  const row = document.createElement("div");
-  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
-  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
-  row.querySelector("strong").textContent = result.name || result.url || "页面基线";
-  row.querySelector("small").textContent = [
-    result.status || "unknown",
-    `${result.diffs?.length || 0} diffs`,
-    result.updated ? "baseline saved" : "baseline checked"
-  ].join(" · ");
-  row.querySelector("button").addEventListener("click", () => {
-    appendToolCall({
-      title: `页面基线：${result.url}`,
-      label: "visual",
-      state: result.status || "unknown",
-      body: JSON.stringify(result, null, 2).slice(0, 12000)
-    });
+  renderBrowserEvidenceRow(result, {
+    title: "页面基线",
+    kind: "browser-baseline",
+    label: "visual",
+    state: result.status || "unknown",
+    heading: result.name || result.url || "页面基线",
+    summary: [
+      result.status || "unknown",
+      `${result.diffs?.length || 0} diffs`,
+      result.updated ? "baseline saved" : "baseline checked"
+    ]
   });
-  browserCheckResult.appendChild(row);
 }
 
 function renderBrowserScreenshot(result) {
   if (!browserCheckResult) return;
-  browserCheckResult.innerHTML = "";
-  const row = document.createElement("div");
-  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
-  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
-  row.querySelector("strong").textContent = result.path || result.url || "页面截图";
-  row.querySelector("small").textContent = [
-    `${result.width || "-"}x${result.height || "-"}`,
-    `${Math.round((result.size || 0) / 1024)} KB`,
-    result.policy?.screenshots ? "screenshot saved" : "no screenshot"
-  ].join(" · ");
-  row.querySelector("button").addEventListener("click", () => {
-    appendToolCall({
-      title: `页面截图：${result.url}`,
-      label: "visual",
-      state: result.ok ? "完成" : "失败",
-      body: JSON.stringify(result, null, 2).slice(0, 12000)
-    });
+  renderBrowserEvidenceRow(result, {
+    title: "页面截图",
+    kind: "browser-screenshot",
+    label: "visual",
+    state: result.ok ? "完成" : "失败",
+    heading: result.path || result.url || "页面截图",
+    summary: [
+      `${result.width || "-"}x${result.height || "-"}`,
+      `${Math.round((result.size || 0) / 1024)} KB`,
+      result.policy?.screenshots ? "screenshot saved" : "no screenshot"
+    ]
   });
-  browserCheckResult.appendChild(row);
+}
+
+function renderBrowserAudit(result) {
+  if (!browserCheckResult) return;
+  const issueCount = Array.isArray(result.audit?.issues) ? result.audit.issues.length : 0;
+  renderBrowserEvidenceRow(result, {
+    title: "页面可访问性审计",
+    kind: "browser-audit",
+    label: "a11y",
+    state: result.audit?.status || "unknown",
+    heading: result.title || result.finalUrl || result.url || "页面可访问性审计",
+    summary: [
+      result.audit?.status || "unknown",
+      `${issueCount} issues`,
+      result.audit?.title ? "title" : "no title",
+      result.audit?.lang ? `lang ${result.audit.lang}` : "no lang"
+    ]
+  });
 }
 
 function renderBrowserDom(result) {
   if (!browserCheckResult) return;
-  browserCheckResult.innerHTML = "";
-  const row = document.createElement("div");
-  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
-  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
-  row.querySelector("strong").textContent = result.title || result.url || "DOM 快照";
-  row.querySelector("small").textContent = [
-    `${Math.round((result.bytes || 0) / 1024)} KB DOM`,
-    `${result.selectors?.length || 0} selectors`,
-    `${result.counts?.buttons || 0} buttons`
-  ].join(" · ");
-  row.querySelector("button").addEventListener("click", () => {
-    appendToolCall({
-      title: `DOM 快照：${result.url}`,
-      label: "dom",
-      state: result.ok ? "完成" : "失败",
-      body: JSON.stringify(result, null, 2).slice(0, 12000)
-    });
+  renderBrowserEvidenceRow(result, {
+    title: "DOM 快照",
+    kind: "browser-dom",
+    label: "dom",
+    state: result.ok ? "完成" : "失败",
+    heading: result.title || result.url || "DOM 快照",
+    summary: [
+      `${Math.round((result.bytes || 0) / 1024)} KB DOM`,
+      `${result.selectors?.length || 0} selectors`,
+      `${result.counts?.buttons || 0} buttons`
+    ]
   });
-  browserCheckResult.appendChild(row);
 }
 
 function renderBrowserTrace(result) {
   if (!browserCheckResult) return;
-  browserCheckResult.innerHTML = "";
-  const row = document.createElement("div");
-  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
-  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
-  row.querySelector("strong").textContent = result.title || result.finalUrl || result.url || "浏览器 Trace";
-  row.querySelector("small").textContent = [
-    `${result.summary?.console || 0} console`,
-    `${result.summary?.exceptions || 0} exceptions`,
-    `${result.summary?.network || 0} requests`,
-    result.artifactPath || "no artifact"
-  ].join(" · ");
-  row.querySelector("button").addEventListener("click", () => {
-    appendToolCall({
-      title: `浏览器 Trace：${result.finalUrl || result.url}`,
-      label: "trace",
-      state: result.ok ? "完成" : "异常",
-      body: JSON.stringify(result, null, 2).slice(0, 12000)
-    });
+  renderBrowserEvidenceRow(result, {
+    title: "浏览器 Trace",
+    kind: "browser-trace",
+    label: "trace",
+    state: result.ok ? "完成" : "异常",
+    heading: result.title || result.finalUrl || result.url || "浏览器 Trace",
+    summary: [
+      `${result.summary?.console || 0} console`,
+      `${result.summary?.exceptions || 0} exceptions`,
+      `${result.summary?.network || 0} requests`,
+      result.artifactPath || "no artifact"
+    ]
   });
-  browserCheckResult.appendChild(row);
 }
 
 function renderBrowserInteract(result) {
   if (!browserCheckResult) return;
-  browserCheckResult.innerHTML = "";
-  const row = document.createElement("div");
-  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
-  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
-  row.querySelector("strong").textContent = result.title || result.finalUrl || result.url || "DOM 交互";
-  row.querySelector("small").textContent = [
-    `${result.actions?.length || 0} actions`,
-    `${Math.round((result.bytes || 0) / 1024)} KB DOM`,
-    `${result.selectors?.length || 0} selectors`
-  ].join(" · ");
-  row.querySelector("button").addEventListener("click", () => {
-    appendToolCall({
-      title: `DOM 交互：${result.url}`,
-      label: "dom",
-      state: result.ok ? "完成" : "失败",
-      body: JSON.stringify(result, null, 2).slice(0, 12000)
-    });
+  renderBrowserEvidenceRow(result, {
+    title: "DOM 交互",
+    kind: "browser-interact",
+    label: "dom",
+    state: result.ok ? "完成" : "失败",
+    heading: result.title || result.finalUrl || result.url || "DOM 交互",
+    summary: [
+      `${result.actions?.length || 0} actions`,
+      `${Math.round((result.bytes || 0) / 1024)} KB DOM`,
+      `${result.selectors?.length || 0} selectors`
+    ]
   });
-  browserCheckResult.appendChild(row);
 }
 
 function renderBrowserSession(result) {
   if (!browserCheckResult) return;
-  browserCheckResult.innerHTML = "";
-  const row = document.createElement("div");
-  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
-  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
-  row.querySelector("strong").textContent = result.name || result.finalUrl || result.url || "浏览器会话";
-  row.querySelector("small").textContent = [
-    `${result.stepCount || 0} steps`,
-    `${result.actionCount || 0} actions`,
-    result.artifactPath || "no artifact"
-  ].join(" · ");
-  row.querySelector("button").addEventListener("click", () => {
-    appendToolCall({
-      title: `浏览器会话：${result.url}`,
-      label: "dom",
-      state: result.ok ? "完成" : "失败",
-      body: JSON.stringify(result, null, 2).slice(0, 12000)
-    });
+  renderBrowserEvidenceRow(result, {
+    title: "浏览器会话",
+    kind: "browser-session",
+    label: "dom",
+    state: result.ok ? "完成" : "失败",
+    heading: result.name || result.finalUrl || result.url || "浏览器会话",
+    summary: [
+      `${result.stepCount || 0} steps`,
+      `${result.actionCount || 0} actions`,
+      result.artifactPath || "no artifact"
+    ]
   });
-  browserCheckResult.appendChild(row);
 }
 
 function renderBrowserVisual(result) {
   if (!browserCheckResult) return;
-  browserCheckResult.innerHTML = "";
-  const row = document.createElement("div");
-  row.className = `queue-row ${result.ok ? "done" : "failed"}`;
-  row.innerHTML = `<strong></strong><small></small><button type="button">详情</button>`;
-  row.querySelector("strong").textContent = result.name || result.url || "视觉断言";
-  row.querySelector("small").textContent = [
-    result.status || "unknown",
-    `${result.comparison?.mismatchedPixels || 0} px diff`,
-    `${((result.comparison?.mismatchRatio || 0) * 100).toFixed(3)}%`,
-    result.updated ? "baseline saved" : "baseline checked"
-  ].join(" · ");
-  row.querySelector("button").addEventListener("click", () => {
-    appendToolCall({
-      title: `视觉断言：${result.url}`,
-      label: "visual",
-      state: result.ok ? "通过" : "失败",
-      body: JSON.stringify(result, null, 2).slice(0, 12000)
-    });
+  renderBrowserEvidenceRow(result, {
+    title: "视觉断言",
+    kind: "browser-visual",
+    label: "visual",
+    state: result.ok ? "通过" : "失败",
+    heading: result.name || result.url || "视觉断言",
+    summary: [
+      result.status || "unknown",
+      `${result.comparison?.mismatchedPixels || 0} px diff`,
+      `${((result.comparison?.mismatchRatio || 0) * 100).toFixed(3)}%`,
+      result.updated ? "baseline saved" : "baseline checked"
+    ]
   });
-  browserCheckResult.appendChild(row);
+}
+
+function renderDebugDiagnostics(result) {
+  if (!debugDiagnosticsPanel) return;
+  if (!result) {
+    state.lastDebugDiagnostics = null;
+    debugDiagnosticsPanel.innerHTML = `<div class="debug-diagnostics-head"><strong>调试诊断</strong><label><input id="debugRunChecks" type="checkbox" />运行安全检查</label></div><div class="debug-last-failed-command" hidden></div><div class="empty-state">点击“一键诊断”后，这里会聚合检查命令、进程健康、页面 Trace 和代码诊断。</div>`;
+    renderLastFailedCommandCard();
+    return;
+  }
+  state.lastDebugDiagnostics = result;
+  const statusLabel = result.status === "failing" ? "失败" : result.status === "needs_attention" ? "需关注" : "就绪";
+  const findings = result.findings || [];
+  const actions = result.nextActions || [];
+  const hasRunnableAction = actions.some((action) => String(action.command || "").trim());
+  const hasLastFailedCommand = Boolean(state.lastFailedCommand?.command);
+  debugDiagnosticsPanel.innerHTML = `
+    <div class="debug-diagnostics-head">
+      <strong>调试诊断 · ${statusLabel}</strong>
+      <div class="debug-diagnostics-controls">
+        <label>
+          <input id="debugRunChecks" type="checkbox" ${result.summary?.checksRun ? "checked" : ""} />
+          运行安全检查
+        </label>
+        <button type="button" data-debug-action="copy-bundle">复制诊断包</button>
+        <button type="button" data-debug-action="prompt-bundle">加入提示词</button>
+        <button type="button" data-debug-action="reference-files">引用文件</button>
+        <button type="button" data-debug-action="run-recommended" ${hasRunnableAction ? "" : "disabled"}>运行推荐动作</button>
+        <button type="button" data-debug-action="fix-last-failed" ${hasLastFailedCommand ? "" : "disabled"}>修复失败命令</button>
+        <button type="button" data-debug-action="run-plan" ${result.verificationPlan?.commands?.length ? "" : "disabled"}>运行验证计划</button>
+        <button type="button" data-debug-action="draft-fix">生成修复提示</button>
+        <button type="button" data-debug-action="run-fix">直接修复</button>
+      </div>
+    </div>
+    <div class="debug-summary">
+      <span>${result.summary?.errors || 0} errors</span>
+      <span>${result.summary?.warnings || 0} warnings</span>
+      <span>${result.summary?.safeCommands || 0} checks</span>
+      <span>${result.summary?.processRows || 0} processes</span>
+      <span>${result.summary?.traceCaptured ? "trace" : "no trace"}</span>
+    </div>
+    <div class="debug-last-failed-command" hidden></div>
+    <div class="debug-finding-list"></div>
+    <div class="debug-evidence-list"></div>
+    <div class="debug-action-list"></div>
+  `;
+  renderLastFailedCommandCard(result);
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='copy-bundle']")?.addEventListener("click", async () => {
+    const bundle = buildDebugBundle(result);
+    const copied = await copyText(bundle);
+    appendDebugEvidence(
+      copied ? "诊断包已复制" : "诊断包复制失败",
+      copied ? "完成" : "失败",
+      copied ? "完整诊断 JSON 已复制到剪贴板，可直接粘给修复代理或 issue。" : `${copyFailureSummary()}\n\n${bundle}`
+    );
+    showToast(copied ? "诊断包已复制。" : copyFailureSummary());
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='prompt-bundle']")?.addEventListener("click", () => {
+    appendDebugContextToPrompt(result);
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='reference-files']")?.addEventListener("click", () => {
+    referenceDebugEvidenceFilesInPrompt(result);
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='run-recommended']")?.addEventListener("click", async () => {
+    await runRecommendedDebugAction(result);
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='fix-last-failed']")?.addEventListener("click", () => {
+    runLastFailedCommandVerificationFix();
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='run-plan']")?.addEventListener("click", async () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再执行验证计划。");
+      return;
+    }
+    setBusy(true, "运行验证计划");
+    try {
+      const ok = await runVerificationPlanCommands(result.verificationPlan);
+      setBusy(false, ok ? "验证通过" : "验证失败");
+      showToast(ok ? "验证计划命令全部通过。" : "验证计划已停在失败命令。");
+    } catch (error) {
+      appendDebugEvidence("验证计划运行失败", "失败", error.message);
+      showToast(error.message);
+      appendGateFailureEvidence(error, {
+        title: "调试验证计划运行失败证据",
+        kind: "debug",
+        endpoint: "/api/command",
+        request: {
+          source: "debug-diagnostics-run-plan",
+          commands: verificationPlanCommands(result.verificationPlan).map((item) => item.command || item).slice(0, 12)
+        },
+        extra: {
+          diagnosticsStatus: result.status || result.diagnostics?.status || "",
+          summary: result.summary || result.diagnostics?.summary || null
+        }
+      });
+      setBusy(false, "验证失败");
+    }
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='draft-fix']")?.addEventListener("click", () => {
+    const prompt = buildDebugFixPrompt(result);
+    if (!prompt) {
+      showToast("暂无可生成的诊断提示。");
+      return;
+    }
+    input.value = prompt;
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendDebugEvidence("已生成带诊断的修复提示", "ready", prompt);
+    showToast("修复提示已填入输入框。");
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='run-fix']")?.addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再发起修复。");
+      return;
+    }
+    const prompt = buildDebugFixPrompt(result);
+    if (!prompt) {
+      showToast("暂无可运行的诊断修复提示。");
+      return;
+    }
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendDebugEvidence("已生成并启动诊断修复", "running", prompt);
+    showToast("正在启动带诊断上下文的修复代理。");
+    submitPromptForm();
+  });
+
+  const findingList = debugDiagnosticsPanel.querySelector(".debug-finding-list");
+  if (!findings.length) {
+    findingList.innerHTML = `<div class="debug-finding info"><strong>未发现明显阻塞项</strong><small>当前聚合证据没有暴露失败信号。</small></div>`;
+  } else {
+    findings.slice(0, 8).forEach((finding) => {
+      const row = document.createElement("div");
+      row.className = `debug-finding ${finding.severity || "info"}`;
+      row.innerHTML = `<strong></strong><small></small>`;
+      row.querySelector("strong").textContent = `${finding.area || "debug"} · ${finding.message || ""}`;
+      row.querySelector("small").textContent = (finding.evidence || []).join(" · ").slice(0, 360) || "无额外证据";
+      findingList.appendChild(row);
+    });
+  }
+
+  const evidenceList = debugDiagnosticsPanel.querySelector(".debug-evidence-list");
+  const evidenceButtons = [
+    {
+      label: "检查计划",
+      state: `${result.verificationPlan?.commands?.length || 0} checks`,
+      enabled: Boolean(result.verificationPlan),
+      value: result.verificationPlan
+    },
+    {
+      label: "进程健康",
+      state: `${result.processHealth?.summary?.total || 0} processes`,
+      enabled: Boolean(result.processHealth),
+      value: result.processHealth
+    },
+    {
+      label: "页面 Trace",
+      state: result.browserTrace?.artifactPath || (result.browserTrace ? "captured" : "none"),
+      enabled: Boolean(result.browserTrace),
+      value: result.browserTrace
+    },
+    {
+      label: "语义诊断",
+      state: `${result.summary?.semanticIssues || 0} issues`,
+      enabled: Boolean(result.semanticDiagnostics),
+      value: result.semanticDiagnostics
+    }
+  ];
+  evidenceButtons.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = item.label;
+    button.disabled = !item.enabled;
+    button.title = item.enabled ? item.state : "暂无证据";
+    button.addEventListener("click", () => {
+      appendDebugEvidence(`调试证据：${item.label}`, item.state, item.value || {});
+    });
+    evidenceList.appendChild(button);
+  });
+
+  const actionList = debugDiagnosticsPanel.querySelector(".debug-action-list");
+  actions.forEach((action) => {
+    const command = String(action.command || "").trim();
+    const kind = String(action.kind || (command ? "command" : "inspect"));
+    const evidenceText = (action.evidence || []).slice(0, 4).join(" · ");
+    const metaText = [
+      action.priority ? `P${action.priority}` : "",
+      kind,
+      action.target ? `target: ${action.target}` : "",
+      evidenceText ? `evidence: ${evidenceText}` : ""
+    ].filter(Boolean).join(" · ");
+    const row = document.createElement("div");
+    row.className = `debug-action-row ${command ? "runnable" : ""} debug-action-${kind}`;
+    row.innerHTML = `
+      <div>
+        <strong></strong>
+        <small></small>
+        <span class="debug-action-meta"></span>
+      </div>
+      <button type="button" data-action="detail">详情</button>
+      <button type="button" data-action="stage" ${command ? "" : "hidden"}>放入面板</button>
+      <button type="button" data-action="copy" ${command ? "" : "hidden"}>复制</button>
+      <button type="button" data-action="run" ${command ? "" : "hidden"}>运行</button>
+    `;
+    row.querySelector("strong").textContent = action.label || action.id || "建议动作";
+    row.querySelector("small").textContent = action.description || (command ? command : "查看建议详情");
+    row.querySelector(".debug-action-meta").textContent = metaText || "无额外证据";
+    row.querySelector("[data-action='detail']").addEventListener("click", () => {
+      appendToolCall({
+        title: `调试建议：${action.label || action.id}`,
+        label: "debug",
+        state: command ? "可运行" : "建议",
+        body: [
+          action.priority ? `priority: ${action.priority}` : "",
+          kind ? `kind: ${kind}` : "",
+          action.target ? `target: ${action.target}` : "",
+          action.description || "",
+          action.evidence?.length ? `evidence:\n${action.evidence.map((item) => `- ${item}`).join("\n")}` : "",
+          command ? `command: ${command}` : ""
+        ].filter(Boolean).join("\n")
+      });
+    });
+    row.querySelector("[data-action='stage']")?.addEventListener("click", () => {
+      stageDebugActionCommand(action);
+    });
+    row.querySelector("[data-action='copy']")?.addEventListener("click", async () => {
+      const copied = await copyText(command);
+      appendToolCall({
+        title: copied ? `已复制下一步验证命令：${action.label || action.id}` : `复制下一步验证命令失败：${action.label || action.id}`,
+        label: "$",
+        state: copied ? "完成" : "失败",
+        body: copyLogBody(copied, command)
+      });
+      showToast(copied ? "下一步命令已复制。" : copyFailureSummary());
+    });
+    row.querySelector("[data-action='run']")?.addEventListener("click", async () => {
+      if (state.busy) {
+        showToast("代理正在运行，请稍后再运行命令。");
+        return;
+      }
+      stageDebugActionCommand(action);
+      setBusy(true, "运行下一步验证");
+      const ok = await runSuggestedCommand(command, { single: true });
+      setBusy(false, ok ? "验证通过" : "验证失败");
+    });
+    actionList.appendChild(row);
+  });
 }
 
 function renderApprovals(approvals = []) {
@@ -1348,13 +9476,14 @@ function renderApprovals(approvals = []) {
   }
   approvals.slice(0, 6).forEach((approval) => {
     const row = document.createElement("div");
-    row.className = `queue-row ${approval.status === "approved" ? "complete" : "failed"}`;
-    row.innerHTML = `<strong></strong><small></small><button type="button" data-action="view">查看</button><button type="button" data-action="approve">批准</button><button type="button" data-action="reject">拒绝</button><button type="button" data-action="execute">执行</button>`;
+    row.className = `queue-row approval-row ${approval.status === "approved" ? "complete" : "failed"}`;
+    row.innerHTML = `<div><strong></strong><small></small></div><span class="approval-row-actions"><button type="button" data-action="view">查看</button><button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="run-safe">直接替代</button><button type="button" data-action="escalate">升级证据</button><button type="button" data-action="approve">批准</button><button type="button" data-action="reject">拒绝</button><button type="button" data-action="execute">执行</button></span>`;
     row.querySelector("strong").textContent = approval.command || approval.type || approval.id;
     row.querySelector("small").textContent = `${approval.type || "command"} · ${approval.status || "blocked"} · ${approval.risk || "blocked"} · ${approval.reason || ""}`;
+    const getDetail = async () => await api(`/api/approval?id=${encodeURIComponent(approval.id)}`);
     row.querySelector("[data-action='view']").addEventListener("click", async () => {
       try {
-        const detail = await api(`/api/approval?id=${encodeURIComponent(approval.id)}`);
+        const detail = await getDetail();
         appendToolCall({
           title: `审批请求：${approval.id}`,
           label: "policy",
@@ -1363,13 +9492,99 @@ function renderApprovals(approvals = []) {
         });
       } catch (error) {
         showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "approval",
+          action: "approval-view",
+          targetName: approval.id,
+          endpoint: "/api/approval",
+          request: { id: approval.id },
+          approval,
+          error
+        }, {
+          title: `审批查看失败：${approval.id}`,
+          label: "policy",
+          retry: async () => {
+            const detail = await getDetail();
+            appendToolCall({
+              title: `审批请求：${approval.id}`,
+              label: "policy",
+              state: detail.status || "blocked",
+              body: JSON.stringify(detail, null, 2).slice(0, 12000)
+            });
+          },
+          safe: () => runApprovalSafeAlternative(approval)
+        });
+      }
+    });
+    row.querySelector("[data-action='prompt']").addEventListener("click", async () => {
+      try {
+        appendApprovalContextToPrompt(await getDetail());
+      } catch (error) {
+        showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "approval",
+          action: "approval-prompt",
+          targetName: approval.id,
+          endpoint: "/api/approval",
+          request: { id: approval.id },
+          approval,
+          error
+        }, {
+          title: `审批上下文加入失败：${approval.id}`,
+          label: "policy",
+          retry: async () => appendApprovalContextToPrompt(await getDetail()),
+          safe: () => runApprovalSafeAlternative(approval)
+        });
+      }
+    });
+    row.querySelector("[data-action='run-safe']").addEventListener("click", async () => {
+      try {
+        runApprovalSafeAlternative(await getDetail());
+      } catch (error) {
+        showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "approval",
+          action: "approval-safe-alternative",
+          targetName: approval.id,
+          endpoint: "/api/approval",
+          request: { id: approval.id },
+          approval,
+          error
+        }, {
+          title: `审批安全替代失败：${approval.id}`,
+          label: "policy",
+          retry: async () => runApprovalSafeAlternative(await getDetail()),
+          safe: () => runApprovalSafeAlternative(approval)
+        });
+      }
+    });
+    row.querySelector("[data-action='escalate']").addEventListener("click", async () => {
+      try {
+        await createApprovalEscalationEvidence(await getDetail());
+      } catch (error) {
+        showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "approval",
+          action: "approval-escalation",
+          targetName: approval.id,
+          endpoint: "/api/approval-escalation",
+          request: { id: approval.id },
+          approval,
+          error
+        }, {
+          title: `审批升级证据生成失败：${approval.id}`,
+          label: "policy",
+          retry: async () => createApprovalEscalationEvidence(await getDetail()),
+          safe: () => runApprovalSafeAlternative(approval)
+        });
       }
     });
     row.querySelector("[data-action='approve']").addEventListener("click", async () => {
-      try {
+      const request = { id: approval.id, decision: "approved", note: "Approved from UI; execution remains disabled." };
+      const approve = async () => {
         const decision = await api("/api/approval", {
           method: "PATCH",
-          body: JSON.stringify({ id: approval.id, decision: "approved", note: "Approved from UI; execution remains disabled." })
+          body: JSON.stringify(request)
         });
         appendToolCall({
           title: `审批已批准：${approval.id}`,
@@ -1378,15 +9593,33 @@ function renderApprovals(approvals = []) {
           body: JSON.stringify(decision, null, 2).slice(0, 12000)
         });
         await refreshHealth();
+      };
+      try {
+        await approve();
       } catch (error) {
         showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "approval",
+          action: "approval-approve",
+          targetName: approval.id,
+          endpoint: "/api/approval",
+          request,
+          approval,
+          error
+        }, {
+          title: `审批批准失败：${approval.id}`,
+          label: "policy",
+          retry: approve,
+          safe: () => runApprovalSafeAlternative(approval)
+        });
       }
     });
     row.querySelector("[data-action='reject']").addEventListener("click", async () => {
-      try {
+      const request = { id: approval.id, decision: "rejected", note: "Rejected from UI." };
+      const reject = async () => {
         const decision = await api("/api/approval", {
           method: "PATCH",
-          body: JSON.stringify({ id: approval.id, decision: "rejected", note: "Rejected from UI." })
+          body: JSON.stringify(request)
         });
         appendToolCall({
           title: `审批已拒绝：${approval.id}`,
@@ -1395,26 +9628,55 @@ function renderApprovals(approvals = []) {
           body: JSON.stringify(decision, null, 2).slice(0, 12000)
         });
         await refreshHealth();
+      };
+      try {
+        await reject();
       } catch (error) {
         showToast(error.message);
+        appendActionFailureEvidence({
+          kind: "approval",
+          action: "approval-reject",
+          targetName: approval.id,
+          endpoint: "/api/approval",
+          request,
+          approval,
+          error
+        }, {
+          title: `审批拒绝失败：${approval.id}`,
+          label: "policy",
+          retry: reject,
+          safe: () => runApprovalSafeAlternative(approval)
+        });
       }
     });
     row.querySelector("[data-action='execute']").addEventListener("click", async () => {
-      try {
+      const request = { id: approval.id };
+      const execute = async () => {
         const result = await api("/api/approval-execute", {
           method: "POST",
-          body: JSON.stringify({ id: approval.id })
+          body: JSON.stringify(request)
         });
-        appendToolCall({
-          title: `审批执行结果：${approval.id}`,
-          label: "policy",
-          state: result.execution?.executed ? "executed" : "blocked",
-          body: JSON.stringify(result, null, 2).slice(0, 12000)
-        });
+        appendApprovalExecutionCard(result, approval);
         await refreshHealth();
+      };
+      try {
+        await execute();
       } catch (error) {
         showToast(error.message);
-        appendToolCall({ title: `审批执行失败：${approval.id}`, label: "policy", state: "失败", body: error.message });
+        appendActionFailureEvidence({
+          kind: "approval",
+          action: "approval-execute",
+          targetName: approval.id,
+          endpoint: "/api/approval-execute",
+          request,
+          approval,
+          error
+        }, {
+          title: `审批执行失败：${approval.id}`,
+          label: "policy",
+          retry: execute,
+          safe: () => runApprovalSafeAlternative(approval)
+        });
       }
     });
     approvalList.appendChild(row);
@@ -1440,6 +9702,7 @@ async function refreshHealth() {
   renderExtensionCatalog(data.extensions);
   renderMcpCatalog(data.mcp);
   renderAssetCatalog(data.assets);
+  state.lastRecoverySummary = data.recoverySummary || null;
   renderGoal(data.goal);
   restorePendingProposal(data.goal);
   renderReviewArtifacts(data.reviews || []);
@@ -1448,6 +9711,7 @@ async function refreshHealth() {
   renderProcesses(data.processes || []);
   state.contextSnapshot = data.contextSnapshot || null;
   state.contextRollup = data.contextRollup || null;
+  restoreCommandDebugState();
 }
 
 async function refreshToolCatalog() {
@@ -1467,7 +9731,7 @@ async function refreshMcpCatalog() {
 
 mcpProbeBtn?.addEventListener("click", async () => {
   setBusy(true);
-  try {
+  const runProbe = async () => {
     const data = await api("/api/mcp?probe=1");
     renderMcpCatalog(data);
     appendToolCall({
@@ -1476,8 +9740,30 @@ mcpProbeBtn?.addEventListener("click", async () => {
       state: "完成",
       body: JSON.stringify(data.summary || {}, null, 2)
     });
+  };
+  try {
+    await runProbe();
   } catch (error) {
-    appendToolCall({ title: "MCP 探测失败", label: "mcp", state: "失败", body: error.message });
+    showToast(error.message);
+    appendActionFailureEvidence({
+      kind: "mcp",
+      action: "mcp-probe",
+      targetName: "MCP 服务 / 探测",
+      endpoint: "/api/mcp?probe=1",
+      request: { probe: true },
+      item: { name: "MCP 服务 / 探测", status: "failed", source: ".forge/mcp + .mcp.json" },
+      error
+    }, {
+      title: "MCP 探测失败",
+      label: "mcp",
+      retry: runProbe,
+      safe: () => appendCatalogEvidenceToPrompt("mcp", {
+        name: "MCP 服务 / 探测",
+        status: "failed",
+        source: ".forge/mcp + .mcp.json",
+        probe: { status: "failed", error: error.message }
+      })
+    });
   } finally {
     setBusy(false);
   }
@@ -1521,6 +9807,26 @@ async function refreshAll() {
     runState.lastChild.textContent = "后端离线";
     workspaceStatus.textContent = "请先运行 node server.js";
     showToast(error.message);
+    appendActionFailureEvidence({
+      kind: "refresh",
+      action: "refresh-all",
+      targetName: "workspace-bootstrap",
+      endpoint: "/api/health + catalogs + files",
+      request: {
+        activeThreadId: state.activeThreadId || "",
+        workspace: workspaceStatus?.textContent || ""
+      },
+      item: {
+        lastPrompt: state.lastPrompt || "",
+        pendingDiffBytes: String(state.pendingDiff || "").length,
+        pendingCommandCount: (state.pendingCommands || []).length
+      },
+      error
+    }, {
+      title: "刷新工作台失败证据",
+      label: "net",
+      retry: refreshAll
+    });
   }
 }
 
@@ -1543,6 +9849,7 @@ async function startNewThread({ announce = true } = {}) {
   state.pendingDiff = "";
   state.pendingCommands = [];
   state.lastPrompt = "";
+  clearCommandDebugState();
   return result.thread;
 }
 
@@ -1562,6 +9869,7 @@ form.addEventListener("submit", async (event) => {
   appendMessage("user", prompt);
   state.lastPrompt = prompt;
   input.value = "";
+  resizePromptInput();
   setBusy(true);
   renderPlan(["列出工作区文件", "按需读取/搜索关键文件", "生成 unified diff、审查和检查命令"]);
   renderReview([]);
@@ -1571,9 +9879,24 @@ form.addEventListener("submit", async (event) => {
     state: "运行中",
     body: `${state.files.length} 个候选文件`
   });
+  const debugContext = buildAgentDebugContext();
+  if (debugContext) {
+    appendToolCall({
+      title: "已附加最近调试诊断",
+      label: "debug",
+      state: debugContext.status || "attached",
+      body: JSON.stringify({
+        generatedAt: debugContext.generatedAt,
+        status: debugContext.status,
+        summary: debugContext.summary,
+        findings: debugContext.findings,
+        nextActions: debugContext.nextActions
+      }, null, 2).slice(0, 8000)
+    });
+  }
 
   try {
-    const result = await runAgentRequest(prompt);
+    const result = await runAgentRequest(prompt, debugContext);
     appendMessage("agent", result.reply);
     renderPlan(result.plan);
     state.pendingDiff = result.diff || "";
@@ -1584,6 +9907,12 @@ form.addEventListener("submit", async (event) => {
     const toolLogText = (result.toolLog || [])
       .map((item) => `${item.name} ${JSON.stringify(item.args)}`)
       .join("\n");
+    const promptReferenceText = (result.promptReferences?.references || [])
+      .map((item) => `${item.path} (${item.size} bytes)`)
+      .join("\n");
+    const missingReferenceText = (result.promptReferences?.missing || [])
+      .map((item) => `@${item.path} · ${item.reason || "未匹配"}`)
+      .join("\n");
     appendToolCall({
       title: "模型工具循环完成",
       label: "ai",
@@ -1591,6 +9920,10 @@ form.addEventListener("submit", async (event) => {
       body: [
         `模型：${result.model}`,
         `fallback：${(result.modelRuntime?.lastFallbacks || []).length} 次`,
+        `引用文件：${(result.promptReferences?.references || []).length} 个`,
+        promptReferenceText ? `\n${promptReferenceText}` : "",
+        `未命中引用：${(result.promptReferences?.missing || []).length} 个`,
+        missingReferenceText ? `\n${missingReferenceText}` : "",
         `工具调用：${(result.toolLog || []).length} 次`,
         `流式事件：${(result.streamLog || []).length} 个`,
         `建议修改：${result.patches.length} 个文件`,
@@ -1602,8 +9935,18 @@ form.addEventListener("submit", async (event) => {
     setBusy(false, "待审批");
   } catch (error) {
     appendMessage("agent", `请求失败：${error.message}`);
+    appendAgentFailureEvidence(error, {
+      prompt,
+      debugContext,
+      endpoint: error.endpoint || "/api/agent-stream",
+      streamLog: error.streamLog || []
+    });
     setBusy(false, "失败");
   }
+});
+
+input?.addEventListener("input", () => {
+  scheduleReferencePreview();
 });
 
 workspaceForm.addEventListener("submit", async (event) => {
@@ -1630,6 +9973,7 @@ workspaceForm.addEventListener("submit", async (event) => {
     state.pendingDiff = "";
     state.pendingCommands = [];
     state.lastPrompt = "";
+    clearCommandDebugState();
     renderPlan([]);
     renderDiff([]);
     renderCommands([]);
@@ -1638,6 +9982,16 @@ workspaceForm.addEventListener("submit", async (event) => {
     setBusy(false, "待命");
   } catch (error) {
     showToast(error.message);
+    appendWorkspaceSafetyFailureEvidence(error, {
+      title: "切换工作目录失败证据",
+      label: "dir",
+      action: "workspace-switch",
+      workspace,
+      currentWorkspace: workspaceStatus?.textContent || "",
+      pendingDiff: state.pendingDiff,
+      pendingPatches: state.pendingPatches,
+      lastPrompt: state.lastPrompt
+    });
     setBusy(false, "切换失败");
   }
 });
@@ -1667,7 +10021,17 @@ worktreeBtn?.addEventListener("click", async () => {
     setBusy(false, "待命");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "创建隔离 worktree 失败", label: "git", state: "失败", body: error.message });
+    appendWorkspaceSafetyFailureEvidence(error, {
+      title: "创建隔离 worktree 失败证据",
+      label: "git",
+      action: "worktree-create",
+      workspace: workspaceStatus?.textContent || workspaceInput?.value.trim() || "",
+      currentWorkspace: workspaceStatus?.textContent || "",
+      checkpoints: state.checkpoints,
+      pendingDiff: state.pendingDiff,
+      pendingPatches: state.pendingPatches,
+      lastPrompt: state.lastPrompt || input.value.trim()
+    });
     setBusy(false, "失败");
   }
 });
@@ -1677,18 +10041,16 @@ contextSnapshotBtn?.addEventListener("click", async () => {
   try {
     const result = await api("/api/context-snapshot", { method: "POST" });
     state.contextSnapshot = result.snapshot || null;
-    appendToolCall({
-      title: "上下文摘要已保存",
-      label: "context",
-      state: "完成",
-      body: JSON.stringify(result.snapshot, null, 2).slice(0, 12000)
-    });
+    appendContextEvidenceCard("snapshot", result);
     await refreshHealth();
     await refreshFiles();
     setBusy(false, "摘要已保存");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "保存上下文摘要失败", label: "context", state: "失败", body: error.message });
+    appendContextFailureEvidence("snapshot", error, {
+      endpoint: "/api/context-snapshot",
+      request: { method: "POST" }
+    });
     setBusy(false, "摘要失败");
   }
 });
@@ -1697,17 +10059,15 @@ contextCompactBtn?.addEventListener("click", async () => {
   setBusy(true, "压缩上下文");
   try {
     const result = await api("/api/context-compact", { method: "POST" });
-    appendToolCall({
-      title: "上下文压缩已保存",
-      label: "compact",
-      state: "完成",
-      body: JSON.stringify(result.compact, null, 2).slice(0, 12000)
-    });
+    appendContextEvidenceCard("compact", result);
     await refreshHealth();
     setBusy(false, "压缩已保存");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "上下文压缩失败", label: "compact", state: "失败", body: error.message });
+    appendContextFailureEvidence("compact", error, {
+      endpoint: "/api/context-compact",
+      request: { method: "POST" }
+    });
     setBusy(false, "压缩失败");
   }
 });
@@ -1720,18 +10080,16 @@ contextRollupBtn?.addEventListener("click", async () => {
       body: JSON.stringify({ limit: 24 })
     });
     state.contextRollup = result.rollup || null;
-    appendToolCall({
-      title: "上下文滚动摘要已保存",
-      label: "rollup",
-      state: "完成",
-      body: JSON.stringify(result.rollup, null, 2).slice(0, 12000)
-    });
+    appendContextEvidenceCard("rollup", result);
     await refreshHealth();
     await refreshFiles();
     setBusy(false, "滚动摘要已保存");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "上下文滚动摘要失败", label: "rollup", state: "失败", body: error.message });
+    appendContextFailureEvidence("rollup", error, {
+      endpoint: "/api/context-rollup",
+      request: { method: "POST", body: { limit: 24 } }
+    });
     setBusy(false, "滚动摘要失败");
   }
 });
@@ -1743,24 +10101,14 @@ modelPolicyBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ includeRecent: true })
     });
-    appendToolCall({
-      title: "模型策略已生成",
-      label: "model",
-      state: result.policy?.status || "unknown",
-      body: JSON.stringify({
-        generatedAt: result.policy?.generatedAt,
-        status: result.policy?.status,
-        endpoint: result.policy?.endpoint,
-        runtime: result.policy?.runtime,
-        budgetPolicy: result.policy?.budgetPolicy,
-        guardrails: result.policy?.guardrails,
-        remainingGaps: result.policy?.remainingGaps
-      }, null, 2).slice(0, 12000)
-    });
+    appendModelEvidenceCard("policy", result);
     setBusy(false, "模型策略完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取模型策略失败", label: "model", state: "失败", body: error.message });
+    appendModelFailureEvidence("policy", error, {
+      endpoint: "/api/model-policy",
+      request: { includeRecent: true }
+    });
     setBusy(false, "模型策略失败");
   }
 });
@@ -1769,23 +10117,13 @@ modelUsageBtn?.addEventListener("click", async () => {
   setBusy(true, "读取模型用量");
   try {
     const result = await api("/api/model-usage");
-    appendToolCall({
-      title: "模型用量账本已读取",
-      label: "model",
-      state: `${result.usage?.summary?.requestCount || 0} requests`,
-      body: JSON.stringify({
-        generatedAt: result.usage?.generatedAt,
-        endpoint: result.usage?.endpoint,
-        summary: result.usage?.summary,
-        totals: result.usage?.totals,
-        recent: result.usage?.recent?.slice(0, 12),
-        policy: result.usage?.policy
-      }, null, 2).slice(0, 12000)
-    });
+    appendModelEvidenceCard("usage", result);
     setBusy(false, "模型用量完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取模型用量失败", label: "model", state: "失败", body: error.message });
+    appendModelFailureEvidence("usage", error, {
+      endpoint: "/api/model-usage"
+    });
     setBusy(false, "模型用量失败");
   }
 });
@@ -1794,24 +10132,13 @@ modelBudgetBtn?.addEventListener("click", async () => {
   setBusy(true, "读取模型预算");
   try {
     const result = await api("/api/model-budget");
-    appendToolCall({
-      title: "模型预算预检已读取",
-      label: "model",
-      state: result.budget?.status || "unknown",
-      body: JSON.stringify({
-        generatedAt: result.budget?.generatedAt,
-        status: result.budget?.status,
-        blocksModelCall: result.budget?.blocksModelCall,
-        checks: result.budget?.checks,
-        usage: result.budget?.usage,
-        policy: result.budget?.policy,
-        message: result.budget?.message
-      }, null, 2).slice(0, 12000)
-    });
+    appendModelEvidenceCard("budget", result);
     setBusy(false, "模型预算完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取模型预算失败", label: "model", state: "失败", body: error.message });
+    appendModelFailureEvidence("budget", error, {
+      endpoint: "/api/model-budget"
+    });
     setBusy(false, "模型预算失败");
   }
 });
@@ -1820,28 +10147,13 @@ modelCostBtn?.addEventListener("click", async () => {
   setBusy(true, "读取模型成本");
   try {
     const result = await api("/api/model-cost");
-    appendToolCall({
-      title: "模型成本估算已读取",
-      label: "model",
-      state: result.cost?.status || "unknown",
-      body: JSON.stringify({
-        generatedAt: result.cost?.generatedAt,
-        status: result.cost?.status,
-        currency: result.cost?.currency,
-        configured: result.cost?.configured,
-        estimatedCost: result.cost?.estimatedCost,
-        pricedModelCount: result.cost?.pricedModelCount,
-        unpricedModelCount: result.cost?.unpricedModelCount,
-        rows: result.cost?.rows,
-        policy: result.cost?.policy,
-        notes: result.cost?.notes,
-        error: result.cost?.error
-      }, null, 2).slice(0, 12000)
-    });
+    appendModelEvidenceCard("cost", result);
     setBusy(false, "模型成本完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取模型成本失败", label: "model", state: "失败", body: error.message });
+    appendModelFailureEvidence("cost", error, {
+      endpoint: "/api/model-cost"
+    });
     setBusy(false, "模型成本失败");
   }
 });
@@ -1850,25 +10162,13 @@ modelCostPolicyBtn?.addEventListener("click", async () => {
   setBusy(true, "读取价格表 schema");
   try {
     const result = await api("/api/model-cost-policy");
-    appendToolCall({
-      title: "模型价格表 schema 已读取",
-      label: "model",
-      state: result.policy?.valid ? "valid" : "invalid",
-      body: JSON.stringify({
-        envVar: result.policy?.envVar,
-        configured: result.policy?.configured,
-        valid: result.policy?.valid,
-        parsed: result.policy?.parsed,
-        schema: result.policy?.schema,
-        exampleJson: result.policy?.exampleJson,
-        policy: result.policy?.policy,
-        notes: result.policy?.notes
-      }, null, 2).slice(0, 12000)
-    });
+    appendModelEvidenceCard("cost-policy", result);
     setBusy(false, "价格表完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取价格表失败", label: "model", state: "失败", body: error.message });
+    appendModelFailureEvidence("cost-policy", error, {
+      endpoint: "/api/model-cost-policy"
+    });
     setBusy(false, "价格表失败");
   }
 });
@@ -1877,30 +10177,13 @@ modelBillingBtn?.addEventListener("click", async () => {
   setBusy(true, "核对模型账单");
   try {
     const result = await api("/api/model-billing");
-    appendToolCall({
-      title: "模型账单核对已读取",
-      label: "model",
-      state: result.billing?.status || "unknown",
-      body: JSON.stringify({
-        generatedAt: result.billing?.generatedAt,
-        status: result.billing?.status,
-        configured: result.billing?.configured,
-        currency: result.billing?.currency,
-        period: result.billing?.period,
-        estimatedCost: result.billing?.estimatedCost,
-        actualCost: result.billing?.actualCost,
-        variance: result.billing?.variance,
-        rows: result.billing?.rows,
-        billing: result.billing?.billing,
-        policy: result.billing?.policy,
-        notes: result.billing?.notes,
-        error: result.billing?.error
-      }, null, 2).slice(0, 12000)
-    });
+    appendModelEvidenceCard("billing", result);
     setBusy(false, "账单核对完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取账单核对失败", label: "model", state: "失败", body: error.message });
+    appendModelFailureEvidence("billing", error, {
+      endpoint: "/api/model-billing"
+    });
     setBusy(false, "账单核对失败");
   }
 });
@@ -1917,25 +10200,36 @@ semanticIndexBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ symbol: "buildSemanticIndex", limit: 12, contextLines: 2 })
     });
-    appendToolCall({
+    const evidence = {
+      generatedAt: result.index?.generatedAt,
+      indexedFiles: result.index?.indexedFiles,
+      summary: result.index?.summary,
+      declarations: result.index?.declarations?.slice(0, 40),
+      routes: result.index?.routes?.slice(0, 30),
+      selectors: result.index?.selectors?.slice(0, 30),
+      routeSearch: search.matches?.slice(0, 20),
+      referenceSample: references.matches?.slice(0, 8)
+    };
+    appendSemanticEvidenceCard(evidence, {
       title: "语义索引已生成",
-      label: "index",
+      kind: "index",
       state: "完成",
-      body: JSON.stringify({
-        generatedAt: result.index?.generatedAt,
-        indexedFiles: result.index?.indexedFiles,
-        summary: result.index?.summary,
-        declarations: result.index?.declarations?.slice(0, 40),
-        routes: result.index?.routes?.slice(0, 30),
-        selectors: result.index?.selectors?.slice(0, 30),
-        routeSearch: search.matches?.slice(0, 20),
-        referenceSample: references.matches?.slice(0, 8)
-      }, null, 2).slice(0, 12000)
+      body: compactSemanticEvidence(evidence)
     });
     setBusy(false, "索引已生成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "生成语义索引失败", label: "index", state: "失败", body: error.message });
+    appendSemanticFailureEvidence(error, {
+      title: "生成语义索引失败证据",
+      kind: "index",
+      endpoint: "/api/semantic-index",
+      request: {
+        followUps: [
+          { endpoint: "/api/semantic-search", body: { query: "api", kind: "route", limit: 20 } },
+          { endpoint: "/api/semantic-references", body: { symbol: "buildSemanticIndex", limit: 12, contextLines: 2 } }
+        ]
+      }
+    });
     setBusy(false, "索引失败");
   }
 });
@@ -1947,36 +10241,50 @@ codeIntelligenceBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 32, includeDiagnostics: true })
     });
-    appendToolCall({
+    const evidence = {
+      generatedAt: result.overview?.generatedAt,
+      summary: result.overview?.summary,
+      readiness: result.overview?.readiness,
+      typecheck: result.overview?.typecheck ? {
+        packageManager: result.overview.typecheck.packageManager,
+        tsconfigs: result.overview.typecheck.tsconfigs,
+        hasTsFiles: result.overview.typecheck.hasTsFiles,
+        localCompiler: result.overview.typecheck.localCompiler,
+        commands: result.overview.typecheck.commands?.slice(0, 8),
+        policy: result.overview.typecheck.policy
+      } : null,
+      entrypoints: result.overview?.entrypoints?.slice(0, 20),
+      apiSurface: {
+        byMethod: result.overview?.apiSurface?.byMethod,
+        topRouteFiles: result.overview?.apiSurface?.topRouteFiles,
+        serverRoutes: result.overview?.apiSurface?.serverRoutes?.slice(0, 30),
+        clientFetches: result.overview?.apiSurface?.clientFetches?.slice(0, 30)
+      },
+      symbolSurface: {
+        declarationsByKind: result.overview?.symbolSurface?.declarationsByKind,
+        outlineByKind: result.overview?.symbolSurface?.outlineByKind,
+        topDeclarationFiles: result.overview?.symbolSurface?.topDeclarationFiles,
+        largestSymbols: result.overview?.symbolSurface?.largestSymbols?.slice(0, 20),
+        topCalls: result.overview?.symbolSurface?.topCalls?.slice(0, 20)
+      },
+      dependencyHotspots: result.overview?.dependencySurface?.hotspots?.slice(0, 24),
+      diagnostics: result.overview?.diagnostics
+    };
+    appendSemanticEvidenceCard(evidence, {
       title: "代码智能概览已生成",
-      label: "intel",
+      kind: "intel",
       state: result.overview?.readiness?.some((item) => item.status === "blocker" || item.status === "warning") ? "review" : "完成",
-      body: JSON.stringify({
-        generatedAt: result.overview?.generatedAt,
-        summary: result.overview?.summary,
-        readiness: result.overview?.readiness,
-        entrypoints: result.overview?.entrypoints?.slice(0, 20),
-        apiSurface: {
-          byMethod: result.overview?.apiSurface?.byMethod,
-          topRouteFiles: result.overview?.apiSurface?.topRouteFiles,
-          serverRoutes: result.overview?.apiSurface?.serverRoutes?.slice(0, 30),
-          clientFetches: result.overview?.apiSurface?.clientFetches?.slice(0, 30)
-        },
-        symbolSurface: {
-          declarationsByKind: result.overview?.symbolSurface?.declarationsByKind,
-          outlineByKind: result.overview?.symbolSurface?.outlineByKind,
-          topDeclarationFiles: result.overview?.symbolSurface?.topDeclarationFiles,
-          largestSymbols: result.overview?.symbolSurface?.largestSymbols?.slice(0, 20),
-          topCalls: result.overview?.symbolSurface?.topCalls?.slice(0, 20)
-        },
-        dependencyHotspots: result.overview?.dependencySurface?.hotspots?.slice(0, 24),
-        diagnostics: result.overview?.diagnostics
-      }, null, 2).slice(0, 12000)
+      body: compactSemanticEvidence(evidence)
     });
     setBusy(false, "代码智能完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "生成代码智能失败", label: "intel", state: "失败", body: error.message });
+    appendSemanticFailureEvidence(error, {
+      title: "生成代码智能失败证据",
+      kind: "intel",
+      endpoint: "/api/code-intelligence",
+      request: { limit: 32, includeDiagnostics: true }
+    });
     setBusy(false, "代码智能失败");
   }
 });
@@ -1992,23 +10300,32 @@ symbolOutlineBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ symbol: "buildSemanticIndex", path: "server.js", contextLines: 2 })
     });
-    appendToolCall({
+    const evidence = {
+      outlineSummary: outline.summary,
+      symbols: outline.symbols?.slice(0, 40),
+      definition: {
+        matchCount: definition.matchCount,
+        definitions: definition.definitions?.slice(0, 10)
+      }
+    };
+    appendSemanticEvidenceCard(evidence, {
       title: "符号大纲与定义已查询",
-      label: "outline",
+      kind: "outline",
       state: "完成",
-      body: JSON.stringify({
-        outlineSummary: outline.summary,
-        symbols: outline.symbols?.slice(0, 40),
-        definition: {
-          matchCount: definition.matchCount,
-          definitions: definition.definitions?.slice(0, 10)
-        }
-      }, null, 2).slice(0, 12000)
+      body: compactSemanticEvidence(evidence)
     });
     setBusy(false, "符号大纲完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "查询符号大纲失败", label: "outline", state: "失败", body: error.message });
+    appendSemanticFailureEvidence(error, {
+      title: "查询符号大纲失败证据",
+      kind: "outline",
+      endpoint: "/api/symbol-outline",
+      request: {
+        outline: { path: "server.js", limit: 40, includeContext: false },
+        definition: { symbol: "buildSemanticIndex", path: "server.js", contextLines: 2 }
+      }
+    });
     setBusy(false, "符号大纲失败");
   }
 });
@@ -2020,21 +10337,27 @@ semanticDiagnosticsBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 80, includeContext: true })
     });
-    appendToolCall({
+    const evidence = {
+      generatedAt: result.generatedAt,
+      checked: result.checked,
+      summary: result.summary,
+      diagnostics: result.diagnostics?.slice(0, 30)
+    };
+    appendSemanticEvidenceCard(evidence, {
       title: "语义诊断已生成",
-      label: "diag",
+      kind: "diag",
       state: "完成",
-      body: JSON.stringify({
-        generatedAt: result.generatedAt,
-        checked: result.checked,
-        summary: result.summary,
-        diagnostics: result.diagnostics?.slice(0, 30)
-      }, null, 2).slice(0, 12000)
+      body: compactSemanticEvidence(evidence)
     });
     setBusy(false, "诊断完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "生成语义诊断失败", label: "diag", state: "失败", body: error.message });
+    appendSemanticFailureEvidence(error, {
+      title: "生成语义诊断失败证据",
+      kind: "diag",
+      endpoint: "/api/semantic-diagnostics",
+      request: { limit: 80, includeContext: true }
+    });
     setBusy(false, "诊断失败");
   }
 });
@@ -2046,26 +10369,32 @@ semanticImpactBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 80, includeContext: true })
     });
-    appendToolCall({
+    const evidence = {
+      generatedAt: result.generatedAt,
+      source: result.source,
+      summary: result.summary,
+      targets: result.targetSummaries?.slice(0, 30),
+      dependents: result.dependents?.slice(0, 30),
+      callers: result.callers?.slice(0, 30),
+      routes: result.routes?.slice(0, 20),
+      selectors: result.selectors?.slice(0, 20),
+      warnings: result.warnings
+    };
+    appendSemanticEvidenceCard(evidence, {
       title: "语义影响面已生成",
-      label: "impact",
+      kind: "impact",
       state: "完成",
-      body: JSON.stringify({
-        generatedAt: result.generatedAt,
-        source: result.source,
-        summary: result.summary,
-        targets: result.targetSummaries?.slice(0, 30),
-        dependents: result.dependents?.slice(0, 30),
-        callers: result.callers?.slice(0, 30),
-        routes: result.routes?.slice(0, 20),
-        selectors: result.selectors?.slice(0, 20),
-        warnings: result.warnings
-      }, null, 2).slice(0, 12000)
+      body: compactSemanticEvidence(evidence)
     });
     setBusy(false, "影响面完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "生成语义影响面失败", label: "impact", state: "失败", body: error.message });
+    appendSemanticFailureEvidence(error, {
+      title: "生成语义影响面失败证据",
+      kind: "impact",
+      endpoint: "/api/semantic-impact",
+      request: { limit: 80, includeContext: true }
+    });
     setBusy(false, "影响面失败");
   }
 });
@@ -2077,24 +10406,30 @@ dependencyGraphBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 120, includeExternal: true })
     });
-    appendToolCall({
+    const evidence = {
+      generatedAt: result.generatedAt,
+      summary: result.summary,
+      nodes: result.nodes?.slice(0, 40),
+      edges: result.edges?.slice(0, 60),
+      cycles: result.cycles?.slice(0, 20),
+      unresolved: result.unresolved?.slice(0, 30),
+      external: result.external?.slice(0, 30)
+    };
+    appendSemanticEvidenceCard(evidence, {
       title: "依赖图已生成",
-      label: "graph",
+      kind: "graph",
       state: result.summary?.cycles ? "review" : "完成",
-      body: JSON.stringify({
-        generatedAt: result.generatedAt,
-        summary: result.summary,
-        nodes: result.nodes?.slice(0, 40),
-        edges: result.edges?.slice(0, 60),
-        cycles: result.cycles?.slice(0, 20),
-        unresolved: result.unresolved?.slice(0, 30),
-        external: result.external?.slice(0, 30)
-      }, null, 2).slice(0, 12000)
+      body: compactSemanticEvidence(evidence)
     });
     setBusy(false, "依赖图完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "生成依赖图失败", label: "graph", state: "失败", body: error.message });
+    appendSemanticFailureEvidence(error, {
+      title: "生成依赖图失败证据",
+      kind: "graph",
+      endpoint: "/api/dependency-graph",
+      request: { limit: 120, includeExternal: true }
+    });
     setBusy(false, "依赖图失败");
   }
 });
@@ -2121,6 +10456,36 @@ queueBtn?.addEventListener("click", async () => {
     setBusy(false, "待命");
   } catch (error) {
     showToast(error.message);
+    appendActionFailureEvidence({
+      kind: "queue",
+      action: "queue-create",
+      targetName: "new-queued-task",
+      endpoint: "/api/queue",
+      request: { prompt, priority: 0, retryLimit: 1 },
+      item: {
+        prompt,
+        status: "create_failed",
+        isolationGroup: "default"
+      },
+      error
+    }, {
+      title: "任务入队失败证据",
+      label: "queue",
+      retry: async () => {
+        const item = await api("/api/queue", {
+          method: "POST",
+          body: JSON.stringify({ prompt, priority: 0, retryLimit: 1 })
+        });
+        appendToolCall({
+          title: "任务已加入队列",
+          label: "queue",
+          state: "完成",
+          body: `${item.id}\n${item.prompt}`
+        });
+        await refreshHealth();
+      },
+      safe: () => appendQueueContextToPrompt({ prompt, status: "queued", isolationGroup: "default", priority: 0, retryLimit: 1 })
+    });
     setBusy(false, "入队失败");
   }
 });
@@ -2129,10 +10494,32 @@ queueIsolationBtn?.addEventListener("click", async () => {
   setBusy(true, "读取队列隔离");
   try {
     const result = await api("/api/queue-isolation?limit=50");
-    appendToolCall({
+    const evidence = {
+      ...result,
+      status: result.summary?.queuedBlockedByIsolation > 0 || result.summary?.activeConflictGroups > 0 ? "needs_attention" : "pass",
+      gates: [
+        {
+          name: "队列隔离",
+          status: result.summary?.activeConflictGroups > 0 ? "block" : result.summary?.queuedBlockedByIsolation > 0 ? "warn" : "pass",
+          message: `${result.summary?.activeGroups || 0} active groups · ${result.summary?.queuedBlockedByIsolation || 0} blocked queued tasks`,
+          evidence: (result.rows || []).slice(0, 8).map((row) => [
+            row.isolationGroup,
+            row.active?.length ? `active: ${row.active.map((item) => item.id).join(", ")}` : "",
+            row.queued?.length ? `queued: ${row.queued.map((item) => item.id).join(", ")}` : "",
+            row.blockedActivations?.length ? `blocked: ${row.blockedActivations.map((item) => item.id).join(", ")}` : ""
+          ].filter(Boolean).join(" · "))
+        }
+      ],
+      blockers: (result.rows || []).flatMap((row) => row.blockedActivations || []).map((item) => item.reason || item.id).filter(Boolean),
+      nextActions: result.summary?.queuedBlockedByIsolation > 0
+        ? ["完成或跳过当前 active 队列项", "调整后续任务 isolationGroup", "直接继续未阻塞的队列项"]
+        : ["队列隔离正常，可继续激活下一项任务"]
+    };
+    appendGateEvidenceCard(evidence, {
       title: "队列隔离报告已读取",
-      label: "queue",
+      kind: "queue",
       state: `${result.summary?.activeGroups || 0} active groups`,
+      includeCommands: false,
       body: JSON.stringify({
         generatedAt: result.generatedAt,
         summary: result.summary,
@@ -2148,7 +10535,30 @@ queueIsolationBtn?.addEventListener("click", async () => {
     setBusy(false, "队列隔离完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取队列隔离失败", label: "queue", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "读取队列隔离失败证据",
+      kind: "queue",
+      endpoint: "/api/queue-isolation",
+      request: { limit: 50 },
+      retry: async () => {
+        const result = await api("/api/queue-isolation?limit=50");
+        appendGateEvidenceCard({
+          ...result,
+          status: result.summary?.queuedBlockedByIsolation > 0 || result.summary?.activeConflictGroups > 0 ? "needs_attention" : "pass",
+          blockers: (result.rows || []).flatMap((row) => row.blockedActivations || []).map((item) => item.reason || item.id).filter(Boolean)
+        }, {
+          title: "队列隔离报告已读取",
+          kind: "queue",
+          state: `${result.summary?.activeGroups || 0} active groups`,
+          includeCommands: false,
+          body: JSON.stringify({
+            generatedAt: result.generatedAt,
+            summary: result.summary,
+            policy: result.policy
+          }, null, 2).slice(0, 12000)
+        });
+      }
+    });
     setBusy(false, "队列隔离失败");
   }
 });
@@ -2158,15 +10568,27 @@ async function applyPendingDiff({ allowPartial = false } = {}) {
     showToast("当前没有可写入的 diff。");
     return;
   }
+  const selectedDiff = allowPartial ? collectSelectedDiff() : null;
+  if (allowPartial && !selectedDiff.diff.trim()) {
+    showToast("请至少选择一个 hunk 再部分应用。");
+    return;
+  }
+  const applyDiff = allowPartial ? selectedDiff.diff : state.pendingDiff;
+  const applyPatches = state.pendingPatches || [];
+  const applyCommands = state.pendingCommands || [];
+  const applyRepairContext = state.activeRepairChain;
+  const applyPrompt = state.lastPrompt;
   setBusy(true);
   try {
     const result = await api("/api/apply", {
       method: "POST",
       body: JSON.stringify({
-        diff: state.pendingDiff,
-        prompt: state.lastPrompt,
-        commands: state.pendingCommands,
-        allowPartial
+        diff: applyDiff,
+        prompt: applyPrompt,
+        commands: applyCommands,
+        repairContext: applyRepairContext,
+        allowPartial,
+        selectedHunks: selectedDiff?.summary || []
       })
     });
     if (result.status === "conflict") {
@@ -2174,7 +10596,7 @@ async function applyPendingDiff({ allowPartial = false } = {}) {
       try {
         conflictPreview = await api("/api/diff-conflicts", {
           method: "POST",
-          body: JSON.stringify({ diff: state.pendingDiff })
+          body: JSON.stringify({ diff: applyDiff })
         });
       } catch (error) {
         conflictPreview = { error: error.message };
@@ -2201,19 +10623,82 @@ async function applyPendingDiff({ allowPartial = false } = {}) {
       title: allowPartial ? "diff 已部分写入工作区" : "diff 已写入工作区",
       label: "fs",
       state: result.status || "完成",
-      body: [
-        `checkpoint：${result.checkpoint.id}`,
-        result.conflicts?.length ? `conflicts：${result.conflicts.map((item) => item.path).join(", ")}` : "",
-        "",
+        body: [
+          `checkpoint：${result.checkpoint.id}`,
+          selectedDiff?.summary?.length ? `selectedHunks：${selectedDiff.summary.map((item) => `${item.path} ${item.selectedHunks}/${item.totalHunks}`).join(", ")}` : "",
+          result.conflicts?.length ? `conflicts：${result.conflicts.map((item) => item.path).join(", ")}` : "",
+          "",
         result.applied.map((item) => item.path).join("\n")
       ].filter((line) => line !== "").join("\n")
     });
     renderVerification(result.verification);
+    if (state.activeRepairChain) {
+      updateRepairEvidenceChain({
+        status: result.verification?.skipped
+          ? "applied_unverified"
+          : result.verification?.ok
+            ? "verified"
+            : result.repair?.diff
+              ? "repair_suggested"
+              : "verification_failed",
+        apply: {
+          status: result.status || "",
+          checkpointId: result.checkpoint?.id || "",
+          changedFiles: (result.applied || []).map((item) => item.path),
+          taskId: result.task?.id || ""
+        },
+        verification: {
+          ok: Boolean(result.verification?.ok),
+          skipped: Boolean(result.verification?.skipped),
+          checkCount: result.verification?.checks?.length || 0,
+          failedCommands: (result.verification?.checks || []).filter((check) => check.exitCode !== 0).map((check) => check.command).slice(0, 6)
+        }
+      }, { title: "修复验证证据链" });
+    }
     if (result.repair?.diff) {
+      const failedCheck = (result.verification?.checks || []).find((check) => check.exitCode !== 0) || null;
+      updateRepairEvidenceChain({
+        source: "apply-verification",
+        status: "awaiting_approval",
+        command: failedCheck?.command || state.activeRepairChain?.command || "",
+        failure: failedCheck ? {
+          exitCode: failedCheck.exitCode,
+          blocked: false,
+          outputSummary: summarizeCommandOutput(failedCheck.output || ""),
+          output: String(failedCheck.output || "").slice(0, 8000),
+          policy: failedCheck.policy || null
+        } : state.activeRepairChain?.failure || null,
+        repair: {
+          reply: result.repair.reply || "",
+          hasDiff: Boolean(result.repair.diff),
+          files: repairChainFiles(result.repair),
+          commandCount: result.repair.commands?.length || 0,
+          reviewCount: result.repair.review?.length || 0
+        }
+      }, { title: "自动检查失败，修复证据链已续写" });
       state.pendingDiff = result.repair.diff;
+      renderPlan(result.repair.plan || []);
       renderDiff(result.repair.patches || []);
       renderReview(result.repair.review || []);
-      appendMessage("agent", `${result.repair.reply} 修复 diff 已放入预览区，可再次批准写入。`);
+      stageRepairVerificationCommands(result.repair.commands || [], {
+        title: "修复后验证命令",
+        successTitle: "修复后验证命令已放入命令面板",
+        source: "apply-verification-repair",
+        note: "自动检查失败后生成了修复候选，但没有附带验证命令。"
+      });
+      appendToolCall({
+        title: "自动检查失败，已生成修复候选",
+        label: "repair",
+        state: result.status || "待审批",
+        body: JSON.stringify({
+          reply: result.repair.reply || "",
+          plan: result.repair.plan || [],
+          review: result.repair.review || [],
+          commands: result.repair.commands || [],
+          repairError: result.repairError || ""
+        }, null, 2).slice(0, 12000)
+      });
+      appendMessage("agent", `${result.repair.reply} 修复 diff、计划和建议命令已放入预览区，可再次批准写入并继续验证。`);
       setBusy(false, "待修复审批");
     } else {
       state.pendingPatches = [];
@@ -2225,6 +10710,17 @@ async function applyPendingDiff({ allowPartial = false } = {}) {
           ? "自动检查通过，任务已记录。"
           : "自动检查未通过，且没有生成可安全应用的修复 diff。";
       appendMessage("agent", verifyMessage);
+      if (!result.verification?.skipped && !result.verification?.ok) {
+        appendApplyFailureEvidence(result, {
+          title: "写入后验证失败证据",
+          diff: applyDiff,
+          patches: applyPatches,
+          commands: applyCommands,
+          allowPartial,
+          repairContext: applyRepairContext,
+          prompt: applyPrompt
+        });
+      }
       setBusy(false, result.verification?.skipped ? "未验证" : result.verification?.ok ? "已验证" : "检查失败");
     }
     if (result.git) renderGit(result.git);
@@ -2232,6 +10728,15 @@ async function applyPendingDiff({ allowPartial = false } = {}) {
     await refreshFiles();
   } catch (error) {
     showToast(error.message);
+    appendApplyFailureEvidence(error, {
+      title: "写入请求失败证据",
+      diff: applyDiff,
+      patches: applyPatches,
+      commands: applyCommands,
+      allowPartial,
+      repairContext: applyRepairContext,
+      prompt: applyPrompt
+    });
     setBusy(false, "写入失败");
   }
 }
@@ -2244,10 +10749,44 @@ approvePartialBtn?.addEventListener("click", async () => {
   await applyPendingDiff({ allowPartial: true });
 });
 
+copyAllDiffBtn?.addEventListener("click", async () => {
+  const diff = combinedPendingDiff() || state.pendingDiff || "";
+  if (!diff.trim()) {
+    showToast("当前没有可复制的 diff。");
+    return;
+  }
+  const copied = await copyText(diff);
+  appendToolCall({
+    title: copied ? "已复制全部 diff" : "复制全部 diff 失败",
+    label: "diff",
+    state: copied ? "完成" : "失败",
+    body: copyLogBody(copied, diff.slice(0, 8000))
+  });
+  showToast(copied ? "全部 diff 已复制。" : copyFailureSummary());
+});
+
+toggleAllDiffBtn?.addEventListener("click", () => {
+  const files = [...diffList.querySelectorAll(".diff-file")];
+  if (!files.length) {
+    showToast("当前没有可折叠的 diff。");
+    return;
+  }
+  const shouldCollapse = files.some((item) => !item.classList.contains("collapsed"));
+  setAllDiffFilesCollapsed(shouldCollapse);
+});
+
 conflictResolutionPanel?.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
   const action = button.dataset.action;
+  if (action === "prompt-conflicts") {
+    appendConflictResolutionToPrompt();
+    return;
+  }
+  if (action === "repair-conflicts") {
+    runConflictResolutionRepair();
+    return;
+  }
   if (action === "create-resolution-draft") {
     await createConflictResolutionDraftFromPanel();
     return;
@@ -2285,66 +10824,245 @@ rollbackBtn.addEventListener("click", async () => {
     setBusy(false, "已回滚");
   } catch (error) {
     showToast(error.message);
+    appendWorkspaceSafetyFailureEvidence(error, {
+      title: "checkpoint 回滚失败证据",
+      label: "undo",
+      action: "checkpoint-rollback",
+      checkpointId,
+      currentWorkspace: workspaceStatus?.textContent || "",
+      checkpoints: state.checkpoints,
+      pendingDiff: state.pendingDiff,
+      pendingPatches: state.pendingPatches,
+      lastPrompt: state.lastPrompt
+    });
     setBusy(false, "回滚失败");
   }
 });
+
+async function runSuggestedCommand(command, { single = false } = {}) {
+  updateCommandRunState(command, { status: "running", result: null, error: "", startedAt: new Date().toISOString() });
+  appendToolCall({ title: `${single ? "单条运行" : "运行命令"}：${command}`, label: "$", state: "运行中", body: "" });
+  try {
+    const result = await api("/api/command", {
+      method: "POST",
+      body: JSON.stringify({ command })
+    });
+    updateCommandRunState(command, { status: "done", result, error: "" });
+    appendToolCall({
+      title: `命令完成：${command}`,
+      label: "$",
+      state: result.exitCode === 0 ? "完成" : result.blocked ? "已拒绝" : "失败",
+      body: [
+        result.policy ? `policy: ${result.policy.risk} · ${result.policy.reason}` : "",
+        result.approval ? `approval: ${result.approval.id}` : "",
+        "",
+        result.output || "(无输出)"
+      ].join("\n").trim()
+    });
+    if (result.exitCode === 0) return true;
+    if (result.blocked) {
+      appendMessage("agent", `命令被安全策略拒绝：${result.policy?.reason || "未通过策略"}`);
+      return false;
+    }
+    let diagnostics = result.diagnostics || null;
+    if (!diagnostics) {
+      try {
+        const diagnosticsResponse = await api("/api/debug-diagnostics", {
+          method: "POST",
+          body: JSON.stringify({
+            url: browserCheckUrlInput?.value.trim() || "",
+            includeTrace: Boolean(browserCheckUrlInput?.value.trim()),
+            runChecks: false,
+            limit: 12,
+            commands: [command]
+          })
+        });
+        diagnostics = diagnosticsResponse.diagnostics;
+      } catch (error) {
+        appendGateFailureEvidence(error, {
+          title: "失败命令诊断失败",
+          kind: "debug",
+          endpoint: "/api/debug-diagnostics",
+          request: {
+            url: browserCheckUrlInput?.value.trim() || "",
+            includeTrace: Boolean(browserCheckUrlInput?.value.trim()),
+            runChecks: false,
+            limit: 12,
+            commands: [command]
+          },
+          extra: {
+            command,
+            commandResult: result
+          }
+        });
+      }
+    }
+    if (diagnostics) {
+      renderDebugDiagnostics(diagnostics);
+      appendToolCall({
+        title: `失败命令诊断：${command}`,
+        label: "debug",
+        state: diagnostics.status || "unknown",
+        body: JSON.stringify({
+          summary: diagnostics.summary,
+          findings: diagnostics.findings,
+          nextActions: diagnostics.nextActions,
+          policy: diagnostics.policy
+        }, null, 2).slice(0, 12000)
+      });
+    }
+    const repair = await api("/api/repair-command", {
+      method: "POST",
+      body: JSON.stringify({
+        prompt: state.lastPrompt || input.value.trim(),
+        command,
+        result,
+        diagnostics
+      })
+    });
+    if (repair.diff) {
+      const repairChain = createRepairEvidenceChain({
+        source: "failed-command",
+        command,
+        result,
+        diagnostics,
+        prompt: state.lastPrompt || input.value.trim()
+      });
+      updateRepairEvidenceChain({
+        ...repairChain,
+        status: "awaiting_approval",
+        repair: {
+          reply: repair.reply || "",
+          hasDiff: Boolean(repair.diff),
+          files: repairChainFiles(repair),
+          commandCount: repair.commands?.length || 0,
+          reviewCount: repair.review?.length || 0
+        }
+      }, { title: "失败命令修复候选已加入证据链" });
+      state.pendingDiff = repair.diff;
+      renderDiff(repair.patches || []);
+      renderReview(repair.review || []);
+      stageRepairVerificationCommands(repair.commands || [], {
+        title: "失败命令修复验证命令",
+        successTitle: "失败命令修复验证命令已放入命令面板",
+        source: "failed-command-repair",
+        note: "失败命令修复候选没有附带验证命令。"
+      });
+      appendMessage("agent", `${repair.reply} 修复 diff 已放入预览区，可批准写入。`);
+    } else {
+      createRepairEvidenceChain({
+        source: "failed-command",
+        command,
+        result,
+        diagnostics,
+        prompt: state.lastPrompt || input.value.trim()
+      });
+      updateRepairEvidenceChain({
+        status: "no_safe_repair",
+        repair: {
+          reply: repair.reply || "",
+          hasDiff: false,
+          files: [],
+          commandCount: repair.commands?.length || 0,
+          reviewCount: repair.review?.length || 0
+        }
+      }, { title: "失败命令未生成安全修复" });
+      appendMessage("agent", repair.reply || "命令失败，但没有生成可安全应用的修复 diff。");
+    }
+    return false;
+  } catch (error) {
+    updateCommandRunState(command, { status: "done", result: { exitCode: 1, output: error.message }, error: error.message });
+    appendActionFailureEvidence({
+      kind: "command",
+      action: "command-run-or-repair",
+      targetName: command,
+      endpoint: "/api/command",
+      request: { command },
+      item: {
+        command,
+        lastPrompt: state.lastPrompt || input.value.trim(),
+        lastKnownRun: state.commandResults[commandResultKey(command)] || null
+      },
+      error
+    }, {
+      title: `命令失败：${command}`,
+      label: "$",
+      retry: () => runSuggestedCommand(command, { single }),
+      safe: () => appendCommandVerificationPromptToPrompt(command, state.commandResults[commandResultKey(command)] || null)
+    });
+    return false;
+  }
+}
+
+async function runCommandBatch(commands = [], { title = "建议命令", stopOnFailure = true } = {}) {
+  const items = normalizeCommandItems(commands);
+  if (!items.length) {
+    showToast("当前没有可运行命令。");
+    return false;
+  }
+  appendToolCall({
+    title: `开始批量运行：${title}`,
+    label: "$",
+    state: "运行中",
+    body: commandItemsToText(items)
+  });
+  let stoppedAt = "";
+  for (const item of items) {
+    const ok = await runSuggestedCommand(item.command);
+    if (!ok && stopOnFailure) {
+      stoppedAt = item.command;
+      break;
+    }
+  }
+  const summary = summarizeCommandBatch(items);
+  const ok = summary.failed === 0 && summary.blocked === 0 && summary.running === 0 && summary.queued === 0;
+  appendToolCall({
+    title: `批量命令摘要：${title}`,
+    label: "$",
+    state: ok ? "完成" : "失败",
+    body: [
+      formatCommandBatchSummary(items),
+      stoppedAt ? `stoppedAt: ${stoppedAt}` : "",
+      "",
+      commandBatchEvidence(items)
+    ].filter((line) => line !== "").join("\n")
+  });
+  showToast(ok ? "全部命令已通过。" : "命令批量运行已停止，查看摘要。");
+  return ok;
+}
 
 runCommandsBtn.addEventListener("click", async () => {
   if (!state.pendingCommands.length) {
     showToast("当前没有建议命令。");
     return;
   }
-  setBusy(true);
-  for (const item of state.pendingCommands) {
-    const command = item.command || item;
-    appendToolCall({ title: `运行命令：${command}`, label: "$", state: "运行中", body: "" });
-    try {
-      const result = await api("/api/command", {
-        method: "POST",
-        body: JSON.stringify({ command })
-      });
-      appendToolCall({
-        title: `命令完成：${command}`,
-        label: "$",
-        state: result.exitCode === 0 ? "完成" : result.blocked ? "已拒绝" : "失败",
-        body: [
-          result.policy ? `policy: ${result.policy.risk} · ${result.policy.reason}` : "",
-          result.approval ? `approval: ${result.approval.id}` : "",
-          "",
-          result.output || "(无输出)"
-        ].join("\n").trim()
-      });
-      if (result.exitCode !== 0) {
-        if (result.blocked) {
-          appendMessage("agent", `命令被安全策略拒绝：${result.policy?.reason || "未通过策略"}`);
-          break;
-        }
-        const repair = await api("/api/repair-command", {
-          method: "POST",
-          body: JSON.stringify({
-            prompt: state.lastPrompt || input.value.trim(),
-            command,
-            result
-          })
-        });
-        if (repair.diff) {
-          state.pendingDiff = repair.diff;
-          renderDiff(repair.patches || []);
-          renderReview(repair.review || []);
-          renderCommands(repair.commands || []);
-          appendMessage("agent", `${repair.reply} 修复 diff 已放入预览区，可批准写入。`);
-        } else {
-          appendMessage("agent", repair.reply || "命令失败，但没有生成可安全应用的修复 diff。");
-        }
-        break;
-      }
-    } catch (error) {
-      appendToolCall({ title: `命令失败：${command}`, label: "$", state: "失败", body: error.message });
-      break;
-    }
-  }
-  setBusy(false, "待命");
+  setBusy(true, "运行命令");
+  const ok = await runCommandBatch(state.pendingCommands, { title: "建议命令" });
+  setBusy(false, ok ? "命令通过" : "命令失败");
 });
+
+manualCommandForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const command = manualCommandInput?.value.trim() || "";
+  resetManualCommandHistoryNavigation();
+  const item = stageManualCommand(command, { focus: false });
+  if (!item) return;
+  if (state.busy) {
+    showToast("代理正在运行，已先加入面板。");
+    return;
+  }
+  setBusy(true, "运行手动验证");
+  const ok = await runSuggestedCommand(item.command, { single: true });
+  setBusy(false, ok ? "验证通过" : "验证失败");
+});
+
+manualCommandStageBtn?.addEventListener("click", () => {
+  resetManualCommandHistoryNavigation();
+  stageManualCommand(manualCommandInput?.value || "");
+});
+
+manualCommandInput?.addEventListener("keydown", handleManualCommandInputKeydown);
+manualCommandInput?.addEventListener("input", resetManualCommandHistoryNavigation);
 
 reviewBtn?.addEventListener("click", async () => {
   setBusy(true, "复核中");
@@ -2378,7 +11096,18 @@ reviewBtn?.addEventListener("click", async () => {
     setBusy(false, "已复核");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "复核当前改动失败", label: "review", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "复核当前改动失败",
+      kind: "review",
+      endpoint: "/api/review",
+      request: { prompt: state.lastPrompt || input.value.trim() },
+      extra: {
+        pendingDiff: {
+          bytes: String(state.pendingDiff || "").length,
+          files: (state.pendingPatches || []).map((patch) => patch.path).filter(Boolean).slice(0, 20)
+        }
+      }
+    });
     setBusy(false, "复核失败");
   }
 });
@@ -2390,17 +11119,22 @@ verificationPlanBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 12, commands: state.pendingCommands.map((item) => item.command || item) })
     });
-    renderVerificationPlan(result.plan);
-    appendToolCall({
+    renderVerificationPlan(result.plan, { logCommands: true });
+    appendGateEvidenceCard(result.plan || {}, {
       title: "验证门禁计划已生成",
-      label: "verify",
+      kind: "verify",
       state: result.plan?.status || "unknown",
-      body: JSON.stringify(result.plan, null, 2).slice(0, 12000)
+      body: compactGateEvidence(result.plan || {})
     });
     setBusy(false, result.plan?.status === "ready" ? "门禁就绪" : "门禁待处理");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "验证门禁计划失败", label: "verify", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "验证门禁计划失败",
+      kind: "verify",
+      endpoint: "/api/verification-plan",
+      request: { limit: 12, commands: state.pendingCommands.map((item) => item.command || item) }
+    });
     setBusy(false, "门禁失败");
   }
 });
@@ -2412,35 +11146,96 @@ ciStatusBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 20, persist: true })
     });
-    appendToolCall({
+    const evidence = {
+      generatedAt: result.status?.generatedAt,
+      status: result.status?.status,
+      provider: result.status?.provider,
+      summary: result.status?.summary,
+      ci: result.status?.ci,
+      remote: {
+        provider: result.status?.remote?.provider,
+        available: result.status?.remote?.available,
+        authenticated: result.status?.remote?.authenticated,
+        reason: result.status?.remote?.reason,
+        checks: result.status?.remote?.checks
+      },
+      verificationPlan: result.status?.verificationPlan,
+      blockers: result.status?.blockers,
+      policy: result.status?.policy,
+      artifact: result.status?.artifact
+    };
+    appendGateEvidenceCard(evidence, {
       title: "CI 状态汇总已生成",
-      label: "ci",
+      kind: "ci",
       state: result.status?.status || "unknown",
-      body: JSON.stringify({
-        generatedAt: result.status?.generatedAt,
-        status: result.status?.status,
-        provider: result.status?.provider,
-        summary: result.status?.summary,
-        ci: result.status?.ci,
-        remote: {
-          provider: result.status?.remote?.provider,
-          available: result.status?.remote?.available,
-          authenticated: result.status?.remote?.authenticated,
-          reason: result.status?.remote?.reason,
-          checks: result.status?.remote?.checks
-        },
-        verificationPlan: result.status?.verificationPlan,
-        blockers: result.status?.blockers,
-        policy: result.status?.policy,
-        artifact: result.status?.artifact
-      }, null, 2).slice(0, 12000)
+      body: compactGateEvidence(evidence)
     });
     renderVerificationPlan(result.status?.verificationPlan);
     setBusy(false, result.status?.status === "ready" ? "CI 就绪" : "CI 待处理");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "CI 状态读取失败", label: "ci", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "CI 状态读取失败",
+      kind: "ci",
+      endpoint: "/api/ci-status",
+      request: { limit: 20, persist: true }
+    });
     setBusy(false, "CI 状态失败");
+  }
+});
+
+debugDiagnosticsBtn?.addEventListener("click", async () => {
+  const targetUrl = browserCheckUrlInput?.value.trim();
+  const runChecks = Boolean(debugDiagnosticsPanel?.querySelector("#debugRunChecks")?.checked || debugRunChecks?.checked);
+  setBusy(true, "调试诊断");
+  try {
+    const diagnosticsResponse = await api("/api/debug-diagnostics", {
+      method: "POST",
+      body: JSON.stringify({
+        url: targetUrl,
+        includeTrace: Boolean(targetUrl),
+        runChecks,
+        limit: 20,
+        commands: state.pendingCommands.map((item) => item.command || item)
+      })
+    });
+    renderDebugDiagnostics(diagnosticsResponse.diagnostics);
+    renderVerificationPlan(diagnosticsResponse.diagnostics?.verificationPlan);
+    if (diagnosticsResponse.diagnostics?.verificationPlan?.commands?.length) {
+      renderCommands(diagnosticsResponse.diagnostics.verificationPlan.commands);
+    }
+    if (diagnosticsResponse.diagnostics?.browserTrace) {
+      renderBrowserTrace(diagnosticsResponse.diagnostics.browserTrace);
+    }
+    appendToolCall({
+      title: "一键调试诊断完成",
+      label: "debug",
+      state: diagnosticsResponse.diagnostics?.status || "unknown",
+      body: JSON.stringify({
+        generatedAt: diagnosticsResponse.diagnostics?.generatedAt,
+        status: diagnosticsResponse.diagnostics?.status,
+        summary: diagnosticsResponse.diagnostics?.summary,
+        findings: diagnosticsResponse.diagnostics?.findings,
+        nextActions: diagnosticsResponse.diagnostics?.nextActions,
+        policy: diagnosticsResponse.diagnostics?.policy
+      }, null, 2).slice(0, 12000)
+    });
+    setBusy(false, diagnosticsResponse.diagnostics?.status === "ready" ? "诊断通过" : "诊断完成");
+  } catch (error) {
+    showToast(error.message);
+    appendGateFailureEvidence(error, {
+      title: "一键调试诊断失败",
+      kind: "debug",
+      endpoint: "/api/debug-diagnostics",
+      request: {
+        url: targetUrl,
+        includeTrace: Boolean(targetUrl),
+        runChecks,
+        limit: 20,
+        commands: state.pendingCommands.map((item) => item.command || item)
+      }
+    });
+    setBusy(false, "诊断失败");
   }
 });
 
@@ -2451,16 +11246,22 @@ policyAuditBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 20, sampleCommands: state.pendingCommands.map((item) => item.command || item) })
     });
-    appendToolCall({
+    appendGateEvidenceCard(result.audit || {}, {
       title: "权限策略审计已生成",
-      label: "policy",
+      kind: "policy",
       state: result.audit?.summary?.findings ? "review" : "ok",
-      body: JSON.stringify(result.audit, null, 2).slice(0, 12000)
+      body: compactGateEvidence(result.audit || {}),
+      includeCommands: false
     });
     setBusy(false, "权限审计完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "权限策略审计失败", label: "policy", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "权限策略审计失败",
+      kind: "policy",
+      endpoint: "/api/policy-audit",
+      request: { limit: 20, sampleCommands: state.pendingCommands.map((item) => item.command || item) }
+    });
     setBusy(false, "权限审计失败");
   }
 });
@@ -2472,16 +11273,22 @@ permissionMatrixBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 40 })
     });
-    appendToolCall({
+    appendGateEvidenceCard(result.matrix || {}, {
       title: "权限矩阵已生成",
-      label: "matrix",
+      kind: "matrix",
       state: `${result.matrix?.summary?.providers || 0} providers`,
-      body: JSON.stringify(result.matrix, null, 2).slice(0, 12000)
+      body: compactGateEvidence(result.matrix || {}),
+      includeCommands: false
     });
     setBusy(false, "权限矩阵完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "权限矩阵失败", label: "matrix", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "权限矩阵失败",
+      kind: "matrix",
+      endpoint: "/api/permission-matrix",
+      request: { limit: 40 }
+    });
     setBusy(false, "权限矩阵失败");
   }
 });
@@ -2493,16 +11300,22 @@ extensionTrustBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ limit: 40 })
     });
-    appendToolCall({
+    appendGateEvidenceCard(result.trust || {}, {
       title: "扩展 Trust 审计已生成",
-      label: "trust",
+      kind: "trust",
       state: `${result.trust?.summary?.total || 0} extensions`,
-      body: JSON.stringify(result.trust, null, 2).slice(0, 12000)
+      body: compactGateEvidence(result.trust || {}),
+      includeCommands: false
     });
     setBusy(false, "扩展信任完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "扩展 Trust 审计失败", label: "trust", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "扩展 Trust 审计失败",
+      kind: "trust",
+      endpoint: "/api/extension-trust",
+      request: { limit: 40 }
+    });
     setBusy(false, "扩展信任失败");
   }
 });
@@ -2516,9 +11329,21 @@ prReadinessBtn?.addEventListener("click", async () => {
     });
     const remoteStatus = await api("/api/remote-pr-status").catch(() => readiness.remote || null);
     const remote = remoteStatus || readiness.remote || {};
-    appendToolCall({
+    const evidence = {
+      provider: readiness.provider,
+      status: readiness.status,
+      remotes: readiness.remotes,
+      ci: readiness.ci,
+      verificationPlan: readiness.verificationPlan,
+      remote,
+      blockers: readiness.blockers,
+      warnings: readiness.warnings,
+      policy: readiness.policy,
+      draft: readiness.draft
+    };
+    appendGateEvidenceCard(evidence, {
       title: "PR readiness 已生成",
-      label: "pr",
+      kind: "pr",
       state: readiness.status || "unknown",
       body: [
         `provider: ${readiness.provider || "unknown"}`,
@@ -2536,7 +11361,12 @@ prReadinessBtn?.addEventListener("click", async () => {
     setBusy(false, readiness.status === "ready" ? "PR 就绪" : "PR 待处理");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "PR readiness 检查失败", label: "pr", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "PR readiness 检查失败",
+      kind: "pr",
+      endpoint: "/api/pr-readiness",
+      request: { prompt: state.lastPrompt || input.value.trim() }
+    });
     setBusy(false, "PR 检查失败");
   }
 });
@@ -2548,27 +11378,34 @@ mergeGateBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ prompt: state.lastPrompt || input.value.trim(), limit: 12 })
     });
-    appendToolCall({
+    const evidence = {
+      generatedAt: result.gate?.generatedAt,
+      status: result.gate?.status,
+      summary: result.gate?.summary,
+      gates: result.gate?.gates,
+      blockers: result.gate?.blockers,
+      warnings: result.gate?.warnings,
+      remote: result.gate?.remote,
+      publishPackage: result.gate?.publishPackage,
+      verificationPlan: result.gate?.verificationPlan,
+      policy: result.gate?.policy
+    };
+    appendGateEvidenceCard(evidence, {
       title: "合并门禁已生成",
-      label: "gate",
+      kind: "gate",
       state: result.gate?.status || "unknown",
-      body: JSON.stringify({
-        generatedAt: result.gate?.generatedAt,
-        status: result.gate?.status,
-        summary: result.gate?.summary,
-        gates: result.gate?.gates,
-        blockers: result.gate?.blockers,
-        warnings: result.gate?.warnings,
-        remote: result.gate?.remote,
-        publishPackage: result.gate?.publishPackage,
-        policy: result.gate?.policy
-      }, null, 2).slice(0, 12000)
+      body: compactGateEvidence(evidence)
     });
     renderVerificationPlan(result.gate?.verificationPlan);
     setBusy(false, result.gate?.status === "ready" ? "合并就绪" : "合并待处理");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "合并门禁失败", label: "gate", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "合并门禁失败",
+      kind: "gate",
+      endpoint: "/api/merge-gate",
+      request: { prompt: state.lastPrompt || input.value.trim(), limit: 12 }
+    });
     setBusy(false, "合并门禁失败");
   }
 });
@@ -2580,28 +11417,38 @@ remotePublishPlanBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ prompt: state.lastPrompt || input.value.trim() })
     });
-    appendToolCall({
+    const evidence = {
+      status: plan.status,
+      provider: plan.provider,
+      package: plan.package,
+      approval: plan.approval,
+      policy: plan.policy,
+      readiness: plan.readiness,
+      commands: plan.commands,
+      notes: plan.notes
+    };
+    appendGateEvidenceCard(evidence, {
       title: "远端发布审批计划已生成",
-      label: "release",
+      kind: "release",
       state: plan.status || "approval_required",
       body: [
         `provider: ${plan.provider || "unknown"}`,
         `commands: ${plan.commands?.length || 0}`,
         `approval: ${plan.approval?.id || ""}`,
         "",
-        JSON.stringify({
-          policy: plan.policy,
-          readiness: plan.readiness,
-          commands: plan.commands,
-          notes: plan.notes
-        }, null, 2)
+        compactGateEvidence(evidence)
       ].join("\n").slice(0, 12000)
     });
     await refreshHealth();
     setBusy(false, "待审批");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "生成远端发布审批失败", label: "release", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "生成远端发布审批失败",
+      kind: "release",
+      endpoint: "/api/remote-publish-plan",
+      request: { prompt: state.lastPrompt || input.value.trim() }
+    });
     setBusy(false, "审批失败");
   }
 });
@@ -2614,33 +11461,39 @@ remotePublishPackagesBtn?.addEventListener("click", async () => {
     if (result.packages?.[0]?.id) {
       detail = await api(`/api/remote-publish-package?id=${encodeURIComponent(result.packages[0].id)}`).catch(() => null);
     }
-    appendToolCall({
+    const evidence = {
+      summary: result.summary,
+      packages: result.packages,
+      latest: detail ? {
+        id: detail.id,
+        policy: detail.policy,
+        paths: detail.paths,
+        plan: {
+          status: detail.plan?.status,
+          provider: detail.plan?.provider,
+          commands: detail.plan?.commands,
+          readiness: detail.plan?.readiness
+        },
+        prBodyPreview: detail.prBody?.slice(0, 2000),
+        reviewSummaryPreview: detail.reviewSummary?.slice(0, 2000)
+      } : null,
+      policy: result.policy
+    };
+    appendGateEvidenceCard(evidence, {
       title: "远端发布包索引已读取",
-      label: "release",
+      kind: "release",
       state: `${result.summary?.total || 0} packages`,
-      body: JSON.stringify({
-        summary: result.summary,
-        packages: result.packages,
-        latest: detail ? {
-          id: detail.id,
-          policy: detail.policy,
-          paths: detail.paths,
-          plan: {
-            status: detail.plan?.status,
-            provider: detail.plan?.provider,
-            commands: detail.plan?.commands,
-            readiness: detail.plan?.readiness
-          },
-          prBodyPreview: detail.prBody?.slice(0, 2000),
-          reviewSummaryPreview: detail.reviewSummary?.slice(0, 2000)
-        } : null,
-        policy: result.policy
-      }, null, 2).slice(0, 12000)
+      body: compactGateEvidence(evidence)
     });
     setBusy(false, "发布包完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取远端发布包失败", label: "release", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "读取远端发布包失败",
+      kind: "release",
+      endpoint: "/api/remote-publish-packages",
+      request: { limit: 8 }
+    });
     setBusy(false, "发布包失败");
   }
 });
@@ -2654,34 +11507,111 @@ remotePublishPreflightBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ id, limit: 8 })
     });
-    appendToolCall({
+    const evidence = {
+      summary: result.preflight?.summary,
+      package: result.preflight?.package,
+      approval: result.preflight?.approval,
+      cli: result.preflight?.cli,
+      git: result.preflight?.git,
+      remote: {
+        provider: result.preflight?.remote?.provider,
+        available: result.preflight?.remote?.available,
+        authenticated: result.preflight?.remote?.authenticated,
+        reason: result.preflight?.remote?.reason
+      },
+      commandChecks: result.preflight?.commandChecks,
+      blockers: result.preflight?.blockers,
+      policy: result.preflight?.policy
+    };
+    appendGateEvidenceCard(evidence, {
       title: "远端发布预检已生成",
-      label: "release",
+      kind: "release",
       state: result.preflight?.status || "unknown",
-      body: JSON.stringify({
-        summary: result.preflight?.summary,
-        package: result.preflight?.package,
-        approval: result.preflight?.approval,
-        cli: result.preflight?.cli,
-        git: result.preflight?.git,
-        remote: {
-          provider: result.preflight?.remote?.provider,
-          available: result.preflight?.remote?.available,
-          authenticated: result.preflight?.remote?.authenticated,
-          reason: result.preflight?.remote?.reason
-        },
-        commandChecks: result.preflight?.commandChecks,
-        blockers: result.preflight?.blockers,
-        policy: result.preflight?.policy
-      }, null, 2).slice(0, 12000)
+      body: compactGateEvidence(evidence)
     });
     setBusy(false, result.preflight?.status === "ready_for_external_execution" ? "预检通过" : "预检待处理");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "远端发布预检失败", label: "release", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "远端发布预检失败",
+      kind: "release",
+      endpoint: "/api/remote-publish-preflight",
+      request: { limit: 8 }
+    });
     setBusy(false, "预检失败");
   }
 });
+
+function buildHandoffPromptContext(handoff = {}) {
+  if (!handoff?.id && !handoff?.body) return "";
+  const taskLines = (handoff.tasks || []).slice(0, 8).map((task) => `- ${task.status || "unknown"} · ${task.id || ""} · ${task.prompt || ""}`);
+  return [
+    "请基于这份 PR/交付草稿继续当前编码、调试或交付准备工作。",
+    "",
+    `草稿 ID：${handoff.id || ""}`,
+    `标题：${handoff.title || ""}`,
+    handoff.path ? `路径：${handoff.path}` : "",
+    handoff.git?.branch ? `分支：${handoff.git.branch}` : "",
+    handoff.policy ? `策略：light=${Boolean(handoff.policy.light)} · fullDiff=${Boolean(handoff.policy.includesFullDiff)}` : "",
+    "",
+    "近期任务：",
+    taskLines.length ? taskLines.join("\n") : "- 无",
+    "",
+    "交付草稿 Markdown：",
+    String(handoff.body || "").slice(0, 12000),
+    "",
+    "要求：先核对当前工作树、diff 和验证状态；如果草稿暴露遗漏、失败检查或交付 blocker，请优先修复；需要改代码时输出最小 diff，并给出或执行安全验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendHandoffEvidenceCard(handoff = {}) {
+  appendToolCall({
+    title: "PR/交付草稿已生成",
+    label: "pr",
+    state: "完成",
+    body: `path: ${handoff.path || ""}\n\n${String(handoff.body || "").slice(0, 12000)}`
+  });
+  const context = buildHandoffPromptContext(handoff);
+  if (!context) return;
+  const actions = document.createElement("div");
+  actions.className = "debug-last-failed-actions";
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="continue">直接继续</button>`;
+  actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
+    const current = input.value.trim();
+    input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+    input.focus();
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "交付草稿已加入提示词",
+      label: "pr",
+      state: "ready",
+      body: context.slice(0, 12000)
+    });
+    showToast("交付草稿已加入提示词。");
+  });
+  actions.querySelector("[data-action='continue']").addEventListener("click", () => {
+    if (state.busy) {
+      showToast("代理正在运行，请稍后再继续交付草稿。");
+      return;
+    }
+    const prompt = [
+      context,
+      "",
+      "请现在直接基于这份交付草稿继续推进：优先补齐交付前 blocker、失败验证或遗漏说明，并给出下一轮安全验证命令。"
+    ].join("\n");
+    input.value = prompt;
+    scheduleReferencePreview({ immediate: true });
+    appendToolCall({
+      title: "已启动交付草稿继续",
+      label: "pr",
+      state: "running",
+      body: prompt.slice(0, 12000)
+    });
+    showToast("正在基于交付草稿启动继续任务。");
+    submitPromptForm();
+  });
+  log.lastElementChild?.appendChild(actions);
+}
 
 handoffBtn?.addEventListener("click", async () => {
   setBusy(true, "生成中");
@@ -2690,19 +11620,188 @@ handoffBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ prompt: state.lastPrompt || input.value.trim() })
     });
-    appendToolCall({
-      title: "PR/交付草稿已生成",
-      label: "pr",
-      state: "完成",
-      body: `path: ${handoff.path}\n\n${handoff.body.slice(0, 12000)}`
-    });
+    appendHandoffEvidenceCard(handoff);
     setBusy(false, "已生成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "生成交付草稿失败", label: "pr", state: "失败", body: error.message });
+    appendGateFailureEvidence(error, {
+      title: "生成交付草稿失败",
+      kind: "pr",
+      endpoint: "/api/handoff",
+      request: { prompt: state.lastPrompt || input.value.trim() }
+    });
     setBusy(false, "生成失败");
   }
 });
+
+async function startManagedProcessCommand(command, { clearInput = true, titlePrefix = "" } = {}) {
+  const commandText = String(command || "").trim();
+  if (!commandText) {
+    showToast("请输入要启动的受管进程命令。");
+    return null;
+  }
+  const process = await api("/api/processes", {
+    method: "POST",
+    body: JSON.stringify({ command: commandText })
+  });
+  appendToolCall({
+    title: process.blocked
+      ? `${titlePrefix}进程命令已拒绝：${commandText}`
+      : `${titlePrefix}已启动受管进程：${commandText}`,
+    label: "proc",
+    state: process.status || "unknown",
+    body: [
+      process.id ? `id: ${process.id}` : "",
+      process.pid ? `pid: ${process.pid}` : "",
+      process.policy ? `policy: ${process.policy.risk} · ${process.policy.reason}` : "",
+      process.probe ? `probe: ${process.probe.status} · ${process.probe.url}` : "",
+      process.approval ? `approval: ${process.approval.id}` : "",
+      "",
+      process.outputTail || "(暂无输出)"
+    ].filter((line) => line !== "").join("\n")
+  });
+  if (!process.blocked && clearInput && processCommandInput) processCommandInput.value = "";
+  await refreshHealth();
+  return process;
+}
+
+async function waitForManagedProcessProbe(process = {}, { attempts = 12, delayMs = 750 } = {}) {
+  if (!process?.id) return process;
+  let latest = process;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const result = await api(`/api/process-health?id=${encodeURIComponent(process.id)}&limit=20`).catch(() => null);
+    latest = result?.rows?.find((item) => item.id === process.id) || latest;
+    const url = processProbeUrl(latest);
+    if (url) {
+      if (browserCheckUrlInput) browserCheckUrlInput.value = url;
+      appendToolCall({
+        title: `启动页面 URL 已识别：${latest.command || process.command || process.id}`,
+        label: "proc",
+        state: latest.probe?.status || "ready",
+        body: JSON.stringify({
+          id: latest.id,
+          command: latest.command,
+          status: latest.status,
+          probe: latest.probe,
+          url,
+          policy: {
+            access: "managed-process-probe",
+            startsProcesses: false,
+            browserCheckReady: true
+          }
+        }, null, 2).slice(0, 8000)
+      });
+      showToast(latest.probe?.ok ? "启动页已就绪，可直接页面调试。" : "已识别启动页 URL，可继续检查。");
+      return latest;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  appendToolCall({
+    title: `启动页面 URL 未识别：${process.command || process.id}`,
+    label: "proc",
+    state: "no-probe",
+    body: JSON.stringify({
+      id: process.id,
+      command: process.command,
+      status: process.status,
+      probe: process.probe || null
+    }, null, 2).slice(0, 4000)
+  });
+  return latest;
+}
+
+async function discoverStartupCommand({ start = false, debug = false } = {}) {
+  setBusy(true, debug ? "发现并调试" : start ? "发现并启动" : "发现启动命令");
+  try {
+    const result = await api("/api/process-startup-commands?limit=8");
+    const first = result.commands?.[0] || null;
+    if (first?.command && processCommandInput) {
+      processCommandInput.value = first.command;
+      processCommandInput.focus();
+    }
+    appendToolCall({
+      title: first?.command ? `启动命令已发现：${first.command}` : "启动命令未发现",
+      label: "proc",
+      state: `${result.commands?.length || 0} commands`,
+      body: JSON.stringify({
+        packageManager: result.packageManager,
+        scripts: result.scripts,
+        commands: result.commands,
+        policy: result.policy
+      }, null, 2).slice(0, 12000)
+    });
+    if (start && first?.command) {
+      const process = await startManagedProcessCommand(first.command, {
+        clearInput: true,
+        titlePrefix: debug ? "发现并调试 · " : "发现并启动 · "
+      });
+      const probedProcess = process?.blocked ? process : await waitForManagedProcessProbe(process);
+      if (debug && !process?.blocked && processProbeUrl(probedProcess)) {
+        setBusy(false, "启动后调试");
+        const debugResult = await runProcessBrowserEvidence(probedProcess, { mode: "debug", title: "发现并调试" });
+        appendToolCall({
+          title: `发现并调试完成：${first.command}`,
+          label: "debug",
+          state: debugResult?.ok ? "完成" : "异常",
+          body: JSON.stringify({
+            command: first.command,
+            processId: probedProcess?.id || "",
+            url: processProbeUrl(probedProcess),
+            debug: debugResult ? {
+              ok: debugResult.ok,
+              status: debugResult.status,
+              finalUrl: debugResult.finalUrl,
+              summary: debugResult.summary,
+              artifactPath: debugResult.artifactPath
+            } : null,
+            policy: {
+              action: "discover-start-debug",
+              startsProcesses: true,
+              browserTrace: true,
+              localUrlOnly: true
+            }
+          }, null, 2).slice(0, 8000)
+        });
+        return { result, process: probedProcess, debug: debugResult };
+      }
+      if (debug && !process?.blocked) {
+        appendToolCall({
+          title: `发现并调试未找到页面 URL：${first.command}`,
+          label: "debug",
+          state: "no-url",
+          body: JSON.stringify({
+            command: first.command,
+            process: probedProcess,
+            policy: {
+              action: "discover-start-debug",
+              startsProcesses: true,
+              browserTrace: false,
+              reason: "managed process did not expose a probe URL"
+            }
+          }, null, 2).slice(0, 8000)
+        });
+      }
+      showToast(process?.blocked ? "推荐启动命令已进入审批/拒绝状态。" : "已发现并启动推荐命令。");
+      setBusy(false, process?.blocked ? "已拒绝" : debug ? "未识别 URL" : "已启动");
+      return { result, process: probedProcess };
+    }
+    showToast(first?.command ? "已填入推荐启动命令。" : "没有发现可安全启动的命令。");
+    setBusy(false, first?.command ? "已发现" : "未发现");
+    return { result, process: null };
+  } catch (error) {
+    showToast(error.message);
+    appendProcessFailureEvidence(error, {
+      title: debug ? "发现并调试失败" : start ? "发现并启动失败" : "启动命令发现失败",
+      action: debug ? "process-discover-start-debug" : start ? "process-discover-and-start" : "process-startup-discovery",
+      endpoint: start ? "/api/process-startup-commands -> /api/processes" : "/api/process-startup-commands",
+      request: { limit: 8, start, debug },
+      item: { command: "process-startup-commands", status: "failed" },
+      retry: async () => discoverStartupCommand({ start, debug })
+    });
+    setBusy(false, debug ? "调试失败" : start ? "启动失败" : "发现失败");
+    return null;
+  }
+}
 
 processForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -2713,32 +11812,32 @@ processForm?.addEventListener("submit", async (event) => {
   }
   setBusy(true, "启动进程");
   try {
-    const process = await api("/api/processes", {
-      method: "POST",
-      body: JSON.stringify({ command })
-    });
-    appendToolCall({
-      title: process.blocked ? `进程命令已拒绝：${command}` : `已启动受管进程：${command}`,
-      label: "proc",
-      state: process.status || "unknown",
-      body: [
-        process.id ? `id: ${process.id}` : "",
-        process.pid ? `pid: ${process.pid}` : "",
-        process.policy ? `policy: ${process.policy.risk} · ${process.policy.reason}` : "",
-        process.probe ? `probe: ${process.probe.status} · ${process.probe.url}` : "",
-        process.approval ? `approval: ${process.approval.id}` : "",
-        "",
-        process.outputTail || "(暂无输出)"
-      ].filter((line) => line !== "").join("\n")
-    });
-    if (!process.blocked && processCommandInput) processCommandInput.value = "";
-    await refreshHealth();
-    setBusy(false, process.blocked ? "已拒绝" : "已启动");
+    const process = await startManagedProcessCommand(command);
+    setBusy(false, process?.blocked ? "已拒绝" : "已启动");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `启动进程失败：${command}`, label: "proc", state: "失败", body: error.message });
+    appendProcessFailureEvidence(error, {
+      title: `启动进程失败：${command}`,
+      action: "process-start",
+      endpoint: "/api/processes",
+      request: { command },
+      item: { command, status: "failed" },
+      retry: async () => startManagedProcessCommand(command)
+    });
     setBusy(false, "启动失败");
   }
+});
+
+processDiscoverBtn?.addEventListener("click", async () => {
+  await discoverStartupCommand({ start: false });
+});
+
+processStartDiscoveredBtn?.addEventListener("click", async () => {
+  await discoverStartupCommand({ start: true });
+});
+
+processStartDebugBtn?.addEventListener("click", async () => {
+  await discoverStartupCommand({ start: true, debug: true });
 });
 
 processSearchForm?.addEventListener("submit", async (event) => {
@@ -2761,7 +11860,23 @@ processSearchForm?.addEventListener("submit", async (event) => {
     setBusy(false, result.matchCount ? "找到进程输出" : "无匹配输出");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "进程输出搜索失败", label: "proc", state: "失败", body: error.message });
+    appendProcessFailureEvidence(error, {
+      title: "进程输出搜索失败",
+      action: "process-search",
+      endpoint: "/api/process-search",
+      request: { q: query },
+      item: { command: `search: ${query}`, status: "failed", outputTail: "" },
+      retry: async () => {
+        const result = await api(`/api/process-search?q=${encodeURIComponent(query)}`);
+        renderProcessSearch(result);
+        appendToolCall({
+          title: `进程输出搜索：${query}`,
+          label: "proc",
+          state: `${result.matchCount || 0} matches`,
+          body: JSON.stringify(result, null, 2).slice(0, 12000)
+        });
+      }
+    });
     setBusy(false, "搜索失败");
   }
 });
@@ -2792,7 +11907,23 @@ processHistoryBtn?.addEventListener("click", async () => {
     setBusy(false, "历史已读取");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取进程历史失败", label: "hist", state: "失败", body: error.message });
+    appendProcessFailureEvidence(error, {
+      title: "读取进程历史失败",
+      action: "process-history",
+      endpoint: "/api/process-history",
+      request: { limit: 20 },
+      item: { command: "process-history", status: "failed" },
+      retry: async () => {
+        const result = await api("/api/process-history?limit=20");
+        renderProcessHistory(result);
+        appendToolCall({
+          title: "进程历史已读取",
+          label: "hist",
+          state: `${result.count || 0} artifacts`,
+          body: JSON.stringify(result, null, 2).slice(0, 12000)
+        });
+      }
+    });
     setBusy(false, "历史失败");
   }
 });
@@ -2801,6 +11932,7 @@ processHealthBtn?.addEventListener("click", async () => {
   setBusy(true, "探测进程健康");
   try {
     const result = await api("/api/process-health?limit=20");
+    renderProcesses(result.rows || []);
     appendToolCall({
       title: "进程健康探针已读取",
       label: "proc",
@@ -2829,7 +11961,23 @@ processHealthBtn?.addEventListener("click", async () => {
     setBusy(false, "健康探针完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "读取进程健康失败", label: "proc", state: "失败", body: error.message });
+    appendProcessFailureEvidence(error, {
+      title: "读取进程健康失败",
+      action: "process-health",
+      endpoint: "/api/process-health",
+      request: { limit: 20 },
+      item: { command: "process-health", status: "failed" },
+      retry: async () => {
+        const result = await api("/api/process-health?limit=20");
+        renderProcesses(result.rows || []);
+        appendToolCall({
+          title: "进程健康探针已读取",
+          label: "proc",
+          state: `${result.summary?.healthy || 0} healthy`,
+          body: JSON.stringify(result, null, 2).slice(0, 12000)
+        });
+      }
+    });
     setBusy(false, "健康探针失败");
   }
 });
@@ -2857,7 +12005,12 @@ browserCheckForm?.addEventListener("submit", async (event) => {
     setBusy(false, result.ok ? "页面正常" : "页面异常");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `页面检查失败：${targetUrl}`, label: "browser", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "页面检查失败",
+      kind: "browser-check-failure",
+      label: "browser",
+      url: targetUrl
+    });
     setBusy(false, "检查失败");
   }
 });
@@ -2884,7 +12037,12 @@ browserBaselineBtn?.addEventListener("click", async () => {
     setBusy(false, result.ok ? "基线通过" : "基线变化");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `页面基线失败：${targetUrl}`, label: "visual", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "页面基线失败",
+      kind: "browser-baseline-failure",
+      label: "visual",
+      url: targetUrl
+    });
     setBusy(false, "基线失败");
   }
 });
@@ -2912,7 +12070,13 @@ browserScreenshotBtn?.addEventListener("click", async () => {
     setBusy(false, result.ok ? "截图完成" : "截图失败");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `页面截图失败：${targetUrl}`, label: "visual", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "页面截图失败",
+      kind: "browser-screenshot-failure",
+      label: "visual",
+      url: targetUrl,
+      selector
+    });
     setBusy(false, "截图失败");
   }
 });
@@ -2929,6 +12093,7 @@ browserAuditBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ url: targetUrl })
     });
+    renderBrowserAudit(result);
     appendToolCall({
       title: `页面可访问性审计：${targetUrl}`,
       label: "a11y",
@@ -2938,7 +12103,12 @@ browserAuditBtn?.addEventListener("click", async () => {
     setBusy(false, result.audit?.status === "pass" ? "审计通过" : "审计完成");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `页面可访问性审计失败：${targetUrl}`, label: "a11y", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "页面可访问性审计失败",
+      kind: "browser-audit-failure",
+      label: "a11y",
+      url: targetUrl
+    });
     setBusy(false, "审计失败");
   }
 });
@@ -2968,7 +12138,15 @@ browserDomBtn?.addEventListener("click", async () => {
     setBusy(false, result.ok ? "DOM 完成" : "DOM 失败");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `DOM 快照失败：${targetUrl}`, label: "dom", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "DOM 快照失败",
+      kind: "browser-dom-failure",
+      label: "dom",
+      url: targetUrl,
+      body: {
+        selectors: ["body", "button", "form", "input", "#promptForm", "#browserCheckForm"]
+      }
+    });
     setBusy(false, "DOM 失败");
   }
 });
@@ -2995,7 +12173,12 @@ browserTraceBtn?.addEventListener("click", async () => {
     setBusy(false, result.ok ? "Trace 完成" : "Trace 异常");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `浏览器 Trace 失败：${targetUrl}`, label: "trace", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "浏览器 Trace 失败",
+      kind: "browser-trace-failure",
+      label: "trace",
+      url: targetUrl
+    });
     setBusy(false, "Trace 失败");
   }
 });
@@ -3040,7 +12223,27 @@ browserInteractBtn?.addEventListener("click", async () => {
     setBusy(false, result.ok ? "交互完成" : "交互失败");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `DOM 交互失败：${targetUrl}`, label: "dom", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "DOM 交互失败",
+      kind: "browser-interact-failure",
+      label: "dom",
+      url: targetUrl,
+      actions: [
+        { type: "wait", selector: "body" },
+        { type: "navigate", value: `${targetUrl}${targetUrl.includes("?") ? "&" : "?"}browser-interact-nav=1` },
+        { type: "waitUrl", value: "browser-interact-nav=1" },
+        { type: "waitNetwork" },
+        { type: "upload", selector: "#browserSmokeFile", value: "README.md" },
+        { type: "hover", selector: "#refreshFilesBtn" },
+        { type: "dblclick", selector: "#refreshFilesBtn" },
+        { type: "clear", selector: "#browserCheckUrlInput" },
+        { type: "type", selector: "#browserCheckUrlInput", value: "browser-interact-smoke" },
+        { type: "waitValue", selector: "#browserCheckUrlInput", value: "browser-interact-smoke" },
+        { type: "press", selector: "#browserCheckUrlInput", key: "Enter" },
+        { type: "check", selector: "#browserSmokeCheck" },
+        { type: "uncheck", selector: "#browserSmokeCheck" }
+      ]
+    });
     setBusy(false, "交互失败");
   }
 });
@@ -3079,7 +12282,17 @@ browserSessionBtn?.addEventListener("click", async () => {
     setBusy(false, result.ok ? "会话完成" : "会话失败");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `浏览器会话失败：${targetUrl}`, label: "dom", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "浏览器会话失败",
+      kind: "browser-session-failure",
+      label: "dom",
+      url: targetUrl,
+      actions: [
+        { type: "wait", selector: "body" },
+        { type: "type", selector: "#browserCheckUrlInput", value: "browser-session-smoke" },
+        { type: "upload", selector: "#browserSmokeFile", value: "README.md" }
+      ]
+    });
     setBusy(false, "会话失败");
   }
 });
@@ -3107,7 +12320,13 @@ browserVisualBtn?.addEventListener("click", async () => {
     setBusy(false, result.ok ? "视觉通过" : "视觉变化");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: `视觉断言失败：${targetUrl}`, label: "visual", state: "失败", body: error.message });
+    appendBrowserFailureEvidence(error, {
+      title: "视觉断言失败",
+      kind: "browser-visual-failure",
+      label: "visual",
+      url: targetUrl,
+      selector
+    });
     setBusy(false, "视觉失败");
   }
 });
@@ -3119,7 +12338,18 @@ newTaskBtn.addEventListener("click", async () => {
     setBusy(false, "待命");
   } catch (error) {
     showToast(error.message);
-    appendToolCall({ title: "创建会话失败", label: "thread", state: "失败", body: error.message });
+    appendThreadFailureEvidence({
+      id: "",
+      title: "新会话",
+      status: "create_failed",
+      messageCount: state.threadMessages?.length || 0
+    }, error, {
+      title: "创建会话失败",
+      action: "thread-create",
+      endpoint: "/api/thread",
+      request: { title: "新会话", messages: state.threadMessages?.slice(-20) || [] },
+      retry: () => startNewThread()
+    });
     setBusy(false, "创建失败");
   }
 });
@@ -3131,10 +12361,8 @@ attachBtn.addEventListener("click", async () => {
 });
 refreshFilesBtn.addEventListener("click", refreshFiles);
 
-input.addEventListener("keydown", (event) => {
-  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-    form.requestSubmit();
-  }
-});
+input.addEventListener("keydown", handlePromptInputKeydown);
+input.addEventListener("input", resizePromptInput);
+resizePromptInput();
 
 refreshAll();
