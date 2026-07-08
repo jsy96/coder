@@ -1932,13 +1932,7 @@ function formatCommandSourceContexts(contexts = []) {
 function buildCommandSourceContextPrompt(commandText, run = null, contexts = []) {
   const command = String(commandText || "").trim();
   const sourceBlock = formatCommandSourceContexts(contexts);
-  const verificationCommands = normalizeCommandItems([
-    command ? { command, reason: "修复后优先重跑原失败命令。" } : null,
-    ...(run?.result?.recoveryChain?.commands || []),
-    "node --check server.js",
-    "node --check app.js",
-    "node server.js --api-smoke-section=debug"
-  ].filter(Boolean)).slice(0, 8);
+  const verificationCommands = commandSourceVerificationCommands(command, run);
   return [
     "请基于失败命令的源码定位上下文继续修复当前项目。",
     "",
@@ -1949,6 +1943,17 @@ function buildCommandSourceContextPrompt(commandText, run = null, contexts = [])
     "",
     "要求：优先从上述行号附近定位根因；需要改代码时输出最小 diff；修复后先重跑原失败命令，再运行相关 smoke 或语法检查。"
   ].filter(Boolean).join("\n");
+}
+
+function commandSourceVerificationCommands(commandText, run = null) {
+  const command = String(commandText || "").trim();
+  return normalizeCommandItems([
+    command ? { command, reason: "修复后优先重跑原失败命令。" } : null,
+    ...(run?.result?.recoveryChain?.commands || []),
+    { command: "node --check server.js", reason: "复查后端入口语法。" },
+    { command: "node --check app.js", reason: "复查前端入口语法。" },
+    { command: "node server.js --api-smoke-section=debug", reason: "复查失败分类、源码定位和调试闭环。" }
+  ].filter(Boolean)).slice(0, 8);
 }
 
 async function runCommandSourceContextFix(commandText, run = null) {
@@ -1964,6 +1969,36 @@ async function runCommandSourceContextFix(commandText, run = null) {
       showToast("这条失败命令没有可运行的源码定位修复提示。");
       return "";
     }
+    const verificationCommands = commandSourceVerificationCommands(command, run);
+    const chain = createRepairEvidenceChain({
+      source: "source-context-fix",
+      command,
+      result: run?.result || null,
+      diagnostics: run?.result?.diagnostics || null,
+      prompt
+    });
+    updateRepairEvidenceChain({
+      id: chain.id,
+      status: "repairing",
+      repair: {
+        source: "source-context-fix",
+        status: "prompted",
+        sourceLocations: commandSourceLocations(run),
+        sourceContextCount: result.contexts?.length || 0,
+        promptSummary: prompt.slice(0, 1200)
+      },
+      verification: {
+        status: "planned",
+        commands: verificationCommands,
+        source: "source-context-fix"
+      }
+    }, { title: "源码定位修复证据链已创建" });
+    stageRepairVerificationCommands(verificationCommands, {
+      title: "源码定位修复验证命令",
+      successTitle: "源码定位修复验证命令已放入命令面板",
+      source: "source-context-fix",
+      note: "源码定位修复会优先重跑原失败命令，再执行语法检查和 debug smoke。"
+    });
     input.value = prompt;
     scheduleReferencePreview({ immediate: true });
     appendToolCall({
@@ -2329,6 +2364,41 @@ function commandBatchEvidence(commands = []) {
       ].filter(Boolean).join("\n");
     })
     .join("\n\n");
+}
+
+function recordRepairVerificationFromBatch(commands = [], { title = "建议命令", stoppedAt = "", ok = false } = {}) {
+  if (!state.activeRepairChain) return null;
+  const items = normalizeCommandItems(commands);
+  if (!items.length) return null;
+  const checks = items.map((item) => {
+    const run = state.commandResults[commandResultKey(item.command)] || {};
+    return {
+      command: item.command,
+      reason: item.reason || "",
+      status: run.status || "queued",
+      exitCode: run.result?.exitCode ?? null,
+      blocked: Boolean(run.result?.blocked),
+      outputSummary: summarizeCommandOutput(run.result?.output || run.error || "")
+    };
+  });
+  const failedCommands = checks
+    .filter((check) => check.blocked || (check.exitCode !== null && check.exitCode !== 0) || check.status !== "done")
+    .map((check) => check.command)
+    .slice(0, 8);
+  return updateRepairEvidenceChain({
+    status: ok ? "verified" : "verification_failed",
+    verification: {
+      status: ok ? "passed" : "failed",
+      ok,
+      skipped: false,
+      title,
+      stoppedAt,
+      checkCount: checks.length,
+      failedCommands,
+      checks,
+      completedAt: new Date().toISOString()
+    }
+  }, { title: ok ? "修复证据链验证通过" : "修复证据链验证失败" });
 }
 
 function commandBatchReferencedFiles(commands = []) {
@@ -8367,17 +8437,430 @@ function runSemanticEvidenceRepair(evidence = {}, options = {}) {
   return prompt;
 }
 
+function semanticEvidenceVerificationCommands(evidence = {}) {
+  const commands = [];
+  const visit = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value !== "object") return;
+    if (Array.isArray(value.verificationCommands)) {
+      value.verificationCommands.forEach((item) => commands.push(item));
+    }
+    Object.values(value).forEach(visit);
+  };
+  visit(evidence);
+  return normalizeCommandItems(commands).slice(0, 12);
+}
+
+function semanticSymbolImpactEvidence(evidence = {}) {
+  const impact = evidence?.symbolImpact && typeof evidence.symbolImpact === "object"
+    ? evidence.symbolImpact
+    : evidence;
+  const hasImpact =
+    Array.isArray(impact?.editTargets)
+    || impact?.definition
+    || impact?.references
+    || impact?.impact
+    || Array.isArray(impact?.verificationCommands);
+  return hasImpact ? impact : null;
+}
+
+function semanticRenamePreviewEvidence(evidence = {}) {
+  const rename = evidence?.renamePreview && typeof evidence.renamePreview === "object"
+    ? evidence.renamePreview
+    : evidence;
+  const hasPreview =
+    Array.isArray(rename?.locations)
+    || Array.isArray(rename?.replacementConflicts)
+    || Array.isArray(rename?.warnings)
+    || (rename?.symbol && rename?.newName);
+  return hasPreview ? rename : null;
+}
+
+function formatSemanticSymbolImpactSummary(symbolImpact = {}) {
+  if (!symbolImpact) return "";
+  const editTargets = (symbolImpact.editTargets || [])
+    .slice(0, 10)
+    .map((item) => {
+      const location = [item.path || item.file || "", item.line || item.startLine || ""].filter(Boolean).join(":");
+      const label = item.name || item.symbol || item.kind || "target";
+      return `- ${location || label}${location ? ` · ${label}` : ""}`;
+    })
+    .join("\n");
+  const definitions = (symbolImpact.definitions || symbolImpact.definition?.definitions || [])
+    .slice(0, 8)
+    .map((item) => `- ${[item.path || item.file || "", item.line || item.startLine || ""].filter(Boolean).join(":")} ${item.name || item.symbol || ""}`.trim())
+    .join("\n");
+  const references = (symbolImpact.references?.matches || symbolImpact.references || [])
+    .slice(0, 12)
+    .map((item) => `- ${[item.path || item.file || "", item.line || item.startLine || ""].filter(Boolean).join(":")} ${item.text || item.name || item.symbol || ""}`.trim())
+    .join("\n");
+  const dependents = (symbolImpact.impact?.dependents || [])
+    .slice(0, 8)
+    .map((item) => `- ${item.path || item.file || item}`)
+    .join("\n");
+  const callers = (symbolImpact.impact?.callers || [])
+    .slice(0, 8)
+    .map((item) => `- ${[item.path || item.file || "", item.line || item.startLine || ""].filter(Boolean).join(":")} ${item.name || item.caller || ""}`.trim())
+    .join("\n");
+  return [
+    symbolImpact.summary ? `影响摘要：${JSON.stringify(symbolImpact.summary)}` : "",
+    editTargets ? `建议编辑目标：\n${editTargets}` : "",
+    definitions ? `定义位置：\n${definitions}` : "",
+    references ? `引用位置：\n${references}` : "",
+    dependents ? `依赖文件：\n${dependents}` : "",
+    callers ? `调用点：\n${callers}` : "",
+    symbolImpact.policy ? `只读策略：${JSON.stringify(symbolImpact.policy)}` : ""
+  ].filter(Boolean).join("\n\n");
+}
+
+function formatSemanticRenamePreviewSummary(renamePreview = {}) {
+  if (!renamePreview) return "";
+  const locations = (renamePreview.locations || [])
+    .slice(0, 12)
+    .map((item) => {
+      const location = [item.path || "", item.line || ""].filter(Boolean).join(":");
+      return `- ${location} · ${item.role || item.kind || "reference"} · ${item.before || ""}${item.after ? ` => ${item.after}` : ""}`.trim();
+    })
+    .join("\n");
+  const conflicts = (renamePreview.replacementConflicts || [])
+    .slice(0, 8)
+    .map((item) => `- ${[item.path || "", item.line || ""].filter(Boolean).join(":")} ${item.kind || ""} ${item.name || ""}`.trim())
+    .join("\n");
+  return [
+    renamePreview.summary ? `重命名摘要：${JSON.stringify(renamePreview.summary)}` : "",
+    renamePreview.symbol || renamePreview.newName ? `重命名：${renamePreview.symbol || "(unknown)"} -> ${renamePreview.newName || "(missing)"}` : "",
+    locations ? `候选替换位置：\n${locations}` : "",
+    conflicts ? `命名冲突：\n${conflicts}` : "",
+    renamePreview.warnings?.length ? `风险警告：${renamePreview.warnings.join(", ")}` : "",
+    renamePreview.policy ? `只读策略：${JSON.stringify(renamePreview.policy)}` : ""
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildSemanticSymbolImpactPrompt(evidence = {}, options = {}) {
+  const symbolImpact = semanticSymbolImpactEvidence(evidence);
+  if (!symbolImpact) return "";
+  const context = buildSemanticEvidenceContext(evidence, options);
+  const files = semanticEvidenceFiles(symbolImpact);
+  const commands = semanticEvidenceVerificationCommands(symbolImpact);
+  return [
+    context,
+    "",
+    "目标：基于符号定义、引用和影响范围完成一次 Codex 式代码修复闭环。",
+    "",
+    formatSemanticSymbolImpactSummary(symbolImpact),
+    files.length ? `优先读取这些影响文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
+    commands.length ? `建议验证命令：\n${commands.map((item) => `- ${item.command}${item.reason ? `：${item.reason}` : ""}`).join("\n")}` : "",
+    "",
+    "输出要求：",
+    "1. 先确认目标符号的定义、引用和影响文件是否仍与当前代码一致。",
+    "2. 如果需要改代码，只修改 editTargets 或直接受影响的文件，避免无关重构。",
+    "3. 修复后必须说明定义、引用、调用点和依赖文件是否仍然一致。",
+    "4. 必须运行或列出上面的验证命令；没有命令时至少给出语法检查和相关 smoke。"
+  ].filter(Boolean).join("\n");
+}
+
+function buildSemanticRenamePreviewPrompt(evidence = {}, options = {}) {
+  const renamePreview = semanticRenamePreviewEvidence(evidence);
+  if (!renamePreview) return "";
+  const context = buildSemanticEvidenceContext(evidence, options);
+  const files = semanticEvidenceFiles(renamePreview);
+  const commands = semanticEvidenceVerificationCommands(renamePreview);
+  return [
+    context,
+    "",
+    "目标：基于只读重命名预览完成一次安全重构闭环。",
+    "",
+    formatSemanticRenamePreviewSummary(renamePreview),
+    files.length ? `优先读取这些待改文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
+    commands.length ? `建议验证命令：\n${commands.map((item) => `- ${item.command}${item.reason ? `：${item.reason}` : ""}`).join("\n")}` : "",
+    "",
+    "输出要求：",
+    "1. 先核对候选替换位置、命名冲突和风险警告，不要跨越预览范围盲改。",
+    "2. 如果执行重命名，请生成最小 diff，并保留未命中的位置作为人工复核项。",
+    "3. 修复后必须说明定义、导入、导出、调用点和候选替换位置是否一致。",
+    "4. 必须运行或列出上面的验证命令；没有命令时至少给出语法检查和 semantic smoke。"
+  ].filter(Boolean).join("\n");
+}
+
+function stageSemanticSymbolImpactCommands(evidence = {}, options = {}) {
+  const symbolImpact = semanticSymbolImpactEvidence(evidence);
+  const commands = semanticEvidenceVerificationCommands(symbolImpact || evidence);
+  const staged = stageRepairVerificationCommands(commands, {
+    title: "符号影响验证命令",
+    successTitle: `符号影响验证命令已放入面板：${options.title || "代码智能"}`,
+    source: "semantic-symbol-impact",
+    note: "这条符号影响证据没有提供验证命令。"
+  });
+  if (symbolImpact && staged.length) {
+    const chain = createRepairEvidenceChain({
+      source: "semantic-symbol-impact",
+      prompt: buildSemanticSymbolImpactPrompt(evidence, options)
+    });
+    updateRepairEvidenceChain({
+      ...chain,
+      status: "verification_staged",
+      repair: {
+        reply: "已根据符号影响范围排队验证命令。",
+        hasDiff: false,
+        files: semanticEvidenceFiles(symbolImpact),
+        commandCount: staged.length,
+        reviewCount: 0
+      },
+      verification: {
+        ok: false,
+        skipped: false,
+        checkCount: staged.length,
+        failedCommands: []
+      }
+    }, { title: "符号影响修复证据链已创建" });
+  }
+  return staged;
+}
+
+function stageSemanticRenamePreviewCommands(evidence = {}, options = {}) {
+  const renamePreview = semanticRenamePreviewEvidence(evidence);
+  const commands = semanticEvidenceVerificationCommands(renamePreview || evidence);
+  const staged = stageRepairVerificationCommands(commands, {
+    title: "重命名预览验证命令",
+    successTitle: `重命名预览验证命令已放入面板：${options.title || "代码智能"}`,
+    source: "semantic-rename-preview",
+    note: "这条重命名预览证据没有提供验证命令。"
+  });
+  if (renamePreview && staged.length) {
+    const chain = createRepairEvidenceChain({
+      source: "semantic-rename-preview",
+      prompt: buildSemanticRenamePreviewPrompt(evidence, options)
+    });
+    updateRepairEvidenceChain({
+      ...chain,
+      status: "verification_staged",
+      repair: {
+        reply: "已根据重命名预览排队验证命令。",
+        hasDiff: false,
+        files: semanticEvidenceFiles(renamePreview),
+        commandCount: staged.length,
+        reviewCount: renamePreview.warnings?.length || 0
+      },
+      verification: {
+        ok: false,
+        skipped: false,
+        checkCount: staged.length,
+        failedCommands: []
+      }
+    }, { title: "重命名预览修复证据链已创建" });
+  }
+  return staged;
+}
+
+function appendSemanticSymbolImpactPromptToPrompt(evidence = {}, options = {}) {
+  const prompt = buildSemanticSymbolImpactPrompt(evidence, options);
+  if (!prompt) {
+    showToast("暂无可生成符号影响提示的语义证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `符号影响修复提示已加入提示词：${options.title || "代码智能"}`,
+    label: options.kind || "symbol",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("符号影响修复提示已加入提示词。");
+  return prompt;
+}
+
+function appendSemanticRenamePreviewPromptToPrompt(evidence = {}, options = {}) {
+  const prompt = buildSemanticRenamePreviewPrompt(evidence, options);
+  if (!prompt) {
+    showToast("暂无可生成重命名预览提示的语义证据。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `重命名预览提示已加入提示词：${options.title || "代码智能"}`,
+    label: options.kind || "rename",
+    state: "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("重命名预览提示已加入提示词。");
+  return prompt;
+}
+
+function runSemanticSymbolImpactFix(evidence = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动符号影响修复。");
+    return "";
+  }
+  const prompt = buildSemanticSymbolImpactPrompt(evidence, options);
+  if (!prompt) {
+    showToast("暂无可用于修复的符号影响证据。");
+    return "";
+  }
+  const commands = stageSemanticSymbolImpactCommands(evidence, options);
+  const chain = updateRepairEvidenceChain({
+    source: "semantic-symbol-impact",
+    status: "repair_requested",
+    prompt,
+    repair: {
+      reply: "已基于符号影响范围启动修复。",
+      hasDiff: false,
+      files: semanticEvidenceFiles(semanticSymbolImpactEvidence(evidence) || evidence),
+      commandCount: commands.length,
+      reviewCount: 0
+    }
+  }, { title: "符号影响修复证据链已续写" });
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动符号影响修复：${options.title || "代码智能"}`,
+    label: options.kind || "symbol",
+    state: "running",
+    body: [summarizeRepairEvidenceChain(chain), "", prompt].filter(Boolean).join("\n").slice(0, 12000)
+  });
+  showToast("正在基于符号影响范围启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+function runSemanticRenamePreviewFix(evidence = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再启动重命名预览修复。");
+    return "";
+  }
+  const prompt = buildSemanticRenamePreviewPrompt(evidence, options);
+  if (!prompt) {
+    showToast("暂无可用于修复的重命名预览证据。");
+    return "";
+  }
+  const commands = stageSemanticRenamePreviewCommands(evidence, options);
+  const chain = updateRepairEvidenceChain({
+    source: "semantic-rename-preview",
+    status: "repair_requested",
+    prompt,
+    repair: {
+      reply: "已基于重命名预览启动修复。",
+      hasDiff: false,
+      files: semanticEvidenceFiles(semanticRenamePreviewEvidence(evidence) || evidence),
+      commandCount: commands.length,
+      reviewCount: semanticRenamePreviewEvidence(evidence)?.warnings?.length || 0
+    }
+  }, { title: "重命名预览修复证据链已续写" });
+  input.value = prompt;
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: `已启动重命名预览修复：${options.title || "代码智能"}`,
+    label: options.kind || "rename",
+    state: "running",
+    body: [summarizeRepairEvidenceChain(chain), "", prompt].filter(Boolean).join("\n").slice(0, 12000)
+  });
+  showToast("正在基于重命名预览启动修复。");
+  submitPromptForm();
+  return prompt;
+}
+
+async function createSemanticRenameDraft(evidence = {}, options = {}) {
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再生成重命名草稿。");
+    return null;
+  }
+  const renamePreview = semanticRenamePreviewEvidence(evidence);
+  if (!renamePreview?.symbol || !renamePreview?.newName) {
+    showToast("暂无可生成草稿的重命名预览证据。");
+    return null;
+  }
+  setBusy(true, "生成重命名草稿");
+  try {
+    const result = await api("/api/semantic-rename-draft", {
+      method: "POST",
+      body: JSON.stringify({
+        symbol: renamePreview.symbol,
+        newName: renamePreview.newName,
+        path: renamePreview.path || "",
+        limit: 80,
+        contextLines: 3,
+        prompt: buildSemanticRenamePreviewPrompt(evidence, options)
+      })
+    });
+    state.pendingDiff = result.proposal?.diff || "";
+    renderPlan(result.proposal?.plan || []);
+    renderDiff(result.proposal?.patches || []);
+    renderReview(result.proposal?.review || []);
+    renderCommands(result.proposal?.commands || []);
+    const chain = updateRepairEvidenceChain({
+      source: "semantic-rename-draft",
+      status: "awaiting_approval",
+      prompt: result.proposal?.prompt || "",
+      repair: {
+        reply: result.proposal?.reply || "已生成重命名 diff 草稿。",
+        hasDiff: Boolean(result.proposal?.diff),
+        files: (result.proposal?.patches || []).map((item) => item.path).filter(Boolean),
+        commandCount: result.proposal?.commands?.length || 0,
+        reviewCount: result.proposal?.review?.length || 0
+      },
+      verification: {
+        ok: false,
+        skipped: false,
+        checkCount: result.proposal?.commands?.length || 0,
+        failedCommands: []
+      }
+    }, { title: "重命名草稿已加入修复证据链" });
+    appendToolCall({
+      title: `重命名 diff 草稿已生成：${renamePreview.symbol} -> ${renamePreview.newName}`,
+      label: options.kind || "rename",
+      state: "待审批",
+      body: JSON.stringify({
+        summary: result.summary,
+        proposalId: result.proposal?.id,
+        files: result.proposal?.patches?.map((item) => item.path),
+        commands: result.proposal?.commands,
+        repairChain: summarizeRepairEvidenceChain(chain),
+        policy: result.policy
+      }, null, 2).slice(0, 12000)
+    });
+    appendMessage("agent", result.proposal?.reply || "重命名 diff 草稿已放入预览区，可复核后批准写入。");
+    setBusy(false, "重命名草稿待审批");
+    return result;
+  } catch (error) {
+    showToast(error.message);
+    appendSemanticFailureEvidence(error, {
+      title: "生成重命名草稿失败证据",
+      kind: options.kind || "rename",
+      endpoint: "/api/semantic-rename-draft",
+      request: {
+        symbol: renamePreview.symbol,
+        newName: renamePreview.newName,
+        path: renamePreview.path || "",
+        limit: 80,
+        contextLines: 3
+      }
+    });
+    setBusy(false, "重命名草稿失败");
+    return null;
+  }
+}
+
 function buildSemanticVerificationPrompt(evidence = {}, options = {}) {
   const context = buildSemanticEvidenceContext(evidence, options);
   if (!context) return "";
   const files = semanticEvidenceFiles(evidence);
-  const commands = [
+  const evidenceCommands = semanticEvidenceVerificationCommands(evidence);
+  const commands = evidenceCommands.length ? evidenceCommands : normalizeCommandItems([
     "node --check app.js",
     "node --check server.js",
     "node server.js --ui-smoke-test",
     "node server.js --api-smoke-section=coding",
     "node server.js --api-smoke-section=debug"
-  ];
+  ]);
   return [
     context,
     "",
@@ -8385,7 +8868,7 @@ function buildSemanticVerificationPrompt(evidence = {}, options = {}) {
     files.length ? `优先读取这些相关文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
     "",
     "建议验证命令：",
-    ...commands.map((command) => `- ${command}`),
+    ...commands.map((item) => `- ${item.command}${item.reason ? `：${item.reason}` : ""}`),
     "",
     "输出要求：",
     "1. 先判断语义诊断是否代表真实 bug、重复实现、未解析依赖或前端/API 契约缺口。",
@@ -8454,18 +8937,36 @@ function appendSemanticEvidenceCard(evidence = {}, {
   if (!article) return;
   const actions = document.createElement("div");
   actions.className = "debug-last-failed-actions";
-  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference">引用文件</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="repair">直接修复</button>`;
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference">引用文件</button><button type="button" data-action="stage-verification">排队验证</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button><button type="button" data-action="symbol-impact-prompt">影响提示</button><button type="button" data-action="symbol-impact-fix">影响修复</button><button type="button" data-action="rename-preview-prompt">重命名提示</button><button type="button" data-action="rename-preview-fix">重命名修复</button><button type="button" data-action="rename-draft">重命名草稿</button><button type="button" data-action="repair">直接修复</button>`;
   actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
     appendSemanticEvidenceToPrompt(evidence, { title, kind });
   });
   actions.querySelector("[data-action='reference']").addEventListener("click", () => {
     referenceSemanticEvidenceFilesInPrompt(evidence, { title });
   });
+  actions.querySelector("[data-action='stage-verification']").addEventListener("click", () => {
+    stageSemanticSymbolImpactCommands(evidence, { title, kind });
+  });
   actions.querySelector("[data-action='verification-prompt']").addEventListener("click", () => {
     appendSemanticVerificationPromptToPrompt(evidence, { title, kind });
   });
   actions.querySelector("[data-action='verification-fix']").addEventListener("click", () => {
     runSemanticVerificationFix(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='symbol-impact-prompt']").addEventListener("click", () => {
+    appendSemanticSymbolImpactPromptToPrompt(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='symbol-impact-fix']").addEventListener("click", () => {
+    runSemanticSymbolImpactFix(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='rename-preview-prompt']").addEventListener("click", () => {
+    appendSemanticRenamePreviewPromptToPrompt(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='rename-preview-fix']").addEventListener("click", () => {
+    runSemanticRenamePreviewFix(evidence, { title, kind });
+  });
+  actions.querySelector("[data-action='rename-draft']").addEventListener("click", () => {
+    createSemanticRenameDraft(evidence, { title, kind });
   });
   actions.querySelector("[data-action='repair']").addEventListener("click", () => {
     runSemanticEvidenceRepair(evidence, { title, kind });
@@ -10300,12 +10801,44 @@ symbolOutlineBtn?.addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ symbol: "buildSemanticIndex", path: "server.js", contextLines: 2 })
     });
+    const symbolImpact = await api("/api/semantic-symbol-impact", {
+      method: "POST",
+      body: JSON.stringify({ symbol: "buildSemanticIndex", path: "server.js", limit: 30, contextLines: 2 })
+    });
+    const renamePreview = await api("/api/semantic-rename-preview", {
+      method: "POST",
+      body: JSON.stringify({ symbol: "buildSemanticIndex", newName: "buildSemanticIndexNext", path: "server.js", limit: 30, contextLines: 2 })
+    });
     const evidence = {
       outlineSummary: outline.summary,
       symbols: outline.symbols?.slice(0, 40),
       definition: {
         matchCount: definition.matchCount,
         definitions: definition.definitions?.slice(0, 10)
+      },
+      symbolImpact: {
+        summary: symbolImpact.summary,
+        editTargets: symbolImpact.editTargets?.slice(0, 12),
+        definitions: symbolImpact.definition?.definitions?.slice(0, 8),
+        references: symbolImpact.references?.matches?.slice(0, 16),
+        impact: {
+          targetSummaries: symbolImpact.impact?.targetSummaries?.slice(0, 12),
+          dependents: symbolImpact.impact?.dependents?.slice(0, 12),
+          callers: symbolImpact.impact?.callers?.slice(0, 12)
+        },
+        verificationCommands: symbolImpact.verificationCommands?.slice(0, 8),
+        policy: symbolImpact.policy
+      },
+      renamePreview: {
+        symbol: renamePreview.symbol,
+        newName: renamePreview.newName,
+        summary: renamePreview.summary,
+        files: renamePreview.files?.slice(0, 12),
+        locations: renamePreview.locations?.slice(0, 16),
+        replacementConflicts: renamePreview.replacementConflicts?.slice(0, 8),
+        warnings: renamePreview.warnings,
+        verificationCommands: renamePreview.verificationCommands?.slice(0, 8),
+        policy: renamePreview.policy
       }
     };
     appendSemanticEvidenceCard(evidence, {
@@ -10323,7 +10856,9 @@ symbolOutlineBtn?.addEventListener("click", async () => {
       endpoint: "/api/symbol-outline",
       request: {
         outline: { path: "server.js", limit: 40, includeContext: false },
-        definition: { symbol: "buildSemanticIndex", path: "server.js", contextLines: 2 }
+        definition: { symbol: "buildSemanticIndex", path: "server.js", contextLines: 2 },
+        symbolImpact: { symbol: "buildSemanticIndex", path: "server.js", limit: 30, contextLines: 2 },
+        renamePreview: { symbol: "buildSemanticIndex", newName: "buildSemanticIndexNext", path: "server.js", limit: 30, contextLines: 2 }
       }
     });
     setBusy(false, "符号大纲失败");
@@ -11016,6 +11551,7 @@ async function runCommandBatch(commands = [], { title = "建议命令", stopOnFa
   }
   const summary = summarizeCommandBatch(items);
   const ok = summary.failed === 0 && summary.blocked === 0 && summary.running === 0 && summary.queued === 0;
+  recordRepairVerificationFromBatch(items, { title, stoppedAt, ok });
   appendToolCall({
     title: `批量命令摘要：${title}`,
     label: "$",

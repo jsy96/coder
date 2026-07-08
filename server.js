@@ -2670,6 +2670,275 @@ async function buildSemanticDefinition(symbol = "", { path: targetPath = "", lin
   };
 }
 
+async function buildSemanticSymbolImpact(symbol = "", { path: targetPath = "", line = 0, limit = 80, contextLines = 4 } = {}) {
+  const name = String(symbol || "").trim();
+  const normalizedPath = toPosix(String(targetPath || "").trim()).replace(/^\.?\//, "");
+  const targetLine = Number(line) || 0;
+  const max = Math.min(200, Math.max(1, Number(limit) || 80));
+  const context = Math.min(20, Math.max(0, Number(contextLines) || 4));
+  const definition = await buildSemanticDefinition(name, {
+    path: normalizedPath,
+    line: targetLine,
+    contextLines: context,
+    limit: max
+  });
+  const references = await buildSemanticReferences(name, {
+    limit: max,
+    contextLines: context
+  });
+  const locations = [
+    ...(definition.definitions || []),
+    ...(references.matches || [])
+  ].filter((item) => item?.path);
+  const impactedPaths = uniqueLimited(locations.map((item) => toPosix(item.path)), max);
+  const impact = await buildSemanticImpact({
+    paths: impactedPaths,
+    limit: max,
+    includeContext: true
+  });
+  const editTargets = uniqueLimited([
+    ...(definition.definitions || []).map((item) => item.path),
+    ...(references.calls || []).map((item) => item.path),
+    ...(references.imports || []).map((item) => item.path)
+  ].filter(Boolean).map(toPosix), 40);
+  const verificationCommands = dedupeCommandItems([
+    commandItem("node --check server.js", "复查后端入口语法。"),
+    commandItem("node --check app.js", "复查前端入口语法。"),
+    commandItem("node server.js --api-smoke-section=semantic", "复查符号索引、定义、引用和影响面。"),
+    commandItem("node server.js --api-smoke-section=debug", "复查失败诊断和源码定位闭环。")
+  ]);
+  return {
+    generatedAt: new Date().toISOString(),
+    symbol: name,
+    path: normalizedPath,
+    line: targetLine || null,
+    summary: {
+      definitions: definition.definitions?.length || 0,
+      references: references.matchCount || 0,
+      calls: references.calls?.length || 0,
+      imports: references.imports?.length || 0,
+      exports: references.exports?.length || 0,
+      impactedPaths: impactedPaths.length,
+      editTargets: editTargets.length,
+      dependents: impact.summary?.dependents || 0,
+      callers: impact.summary?.callers || 0
+    },
+    definition,
+    references: {
+      ...references,
+      matches: (references.matches || []).slice(0, max)
+    },
+    impact,
+    editTargets,
+    verificationCommands,
+    repairContext: [
+      `symbol: ${name || "(line lookup)"}`,
+      normalizedPath ? `path: ${normalizedPath}` : "",
+      targetLine ? `line: ${targetLine}` : "",
+      editTargets.length ? `editTargets: ${editTargets.join(", ")}` : "",
+      verificationCommands.length ? `verificationCommands: ${verificationCommands.map((item) => item.command).join(" | ")}` : ""
+    ].filter(Boolean).join("\n"),
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      usesSymbolOutline: true,
+      includesImpact: true
+    }
+  };
+}
+
+function isSemanticIdentifierChar(value = "") {
+  return /[A-Za-z0-9_$]/.test(value);
+}
+
+function replaceCodeIdentifierOccurrences(line = "", symbol = "", replacement = "") {
+  const source = String(line || "");
+  const name = String(symbol || "");
+  const nextName = String(replacement || "");
+  if (!name || !nextName) return { text: source, count: 0 };
+  let output = "";
+  let count = 0;
+  let index = 0;
+  let quote = "";
+  let escaped = false;
+  let inLineComment = false;
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1] || "";
+    if (inLineComment) {
+      output += source.slice(index);
+      break;
+    }
+    if (quote) {
+      output += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = "";
+      }
+      index += 1;
+      continue;
+    }
+    if ((char === "\"" || char === "'" || char === "`")) {
+      quote = char;
+      output += char;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      inLineComment = true;
+      output += char;
+      index += 1;
+      continue;
+    }
+    if (source.startsWith(name, index)) {
+      const before = index > 0 ? source[index - 1] : "";
+      const after = source[index + name.length] || "";
+      if (!isSemanticIdentifierChar(before) && !isSemanticIdentifierChar(after)) {
+        output += nextName;
+        count += 1;
+        index += name.length;
+        continue;
+      }
+    }
+    output += char;
+    index += 1;
+  }
+  return { text: output, count };
+}
+
+async function buildSemanticRenamePreview(symbol = "", newName = "", { path: targetPath = "", line = 0, limit = 80, contextLines = 3 } = {}) {
+  const name = String(symbol || "").trim();
+  const replacement = String(newName || "").trim();
+  const normalizedPath = toPosix(String(targetPath || "").trim()).replace(/^\.?\//, "");
+  const targetLine = Number(line) || 0;
+  const max = Math.min(200, Math.max(1, Number(limit) || 80));
+  const context = Math.min(12, Math.max(0, Number(contextLines) || 3));
+  const warnings = [];
+  const identifierPattern = /^[A-Za-z_$][\w$]*$/;
+  if (!name) warnings.push("missing-symbol");
+  if (!replacement) warnings.push("missing-new-name");
+  if (replacement && !identifierPattern.test(replacement)) warnings.push("new-name-is-not-a-javascript-identifier");
+  if (name && replacement && name === replacement) warnings.push("new-name-matches-current-symbol");
+
+  const definition = await buildSemanticDefinition(name, {
+    path: normalizedPath,
+    line: targetLine,
+    contextLines: context,
+    limit: max
+  });
+  const references = await buildSemanticReferences(name, {
+    limit: max,
+    contextLines: context
+  });
+  const index = await readSemanticIndex() || await buildSemanticIndex();
+  const lowerReplacement = replacement.toLowerCase();
+  const replacementConflicts = replacement
+    ? (index.symbolOutline || [])
+      .filter((item) => {
+        if (String(item.name || "").toLowerCase() !== lowerReplacement) return false;
+        if (normalizedPath && toPosix(item.path || "") !== normalizedPath) return false;
+        return true;
+      })
+      .slice(0, 20)
+    : [];
+  if (replacementConflicts.length) warnings.push("new-name-already-exists-in-scope");
+
+  const rawLocations = [
+    ...(definition.definitions || []).map((item) => ({ ...item, role: "definition" })),
+    ...(references.exports || []).map((item) => ({ ...item, role: "export" })),
+    ...(references.imports || []).map((item) => ({ ...item, role: "import" })),
+    ...(references.calls || []).map((item) => ({ ...item, role: "call" }))
+  ].filter((item) => item?.path && item?.line);
+  const seen = new Set();
+  const locations = [];
+  for (const item of rawLocations) {
+    const key = `${toPosix(item.path)}:${item.line}:${item.role}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const contextText = item.context || await readWorkspaceFileRange(item.path, Math.max(1, Number(item.line) - context), context * 2 + 1).catch(() => "");
+    const targetLineText = String(contextText || "")
+      .split(/\r?\n/)
+      .find((entry) => entry.includes(name)) || "";
+    const replacementResult = targetLineText ? replaceCodeIdentifierOccurrences(targetLineText, name, replacement) : { text: "", count: 0 };
+    locations.push({
+      role: item.role,
+      kind: item.kind || item.type || "reference",
+      path: item.path,
+      line: item.line,
+      name: item.name || name,
+      source: item.source || "",
+      occurrenceCount: replacementResult.count,
+      before: targetLineText.trim(),
+      after: replacementResult.count ? replacementResult.text.trim() : "",
+      context: contextText
+    });
+    if (locations.length >= max) break;
+  }
+  if (!locations.length) warnings.push("no-rename-locations-found");
+  if (locations.some((item) => item.occurrenceCount === 0)) warnings.push("some-locations-need-manual-review");
+  if (locations.some((item) => item.before && !item.after)) warnings.push("some-matches-may-be-inside-string-or-comment");
+  const files = uniqueLimited(locations.map((item) => toPosix(item.path)), 40);
+  const verificationCommands = dedupeCommandItems([
+    commandItem("node --check server.js", "重命名后复查后端入口语法。"),
+    commandItem("node --check app.js", "重命名后复查前端入口语法。"),
+    commandItem("node server.js --api-smoke-section=semantic", "重命名后复查语义索引、定义、引用、重命名预览和影响面。"),
+    commandItem("node server.js --ui-smoke-test", "重命名后复查前端证据卡和按钮钩子。")
+  ]);
+  return {
+    generatedAt: new Date().toISOString(),
+    symbol: name,
+    newName: replacement,
+    path: normalizedPath,
+    line: targetLine || null,
+    summary: {
+      definitions: definition.definitions?.length || 0,
+      references: references.matchCount || 0,
+      locations: locations.length,
+      files: files.length,
+      conflicts: replacementConflicts.length,
+      warnings: warnings.length
+    },
+    definition,
+    references: {
+      ...references,
+      matches: (references.matches || []).slice(0, max)
+    },
+    replacementConflicts: replacementConflicts.map((item) => ({
+      path: item.path,
+      line: item.line,
+      endLine: item.endLine || item.line,
+      name: item.name,
+      kind: item.kind,
+      container: item.container || "",
+      signature: item.signature || ""
+    })),
+    locations,
+    files,
+    warnings: uniqueLimited(warnings, 20),
+    verificationCommands,
+    repairContext: [
+      `rename: ${name} -> ${replacement || "(missing)"}`,
+      normalizedPath ? `path: ${normalizedPath}` : "",
+      targetLine ? `line: ${targetLine}` : "",
+      files.length ? `files: ${files.join(", ")}` : "",
+      warnings.length ? `warnings: ${uniqueLimited(warnings, 20).join(", ")}` : "",
+      verificationCommands.length ? `verificationCommands: ${verificationCommands.map((item) => item.command).join(" | ")}` : ""
+    ].filter(Boolean).join("\n"),
+    policy: {
+      access: "local-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      writesFiles: false,
+      previewOnly: true,
+      requiresApprovalBeforeWrite: true
+    }
+  };
+}
+
 function resolveSemanticImportCandidates(importerPath, source) {
   const cleanSource = String(source || "").split(/[?#]/)[0].trim();
   if (!cleanSource || !/^[./]/.test(cleanSource)) return [];
@@ -4218,6 +4487,141 @@ async function buildConflictResolutionDraft({ diff = "", resolutions = [], promp
     },
     policy: {
       access: "workspace-conflict-resolution-draft",
+      writesFiles: false,
+      createsCheckpoint: false,
+      updatesPendingProposal: true,
+      requiresApplyApproval: true
+    }
+  };
+}
+
+async function buildSemanticRenameDraft({ symbol = "", newName = "", path: targetPath = "", line = 0, limit = 80, contextLines = 3, prompt = "" } = {}) {
+  const preview = await buildSemanticRenamePreview(symbol, newName, {
+    path: targetPath,
+    line,
+    limit,
+    contextLines
+  });
+  if (!preview.symbol || !preview.newName) throw new Error("缺少 symbol 或 newName。");
+  if (!/^[A-Za-z_$][\w$]*$/.test(preview.newName)) throw new Error("newName 不是合法 JavaScript 标识符。");
+  if (preview.symbol === preview.newName) throw new Error("newName 与当前符号相同。");
+  if (preview.replacementConflicts?.length) {
+    throw new Error(`重命名存在命名冲突：${preview.replacementConflicts.map((item) => `${item.path}:${item.line}`).join(", ")}`);
+  }
+
+  const candidateLocationMap = new Map();
+  for (const item of preview.locations || []) {
+    if (!item.path || !item.line || Number(item.occurrenceCount || 0) <= 0) continue;
+    const filePath = toPosix(item.path);
+    const key = `${filePath}:${Number(item.line)}`;
+    const existing = candidateLocationMap.get(key);
+    if (existing) {
+      existing.role = uniqueLimited([existing.role, item.role].filter(Boolean), 4).join(",");
+      existing.kind = uniqueLimited([existing.kind, item.kind].filter(Boolean), 4).join(",");
+      existing.occurrenceCount = Math.max(Number(existing.occurrenceCount || 0), Number(item.occurrenceCount || 0));
+    } else {
+      candidateLocationMap.set(key, { ...item, path: filePath });
+    }
+  }
+  const candidateLocations = [...candidateLocationMap.values()]
+    .sort((left, right) => String(left.path).localeCompare(String(right.path)) || Number(left.line || 0) - Number(right.line || 0));
+  if (!candidateLocations.length) throw new Error("没有可安全替换的位置。");
+
+  const patchesByPath = new Map();
+  for (const location of candidateLocations) {
+    const filePath = toPosix(location.path);
+    const currentContent = await readWorkspaceFile(filePath);
+    const lines = currentContent.replace(/\r\n/g, "\n").split("\n");
+    const lineIndex = Number(location.line || 0) - 1;
+    if (lineIndex < 0 || lineIndex >= lines.length) {
+      throw new Error(`重命名位置超出当前文件范围：${filePath}:${location.line}`);
+    }
+    const beforeLine = lines[lineIndex];
+    const replacementResult = replaceCodeIdentifierOccurrences(beforeLine, preview.symbol, preview.newName);
+    if (!replacementResult.count) {
+      throw new Error(`重命名位置已变化，需要重新预览：${filePath}:${location.line}`);
+    }
+    const afterLine = replacementResult.text;
+    if (afterLine === beforeLine) continue;
+    const patch = patchesByPath.get(filePath) || { path: filePath, hunks: [] };
+    patch.hunks.push({
+      oldStart: lineIndex + 1,
+      oldCount: 1,
+      newStart: lineIndex + 1,
+      newCount: 1,
+      lines: [`-${beforeLine}`, `+${afterLine}`]
+    });
+    patchesByPath.set(filePath, patch);
+  }
+
+  const patches = [...patchesByPath.values()];
+  if (!patches.length) throw new Error("没有生成可写入的重命名 diff。");
+  const renameDiff = patches.map(renderSingleFileDiff).join("\n");
+  const analysis = await analyzeUnifiedDiffApplication(renameDiff);
+  if (analysis.conflicts.length) {
+    throw new Error(`生成的重命名 diff 仍有冲突：${analysis.conflicts.map((item) => `${item.path} ${item.hunk || ""}`.trim()).join(", ")}`);
+  }
+  const rendered = await previewUnifiedDiff(renameDiff);
+  const proposal = {
+    id: `rename-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+    type: "semantic_rename",
+    createdAt: new Date().toISOString(),
+    prompt: prompt || `Rename ${preview.symbol} to ${preview.newName}`,
+    reply: `已生成 ${preview.symbol} -> ${preview.newName} 的重命名 diff 草稿，等待审批写入。`,
+    plan: ["读取符号重命名预览", "生成逐行安全替换 diff", "预检 diff 可应用", "等待审批写入并运行验证"],
+    diff: renameDiff,
+    patches: rendered,
+    commands: preview.verificationCommands || [],
+    review: [
+      {
+        severity: "info",
+        message: "重命名草稿只更新 pending proposal，不直接写入目标文件。",
+        file: "",
+        line: ""
+      },
+      ...(preview.warnings || []).map((warning) => ({
+        severity: "warning",
+        message: `重命名预览警告：${warning}`,
+        file: "",
+        line: ""
+      }))
+    ],
+    renamePreview: {
+      symbol: preview.symbol,
+      newName: preview.newName,
+      summary: preview.summary,
+      files: preview.files,
+      warnings: preview.warnings
+    }
+  };
+  const previousGoal = await readGoalState();
+  const goal = await writeGoalState({
+    objective: prompt || previousGoal.objective || proposal.prompt,
+    phase: "awaiting_rename_approval",
+    status: "awaiting_approval",
+    lastPrompt: prompt || previousGoal.lastPrompt || proposal.prompt,
+    pendingProposal: proposal,
+    nextStep: "复核重命名 diff 后批准写入。"
+  });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    proposal,
+    preview,
+    summary: {
+      files: patches.length,
+      locations: candidateLocations.length,
+      applicableHunks: analysis.summary.applicableHunks,
+      conflictHunks: analysis.summary.conflictHunks
+    },
+    analysis,
+    goal: {
+      phase: goal.phase,
+      status: goal.status,
+      pendingProposalId: goal.pendingProposal?.id || ""
+    },
+    policy: {
+      access: "workspace-semantic-rename-draft",
       writesFiles: false,
       createsCheckpoint: false,
       updatesPendingProposal: true,
@@ -10740,6 +11144,63 @@ function getAgentTools() {
     {
       type: "function",
       function: {
+        name: "semantic_symbol_impact",
+        description: "只读分析本地符号影响范围，返回定义、引用、调用点、影响文件、建议编辑目标和验证命令；不写入文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string" },
+            path: { type: "string" },
+            line: { type: "number" },
+            contextLines: { type: "number" },
+            limit: { type: "number" }
+          },
+          required: ["symbol"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "semantic_rename_preview",
+        description: "只读预览本地符号重命名影响，返回定义、引用、候选替换位置、命名冲突、风险警告和建议验证命令；不写入文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string" },
+            newName: { type: "string" },
+            path: { type: "string" },
+            line: { type: "number" },
+            contextLines: { type: "number" },
+            limit: { type: "number" }
+          },
+          required: ["symbol", "newName"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "semantic_rename_draft",
+        description: "基于重命名预览生成待审批 unified diff 草稿，写入 pending proposal；不直接修改目标文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string" },
+            newName: { type: "string" },
+            path: { type: "string" },
+            line: { type: "number" },
+            contextLines: { type: "number" },
+            limit: { type: "number" },
+            prompt: { type: "string" }
+          },
+          required: ["symbol", "newName"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
         name: "semantic_search",
         description: "按符号、导入、路由、选择器、调用名或文件路径搜索本地语义索引。",
         parameters: {
@@ -12287,6 +12748,33 @@ async function runReadTool(name, args) {
       limit: Number(args.limit || 20)
     }));
   }
+  if (name === "semantic_symbol_impact") {
+    return JSON.stringify(await buildSemanticSymbolImpact(String(args.symbol || ""), {
+      path: String(args.path || ""),
+      line: Number(args.line || 0),
+      contextLines: Number(args.contextLines || 4),
+      limit: Number(args.limit || 80)
+    }));
+  }
+  if (name === "semantic_rename_preview") {
+    return JSON.stringify(await buildSemanticRenamePreview(String(args.symbol || ""), String(args.newName || ""), {
+      path: String(args.path || ""),
+      line: Number(args.line || 0),
+      contextLines: Number(args.contextLines || 3),
+      limit: Number(args.limit || 80)
+    }));
+  }
+  if (name === "semantic_rename_draft") {
+    return JSON.stringify(await buildSemanticRenameDraft({
+      symbol: String(args.symbol || ""),
+      newName: String(args.newName || ""),
+      path: String(args.path || ""),
+      line: Number(args.line || 0),
+      contextLines: Number(args.contextLines || 3),
+      limit: Number(args.limit || 80),
+      prompt: String(args.prompt || "")
+    }));
+  }
   if (name === "semantic_search") {
     return JSON.stringify(await searchSemanticIndex(String(args.query || ""), {
       kind: String(args.kind || "all"),
@@ -13159,6 +13647,66 @@ async function handleApi(req, res) {
         line: Number(payload.line || 0),
         contextLines: Number(payload.contextLines || 4),
         limit: Number(payload.limit || 20)
+      }));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/semantic-symbol-impact") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            symbol: url.searchParams.get("symbol") || "",
+            path: url.searchParams.get("path") || "",
+            line: Number(url.searchParams.get("line") || 0),
+            contextLines: Number(url.searchParams.get("contextLines") || 4),
+            limit: Number(url.searchParams.get("limit") || 80)
+          };
+      return send(res, 200, await buildSemanticSymbolImpact(String(payload.symbol || ""), {
+        path: String(payload.path || ""),
+        line: Number(payload.line || 0),
+        contextLines: Number(payload.contextLines || 4),
+        limit: Number(payload.limit || 80)
+      }));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/semantic-rename-preview") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            symbol: url.searchParams.get("symbol") || "",
+            newName: url.searchParams.get("newName") || "",
+            path: url.searchParams.get("path") || "",
+            line: Number(url.searchParams.get("line") || 0),
+            contextLines: Number(url.searchParams.get("contextLines") || 3),
+            limit: Number(url.searchParams.get("limit") || 80)
+          };
+      return send(res, 200, await buildSemanticRenamePreview(String(payload.symbol || ""), String(payload.newName || ""), {
+        path: String(payload.path || ""),
+        line: Number(payload.line || 0),
+        contextLines: Number(payload.contextLines || 3),
+        limit: Number(payload.limit || 80)
+      }));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/semantic-rename-draft") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            symbol: url.searchParams.get("symbol") || "",
+            newName: url.searchParams.get("newName") || "",
+            path: url.searchParams.get("path") || "",
+            line: Number(url.searchParams.get("line") || 0),
+            contextLines: Number(url.searchParams.get("contextLines") || 3),
+            limit: Number(url.searchParams.get("limit") || 80),
+            prompt: url.searchParams.get("prompt") || ""
+          };
+      return send(res, 200, await buildSemanticRenameDraft({
+        symbol: String(payload.symbol || ""),
+        newName: String(payload.newName || ""),
+        path: String(payload.path || ""),
+        line: Number(payload.line || 0),
+        contextLines: Number(payload.contextLines || 3),
+        limit: Number(payload.limit || 80),
+        prompt: String(payload.prompt || "")
       }));
     }
 
@@ -14376,7 +14924,7 @@ async function runApiSmokeSectionTest(sectionValue = "") {
         body: JSON.stringify({ limit: 20, includeContext: true })
       });
       assertSmoke(Array.isArray(semanticDiagnostics.diagnostics), "semantic diagnostics missing diagnostics list");
-      checked.push("semantic-index", "symbol-outline", "semantic-search", "semantic-diagnostics");
+      checked.push("semantic-index", "symbol-outline", "semantic-symbol-impact", "semantic-rename-preview", "semantic-rename-draft", "semantic-search", "semantic-diagnostics");
     }
 
     if (shouldRun("model")) {
@@ -14957,6 +15505,9 @@ async function runUiSmokeTest() {
     "/api/code-intelligence",
     "/api/symbol-outline",
     "/api/semantic-definition",
+    "/api/semantic-symbol-impact",
+    "/api/semantic-rename-preview",
+    "/api/semantic-rename-draft",
     "/api/semantic-search",
     "/api/semantic-references",
     "/api/semantic-diagnostics",
@@ -14998,12 +15549,31 @@ async function runUiSmokeTest() {
     "function appendSemanticEvidenceToPrompt",
     "function referenceSemanticEvidenceFilesInPrompt",
     "function runSemanticEvidenceRepair",
+    "function semanticEvidenceVerificationCommands",
+    "function buildSemanticSymbolImpactPrompt",
+    "function stageSemanticSymbolImpactCommands",
+    "function runSemanticSymbolImpactFix",
+    "function semanticRenamePreviewEvidence",
+    "function buildSemanticRenamePreviewPrompt",
+    "function stageSemanticRenamePreviewCommands",
+    "function runSemanticRenamePreviewFix",
+    "async function createSemanticRenameDraft",
     "function buildSemanticVerificationPrompt",
     "function appendSemanticVerificationPromptToPrompt",
     "function runSemanticVerificationFix",
     "function appendSemanticFailureEvidence",
     "语义证据已加入提示词",
     "已启动语义证据修复",
+    "符号影响验证命令已放入面板",
+    "符号影响修复证据链已创建",
+    "符号影响修复提示已加入提示词",
+    "已启动符号影响修复",
+    "重命名预览验证命令已放入面板",
+    "重命名预览修复证据链已创建",
+    "重命名预览提示已加入提示词",
+    "已启动重命名预览修复",
+    "重命名 diff 草稿已生成",
+    "重命名草稿已加入修复证据链",
     "语义诊断验证提示已加入提示词",
     "已启动语义诊断验证修复",
     "已引用语义证据文件",
@@ -15094,6 +15664,7 @@ async function runUiSmokeTest() {
     "function commandSourceLocations",
     "function fetchCommandSourceContexts",
     "function buildCommandSourceContextPrompt",
+    "function commandSourceVerificationCommands",
     "function runCommandSourceContextFix",
     "sourceLocations",
     "/api/source-context",
@@ -15144,6 +15715,7 @@ async function runUiSmokeTest() {
     "function buildCommandBatchPromptContext",
     "function appendCommandBatchEvidenceToPrompt",
     "function commandBatchReferencedFiles",
+    "function recordRepairVerificationFromBatch",
     "function referenceCommandBatchFilesInPrompt",
     "function commandBatchNeedsRepair",
     "function runCommandBatchEvidenceRepair",
@@ -16062,6 +16634,35 @@ async function runApiSmokeTest() {
     });
     assertSmoke(semanticDefinition.matchCount >= 1, "semantic definition missing symbol match");
     assertSmoke(semanticDefinition.definitions.some((item) => item.name === "buildSemanticIndex" && item.context?.includes("buildSemanticIndex")), "semantic definition missing definition context");
+    smokeStep("semantic-symbol-impact");
+    const semanticSymbolImpact = await requestJson(baseUrl, "/api/semantic-symbol-impact", {
+      method: "POST",
+      body: JSON.stringify({ symbol: "buildSemanticIndex", path: "server.js", limit: 20, contextLines: 2 })
+    });
+    assertSmoke(semanticSymbolImpact.summary?.definitions >= 1, "semantic symbol impact missing definitions");
+    assertSmoke(semanticSymbolImpact.references?.matchCount >= 1, "semantic symbol impact missing references");
+    assertSmoke(semanticSymbolImpact.impact?.summary?.targets >= 1, "semantic symbol impact missing impact targets");
+    assertSmoke(Array.isArray(semanticSymbolImpact.verificationCommands) && semanticSymbolImpact.verificationCommands.length >= 1, "semantic symbol impact missing verification commands");
+    assertSmoke(semanticSymbolImpact.policy?.executesCommands === false, "semantic symbol impact should be read-only");
+    smokeStep("semantic-rename-preview");
+    const semanticRenamePreview = await requestJson(baseUrl, "/api/semantic-rename-preview", {
+      method: "POST",
+      body: JSON.stringify({ symbol: "buildSemanticIndex", newName: "buildSemanticIndexNext", path: "server.js", limit: 20, contextLines: 2 })
+    });
+    assertSmoke(semanticRenamePreview.summary?.definitions >= 1, "semantic rename preview missing definitions");
+    assertSmoke(semanticRenamePreview.summary?.locations >= 1, "semantic rename preview missing locations");
+    assertSmoke(Array.isArray(semanticRenamePreview.locations) && semanticRenamePreview.locations.some((item) => item.after?.includes("buildSemanticIndexNext")), "semantic rename preview missing replacement preview");
+    assertSmoke(Array.isArray(semanticRenamePreview.verificationCommands) && semanticRenamePreview.verificationCommands.length >= 1, "semantic rename preview missing verification commands");
+    assertSmoke(semanticRenamePreview.policy?.previewOnly === true && semanticRenamePreview.policy?.writesFiles === false, "semantic rename preview should be read-only");
+    smokeStep("semantic-rename-draft");
+    const semanticRenameDraft = await requestJson(baseUrl, "/api/semantic-rename-draft", {
+      method: "POST",
+      body: JSON.stringify({ symbol: "buildSemanticIndex", newName: "buildSemanticIndexNext", path: "server.js", limit: 20, contextLines: 2, prompt: "api smoke rename draft" })
+    });
+    assertSmoke(semanticRenameDraft.proposal?.diff?.includes("buildSemanticIndexNext"), "semantic rename draft missing replacement diff");
+    assertSmoke(Array.isArray(semanticRenameDraft.proposal?.patches) && semanticRenameDraft.proposal.patches.length >= 1, "semantic rename draft missing patches");
+    assertSmoke(semanticRenameDraft.goal?.pendingProposalId?.startsWith("rename-"), "semantic rename draft missing pending proposal id");
+    assertSmoke(semanticRenameDraft.policy?.writesFiles === false && semanticRenameDraft.policy?.requiresApplyApproval === true, "semantic rename draft should only create pending proposal");
     smokeStep("semantic-search");
     const semanticSearch = await requestJson(baseUrl, "/api/semantic-search", {
       method: "POST",
@@ -16195,6 +16796,9 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "semantic_index"), "tools endpoint missing semantic_index");
     assertSmoke(tools.tools.some((item) => item.name === "symbol_outline"), "tools endpoint missing symbol_outline");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_definition"), "tools endpoint missing semantic_definition");
+    assertSmoke(tools.tools.some((item) => item.name === "semantic_symbol_impact"), "tools endpoint missing semantic_symbol_impact");
+    assertSmoke(tools.tools.some((item) => item.name === "semantic_rename_preview"), "tools endpoint missing semantic_rename_preview");
+    assertSmoke(tools.tools.some((item) => item.name === "semantic_rename_draft"), "tools endpoint missing semantic_rename_draft");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_search"), "tools endpoint missing semantic_search");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_references"), "tools endpoint missing semantic_references");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_diagnostics"), "tools endpoint missing semantic_diagnostics");
@@ -17011,7 +17615,7 @@ async function runApiSmokeTest() {
     console.log(JSON.stringify({
       ok: true,
       apiSmoke: true,
-    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "debug-diagnostics", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-startup-commands", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight"],
+    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "debug-diagnostics", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-symbol-impact", "semantic-rename-preview", "semantic-rename-draft", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-startup-commands", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight"],
       queueId: queued.id,
       handoffId: handoff.id
     }));
