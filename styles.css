@@ -2175,6 +2175,53 @@ textarea:focus {
   line-height: 1.4;
 }
 
+.capability-gap-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid rgba(242, 166, 90, 0.32);
+  border-radius: var(--radius);
+  background: rgba(242, 166, 90, 0.07);
+  cursor: pointer;
+}
+
+.capability-gap-summary strong {
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.capability-gap-summary small {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.35;
+}
+
+.capability-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.capability-actions button {
+  min-height: 24px;
+  padding: 4px 7px;
+  border: 1px solid rgba(122, 166, 255, 0.24);
+  border-radius: 7px;
+  background: rgba(122, 166, 255, 0.07);
+  color: var(--text);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.capability-actions button:hover {
+  border-color: rgba(122, 166, 255, 0.45);
+  background: rgba(122, 166, 255, 0.12);
+}
+
 .capability-row {
   display: grid;
   gap: 4px;

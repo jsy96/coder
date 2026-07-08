@@ -1,7 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { exec, spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import fsSync, { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
@@ -21,9 +21,10 @@ function parseNonNegativeInteger(value, fallback) {
   if (Number.isInteger(parsed) && parsed >= 0) return parsed;
   return fallback;
 }
-const PORT = parsePositivePort(process.env.FORGE_PORT || process.env.PORT, 4173);
+const PORT = parsePositivePort(getCliOption("--port") || process.env.FORGE_PORT || process.env.PORT, 4173);
 const PORT_AUTO_RETRY = process.env.FORGE_PORT_AUTO_RETRY !== "0";
 const PORT_RETRY_LIMIT = parseNonNegativeInteger(process.env.FORGE_PORT_RETRY_LIMIT, 50);
+let activeRuntimeServer = null;
 const DEFAULT_MODEL = "deepseek-v4-pro";
 const MODEL_API_URL = process.env.FORGE_MODEL_API_URL || "https://api.deepseek.com/chat/completions";
 const MODEL_CANDIDATES = (process.env.FORGE_MODELS || process.env.DEEPSEEK_MODEL || DEFAULT_MODEL)
@@ -778,6 +779,7 @@ const CONTEXT_ROLLUP_PATH = path.join(STATE_DIR, "context-rollup.json");
 const MODEL_USAGE_PATH = path.join(STATE_DIR, "model-usage.json");
 const MODEL_BILLING_PATH = path.join(STATE_DIR, "model-billing.json");
 const SEMANTIC_INDEX_PATH = path.join(STATE_DIR, "semantic-index.json");
+const RUNTIME_URL_PATH = path.join(STATE_DIR, "runtime-url.json");
 const APPROVAL_DIR = path.join(APP_ROOT, ".forge", "approvals");
 const ESCALATION_DIR = path.join(APP_ROOT, ".forge", "escalations");
 const EXTENSION_DIR = path.join(APP_ROOT, ".forge", "extensions");
@@ -817,7 +819,8 @@ const SAFE_COMMAND_PATTERNS = [
   /^node --check [\w./\\-]+$/i,
   /^node [\w./\\-]+ --smoke-test$/i,
   /^node [\w./\\-]+ --api-smoke-section=(?:all|fast|coding|debug|integrations|publish|core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote)(?:,(?:core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote))*$/i,
-  /^node [\w./\\-]+ --mcp-smoke-server$/i
+  /^node [\w./\\-]+ --mcp-smoke-server$/i,
+  /^(?:\.?[\\\/])?validate\.bat(?:\s+(?:--no-pause|\/no-pause|--ci))?$/i
 ];
 const PROCESS_COMMAND_PATTERNS = [
   /^npm (?:run )?(?:dev|start|serve|preview)(?:\s+--\s*[\w:./=-]+)?$/i,
@@ -1036,6 +1039,36 @@ async function listFiles(dir = currentWorkspace, base = "") {
     if (stat.size > MAX_FILE_BYTES) continue;
     files.push({ path: toPosix(path.join(base, entry.name)), size: stat.size });
   }
+  return files.sort((a, b) => a.path.localeCompare(b.path)).slice(0, 400);
+}
+
+function listWorkspaceFilesSync(dir = currentWorkspace, base = "", files = []) {
+  if (files.length >= 400) return files;
+  let entries = [];
+  try {
+    entries = fsSync.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return files;
+  }
+  for (const entry of entries) {
+    if (files.length >= 400) break;
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      listWorkspaceFilesSync(path.join(dir, entry.name), path.join(base, entry.name), files);
+      continue;
+    }
+    if (!entry.isFile() || !isTextFile(entry.name)) continue;
+    const full = path.join(dir, entry.name);
+    let stat = null;
+    try {
+      stat = fsSync.statSync(full);
+    } catch {
+      continue;
+    }
+    if (stat.size > MAX_FILE_BYTES) continue;
+    files.push({ path: toPosix(path.join(base, entry.name)), size: stat.size });
+  }
+  if (base) return files;
   return files.sort((a, b) => a.path.localeCompare(b.path)).slice(0, 400);
 }
 
@@ -2316,7 +2349,7 @@ function extractSemanticSignals(filePath, content) {
       const exportNamed = /^\s*export\s+(?:async\s+)?(?:function|class|const|let|var|interface|type)\s+([A-Za-z_$][\w$]*)/.exec(line);
       const exportList = /^\s*export\s*\{([^}]+)\}/.exec(line);
       const route = /\b(?:app|router)\.(get|post|put|patch|delete|use)\(\s*["'`]([^"'`]+)["'`]/.exec(line);
-      const apiFetch = /\bfetch\(\s*["'`]([^"'`]+)["'`]/.exec(line);
+      const urlPathMatch = /\burl\.pathname\s*===\s*["'`]([^"'`]+)["'`]/.exec(line);
 
       if (importFrom) addImport(importFrom[2], lineNumber, importFrom[1].match(/[A-Za-z_$][\w$]*/g) || []);
       if (importBare) addImport(importBare[1], lineNumber);
@@ -2326,7 +2359,25 @@ function extractSemanticSignals(filePath, content) {
         for (const name of exportList[1].match(/[A-Za-z_$][\w$]*/g) || []) addExport(name, lineNumber);
       }
       if (route) record.routes.push({ method: route[1].toUpperCase(), path: route[2], line: lineNumber });
-      if (apiFetch) record.routes.push({ method: "FETCH", path: apiFetch[1], line: lineNumber });
+      if (urlPathMatch) {
+        const methods = [...line.matchAll(/\breq\.method\s*===\s*["']([A-Z]+)["']/g)].map((match) => match[1]);
+        for (const method of uniqueLimited(methods, 8)) {
+          record.routes.push({ method, path: urlPathMatch[1], line: lineNumber });
+        }
+      }
+      if (/\b(?:fetch|api)\(\s*["'`]/.test(line)) {
+        const callWindow = lines.slice(index, Math.min(lines.length, index + 8)).join("\n");
+        for (const callMatch of callWindow.matchAll(/\b(?:fetch|api)\(\s*["'`]([^"'`]+)["'`]/g)) {
+          const callText = callWindow.slice(callMatch.index || 0, (callMatch.index || 0) + 500);
+          const methodMatch = /\bmethod\s*:\s*["']([A-Z]+)["']/.exec(callText);
+          record.routes.push({
+            method: "FETCH",
+            path: callMatch[1],
+            line: lineNumber,
+            clientMethod: methodMatch?.[1] || "GET"
+          });
+        }
+      }
     } else if (ext === ".py") {
       const imp = /^\s*(?:from\s+([\w.]+)\s+import\s+(.+)|import\s+(.+))/.exec(line);
       if (imp) addImport(imp[1] || imp[3], lineNumber, (imp[2] || "").match(/[A-Za-z_][\w]*/g) || []);
@@ -2401,7 +2452,7 @@ async function buildSemanticIndex({ persist = false } = {}) {
     records.push(record);
     for (const declaration of record.declarations) declarations.push({ ...declaration, path: file.path });
     for (const item of record.imports) imports.push({ ...item, path: file.path });
-    for (const route of record.routes) routes.push({ ...route, path: file.path });
+    for (const route of record.routes) routes.push({ ...route, route: route.route || route.path, path: file.path });
     for (const selector of record.selectors) selectors.push({ ...selector, path: file.path });
     for (const item of record.symbolOutline || []) symbolOutline.push({ ...item, path: file.path });
     callGraph[file.path] = uniqueLimited(record.calls.map((item) => item.name), 160);
@@ -2423,7 +2474,7 @@ async function buildSemanticIndex({ persist = false } = {}) {
     records: records.slice(0, 240),
     declarations: declarations.slice(0, 400),
     imports: imports.slice(0, 300),
-    routes: routes.slice(0, 200),
+    routes: routes.slice(0, 800),
     selectors: selectors.slice(0, 240),
     symbolOutline: symbolOutline.slice(0, 2000),
     callGraph
@@ -2456,6 +2507,8 @@ async function searchSemanticIndex(query = "", { kind = "all", limit = 50 } = {}
   const matches = [];
   const wants = (...types) => normalizedKind === "all" || types.includes(normalizedKind);
   const push = (item) => {
+    const key = `${item.kind || ""}:${item.path || ""}:${item.line || ""}:${item.name || item.route || item.selector || item.source || ""}`;
+    if (matches.some((match) => `${match.kind || ""}:${match.path || ""}:${match.line || ""}:${match.name || match.route || match.selector || match.source || ""}` === key)) return;
     if (matches.length < max) matches.push(item);
   };
 
@@ -2463,6 +2516,12 @@ async function searchSemanticIndex(query = "", { kind = "all", limit = 50 } = {}
     if (!wants("declaration", "symbol")) continue;
     if (semanticMatch(item.name, term) || semanticMatch(item.kind, term) || semanticMatch(item.path, term)) {
       push({ kind: "declaration", path: item.path, line: item.line, name: item.name, type: item.kind });
+    }
+  }
+  for (const item of index.symbolOutline || []) {
+    if (!wants("declaration", "symbol", "outline")) continue;
+    if (semanticMatch(item.name, term) || semanticMatch(item.kind, term) || semanticMatch(item.path, term) || semanticMatch(item.signature, term)) {
+      push({ kind: "declaration", path: item.path, line: item.line, endLine: item.endLine, name: item.name, type: item.kind });
     }
   }
   for (const item of index.imports || []) {
@@ -2538,6 +2597,19 @@ async function buildSemanticReferences(symbol = "", { limit = 80, contextLines =
   for (const item of index.declarations || []) {
     if (String(item.name || "").toLowerCase() === lowerName) {
       declarations.push({ kind: "declaration", path: item.path, line: item.line, name: item.name, type: item.kind });
+    }
+  }
+  for (const item of index.symbolOutline || []) {
+    if (String(item.name || "").toLowerCase() === lowerName) {
+      declarations.push({
+        kind: "declaration",
+        path: item.path,
+        line: item.line,
+        endLine: item.endLine || item.line,
+        name: item.name,
+        type: item.kind || item.type || "symbol",
+        signature: item.signature || ""
+      });
     }
   }
   for (const item of index.imports || []) {
@@ -3022,11 +3094,14 @@ async function buildSemanticDiagnostics({ limit = 120, includeContext = false } 
 
   const routeSeen = new Map();
   const serverRoutes = new Set();
+  const serverRouteMethods = new Map();
   for (const route of index.routes || []) {
-    const routePath = String(route.path || "").split(/[?#]/)[0] || "/";
+    const routePath = String(route.route || route.path || "").split(/[?#]/)[0] || "/";
     if (route.method === "FETCH") continue;
     const key = `${route.method}:${routePath}`;
     serverRoutes.add(routePath);
+    if (!serverRouteMethods.has(routePath)) serverRouteMethods.set(routePath, new Set());
+    serverRouteMethods.get(routePath).add(route.method);
     if (routeSeen.has(key)) {
       const first = routeSeen.get(key);
       add({
@@ -3045,8 +3120,10 @@ async function buildSemanticDiagnostics({ limit = 120, includeContext = false } 
 
   for (const route of index.routes || []) {
     if (route.method !== "FETCH") continue;
-    const routePath = String(route.path || "").split(/[?#]/)[0];
+    const routePath = String(route.route || route.path || "").split(/[?#]/)[0];
     if (!routePath.startsWith("/api/")) continue;
+    const clientMethod = String(route.clientMethod || "GET").toUpperCase();
+    const serverMethods = [...(serverRouteMethods.get(routePath) || [])].sort();
     if (!serverRoutes.has(routePath)) {
       add({
         severity: "info",
@@ -3055,7 +3132,19 @@ async function buildSemanticDiagnostics({ limit = 120, includeContext = false } 
         line: route.line,
         title: `前端 API 未找到服务端路由：${routePath}`,
         message: `${route.path} 调用了 ${routePath}，语义索引没有发现同名服务端路由。`,
-        evidence: { route: routePath, method: "FETCH" }
+        evidence: { route: routePath, method: clientMethod }
+      });
+      continue;
+    }
+    if (serverMethods.length && !serverMethods.includes(clientMethod)) {
+      add({
+        severity: "warning",
+        category: "api-method-mismatch",
+        path: route.path,
+        line: route.line,
+        title: `前端 API 方法可能不匹配：${clientMethod} ${routePath}`,
+        message: `${route.path} 使用 ${clientMethod} 调用 ${routePath}，但服务端语义索引只发现 ${serverMethods.join(", ")}。`,
+        evidence: { route: routePath, clientMethod, serverMethods }
       });
     }
   }
@@ -3075,7 +3164,8 @@ async function buildSemanticDiagnostics({ limit = 120, includeContext = false } 
       indexedFiles: index.indexedFiles || 0,
       localImports: localImportCount,
       routes: (index.routes || []).filter((route) => route.method !== "FETCH").length,
-      fetches: (index.routes || []).filter((route) => route.method === "FETCH").length
+      fetches: (index.routes || []).filter((route) => route.method === "FETCH").length,
+      apiMethodContracts: serverRouteMethods.size
     },
     summary: summarizeSemanticDiagnostics(clipped),
     diagnostics: withContext
@@ -3128,7 +3218,7 @@ async function buildSemanticImpact({ paths = [], limit = 80, includeContext = fa
       if (declaration.name) declarationNames.add(String(declaration.name).toLowerCase());
     }
     for (const route of record.routes || []) {
-      routes.push({ kind: "route", path: targetPath, line: route.line, method: route.method, route: route.path });
+      routes.push({ kind: "route", path: targetPath, line: route.line, method: route.method, route: route.route || route.path });
     }
     for (const selector of record.selectors || []) {
       selectors.push({ kind: "selector", path: targetPath, line: selector.line, selector: selector.selector });
@@ -3731,6 +3821,72 @@ async function readJsonOrNull(filePath) {
   } catch {
     return null;
   }
+}
+
+function buildRuntimeUrlState({ port = 0, url = "", source = "runtime" } = {}) {
+  const activePort = parsePositivePort(port, 0);
+  const normalizedUrl = String(url || (activePort ? `http://127.0.0.1:${activePort}` : "")).trim();
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    source,
+    port: activePort,
+    url: normalizedUrl,
+    browserCheckUrl: normalizedUrl,
+    statePath: toPosix(path.relative(APP_ROOT, RUNTIME_URL_PATH)),
+    policy: {
+      access: "local-runtime-read-only",
+      writesLocalArtifact: source !== "read",
+      executesCommands: false,
+      startsProcesses: false,
+      writesRemote: false
+    }
+  };
+}
+
+async function persistRuntimeUrlState({ port = 0, url = "", source = "runtime" } = {}) {
+  const state = buildRuntimeUrlState({ port, url, source });
+  await writeJsonAtomic(RUNTIME_URL_PATH, state);
+  return state;
+}
+
+async function readRuntimeUrlState() {
+  const saved = await readJsonOrNull(RUNTIME_URL_PATH);
+  if (saved && saved.workspace === currentWorkspace && saved.url) {
+    return {
+      ...saved,
+      source: saved.source || "saved",
+      statePath: saved.statePath || toPosix(path.relative(APP_ROOT, RUNTIME_URL_PATH)),
+      policy: {
+        access: "local-runtime-read-only",
+        writesLocalArtifact: false,
+        executesCommands: false,
+        startsProcesses: false,
+        writesRemote: false,
+        ...(saved.policy || {})
+      }
+    };
+  }
+  const activeAddress = activeRuntimeServer?.address?.();
+  if (activeAddress && typeof activeAddress === "object" && activeAddress.port) {
+    return buildRuntimeUrlState({ port: activeAddress.port, source: "active-server" });
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    source: "missing",
+    port: 0,
+    url: "",
+    browserCheckUrl: "",
+    statePath: toPosix(path.relative(APP_ROOT, RUNTIME_URL_PATH)),
+    policy: {
+      access: "local-runtime-read-only",
+      writesLocalArtifact: false,
+      executesCommands: false,
+      startsProcesses: false,
+      writesRemote: false
+    }
+  };
 }
 
 async function readModelUsageLedger() {
@@ -4852,6 +5008,7 @@ async function discoverStartupCommands({ limit = 8 } = {}) {
   const max = Math.min(20, Math.max(1, Number(limit) || 8));
   const scripts = await readPackageScripts();
   const manager = await detectPackageManager();
+  const runtimeUrl = await readRuntimeUrlState();
   const seen = new Set();
   const commands = [];
   const add = (command, reason = "", source = "detected") => {
@@ -4890,6 +5047,7 @@ async function discoverStartupCommands({ limit = 8 } = {}) {
   return {
     generatedAt: new Date().toISOString(),
     workspace: currentWorkspace,
+    runtimeUrl,
     packageManager: manager,
     scripts: Object.fromEntries(START_SCRIPT_NAMES.filter((name) => scripts[name]).map((name) => [name, scripts[name]])),
     commands: commands.slice(0, max),
@@ -4898,6 +5056,7 @@ async function discoverStartupCommands({ limit = 8 } = {}) {
       scope: "currentWorkspace",
       executesCommands: false,
       startsProcesses: false,
+      readsRuntimeUrl: true,
       filtersByProcessPolicy: true
     }
   };
@@ -5024,6 +5183,16 @@ function classifyCommandFailure(command = "", result = {}) {
   if (/syntaxerror|unexpected token|missing \)|unterminated|string literal/i.test(output)) {
     add("syntax", "error", "检测到语法错误。", stackLines, "优先读取报错文件和行号，使用 node --check 或对应编译器做最小验证。");
   }
+  if (
+    /^(?:npm|pnpm|yarn)\b/i.test(String(command || "").trim())
+    && (
+      /npm-cli\.js|pnpm\.cjs|yarn\.js|corepack/i.test(output)
+      || /cannot find module .*node_modules[\\/](?:npm|pnpm|yarn)[\\/]/i.test(output)
+      || /module_not_found/i.test(output) && /[\\/](?:npm|pnpm|yarn)[\\/](?:bin|dist|lib)[\\/]/i.test(output)
+    )
+  ) {
+    add("package-manager", "error", "检测到包管理器运行环境损坏。", stackLines, "先改用 node 直跑等价验证命令或 validate.bat 继续排查项目，再修复本机 npm/pnpm/yarn 安装。");
+  }
   if (/cannot find module|module not found|err_module_not_found|could not resolve|failed to resolve|can't resolve/i.test(lower)) {
     add("module-resolution", "error", "检测到模块或导入解析失败。", stackLines, "检查 package.json、相对路径大小写、扩展名和本地导出。");
   }
@@ -5064,6 +5233,10 @@ function extractCommandSourceLocations(text = "") {
   if (!source.trim()) return [];
   const workspaceFiles = listWorkspaceFilesSync();
   const byExact = new Map(workspaceFiles.map((file) => [file.path.toLowerCase(), file.path]));
+  const byAbsolute = new Map(workspaceFiles.map((file) => [
+    toPosix(path.resolve(currentWorkspace, file.path)).toLowerCase(),
+    file.path
+  ]));
   const byBase = new Map();
   for (const file of workspaceFiles) {
     const base = path.basename(file.path).toLowerCase();
@@ -5071,15 +5244,29 @@ function extractCommandSourceLocations(text = "") {
     byBase.get(base).push(file.path);
   }
   const locations = new Map();
+  const workspaceRoot = toPosix(path.resolve(currentWorkspace)).toLowerCase();
   const add = (rawPath, line, column, rawLine = "") => {
-    const normalized = String(rawPath || "").trim()
+    const cleanedPath = String(rawPath || "").trim()
       .replace(/^file:\/\//i, "")
-      .replace(/^\.?[\\/]/, "")
+      .replace(/^\/([A-Za-z]:[\\/])/i, "$1")
       .replaceAll("\\", "/");
+    const normalized = cleanedPath.replace(/^\.?[\\/]/, "");
     if (!normalized || !/\.[A-Za-z0-9]+$/.test(normalized)) return;
+    const absoluteCandidate = path.isAbsolute(cleanedPath)
+      ? toPosix(path.resolve(cleanedPath)).toLowerCase()
+      : "";
+    const workspaceRelative = absoluteCandidate && absoluteCandidate.startsWith(`${workspaceRoot}/`)
+      ? absoluteCandidate.slice(workspaceRoot.length + 1)
+      : "";
     const exact = byExact.get(normalized.toLowerCase());
+    const absolute = absoluteCandidate ? byAbsolute.get(absoluteCandidate) : "";
+    const relative = workspaceRelative ? byExact.get(workspaceRelative) : "";
     const baseMatches = byBase.get(path.basename(normalized).toLowerCase()) || [];
-    const resolved = exact || baseMatches.find((candidate) => candidate.toLowerCase().endsWith(normalized.toLowerCase())) || "";
+    const resolved = exact
+      || absolute
+      || relative
+      || baseMatches.find((candidate) => candidate.toLowerCase().endsWith(normalized.toLowerCase()))
+      || "";
     if (!resolved) return;
     const parsedLine = Math.max(1, Number.parseInt(line, 10) || 1);
     const parsedColumn = Math.max(0, Number.parseInt(column, 10) || 0);
@@ -5094,8 +5281,10 @@ function extractCommandSourceLocations(text = "") {
   };
 
   const patterns = [
-    /(?:^|[\s("'`])((?:\.?[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+):(\d+):(\d+)/g,
-    /(?:^|[\s("'`])((?:\.?[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+):(\d+)/g,
+    /(?:^|[\s("'`])((?:[A-Za-z]:)?(?:\.?[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+):(\d+):(\d+)/g,
+    /(?:^|[\s("'`])((?:[A-Za-z]:)?(?:\.?[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+):(\d+)/g,
+    /(?:^|[\s("'`])((?:file:\/\/\/?)?(?:[A-Za-z]:)?[^:\r\n]+?\.[A-Za-z0-9_]+):(\d+):(\d+)/g,
+    /(?:^|[\s("'`])((?:file:\/\/\/?)?(?:[A-Za-z]:)?[^:\r\n]+?\.[A-Za-z0-9_]+):(\d+)/g,
     /\(([^()\r\n]+?\.[A-Za-z0-9_]+):(\d+):(\d+)\)/g
   ];
   const lines = source.split(/\r?\n/);
@@ -5108,7 +5297,149 @@ function extractCommandSourceLocations(text = "") {
       }
     }
   }
+  if (!locations.size) {
+    const lineHint = Number((source.match(/(?:^|\n)[^\r\n]*?\.[A-Za-z0-9_]+:(\d+)(?::\d+)?/) || [])[1]) || 1;
+    const commandFilePattern = /(?:^|\s)((?:\.?[\\/])?[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+)(?=\s|$)/g;
+    let match;
+    while ((match = commandFilePattern.exec(source))) {
+      add(match[1], lineHint, 0, match[0]);
+      if (locations.size) break;
+    }
+  }
   return [...locations.values()].slice(0, 16);
+}
+
+function uniqueSourceLocations(locations = [], limit = 16) {
+  const seen = new Set();
+  const unique = [];
+  for (const item of Array.isArray(locations) ? locations : []) {
+    const pathValue = String(item?.path || "").replaceAll("\\", "/").trim();
+    if (!pathValue) continue;
+    const line = Math.max(1, Number.parseInt(item.line, 10) || 1);
+    const column = Math.max(0, Number.parseInt(item.column, 10) || 0);
+    const key = `${pathValue.toLowerCase()}:${line}:${column}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push({
+      path: pathValue,
+      line,
+      column,
+      text: String(item.text || "").trim().slice(0, 400)
+    });
+    if (unique.length >= limit) break;
+  }
+  return unique;
+}
+
+function resolveWorkspaceRelativePathFromBrowserUrl(rawUrl = "") {
+  const value = String(rawUrl || "").trim();
+  if (!value) return "";
+  const workspaceFiles = listWorkspaceFilesSync();
+  const byExact = new Map(workspaceFiles.map((file) => [file.path.toLowerCase(), file.path]));
+  const byBase = new Map();
+  for (const file of workspaceFiles) {
+    const base = path.basename(file.path).toLowerCase();
+    if (!byBase.has(base)) byBase.set(base, []);
+    byBase.get(base).push(file.path);
+  }
+  const workspaceRoot = toPosix(path.resolve(currentWorkspace)).toLowerCase();
+  const candidates = [];
+  const addCandidate = (candidate) => {
+    const cleaned = String(candidate || "")
+      .split(/[?#]/)[0]
+      .replaceAll("\\", "/")
+      .replace(/^\/([A-Za-z]:\/)/, "$1")
+      .replace(/^\/+/, "")
+      .trim();
+    if (cleaned) candidates.push(cleaned);
+  };
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === "file:") {
+      const filePath = toPosix(fileURLToPath(parsed));
+      if (filePath.toLowerCase().startsWith(`${workspaceRoot}/`)) {
+        addCandidate(filePath.slice(workspaceRoot.length + 1));
+      }
+      addCandidate(filePath);
+    } else if (/^https?:$/.test(parsed.protocol)) {
+      const decodedPath = decodeURIComponent(parsed.pathname || "/");
+      if (decodedPath === "/" || !decodedPath) addCandidate("index.html");
+      addCandidate(decodedPath);
+    }
+  } catch {
+    addCandidate(value.replace(/^https?:\/\/[^/]+/i, ""));
+    addCandidate(value.replace(/^file:\/\//i, ""));
+  }
+  addCandidate(value);
+  for (const candidate of candidates) {
+    const exact = byExact.get(candidate.toLowerCase());
+    if (exact) return exact;
+    const absoluteCandidate = path.isAbsolute(candidate)
+      ? toPosix(path.resolve(candidate)).toLowerCase()
+      : "";
+    if (absoluteCandidate && absoluteCandidate.startsWith(`${workspaceRoot}/`)) {
+      const relative = absoluteCandidate.slice(workspaceRoot.length + 1);
+      const resolved = byExact.get(relative.toLowerCase());
+      if (resolved) return resolved;
+    }
+    const base = candidate.split("/").pop()?.toLowerCase() || "";
+    const baseMatches = byBase.get(base) || [];
+    const resolved = baseMatches.find((item) => item.toLowerCase().endsWith(candidate.toLowerCase()))
+      || (baseMatches.length === 1 ? baseMatches[0] : "");
+    if (resolved) return resolved;
+  }
+  return "";
+}
+
+function addBrowserSourceLocation(locations, rawUrl = "", line = 0, column = 0, text = "", { zeroBased = true } = {}) {
+  const resolved = resolveWorkspaceRelativePathFromBrowserUrl(rawUrl);
+  if (!resolved) return;
+  const parsedLine = Number.parseInt(line, 10);
+  const parsedColumn = Number.parseInt(column, 10);
+  locations.push({
+    path: resolved,
+    line: Math.max(1, (Number.isFinite(parsedLine) ? parsedLine : 0) + (zeroBased ? 1 : 0)),
+    column: Math.max(0, (Number.isFinite(parsedColumn) ? parsedColumn : 0) + (zeroBased ? 1 : 0)),
+    text: String(text || rawUrl || "").trim().slice(0, 400)
+  });
+}
+
+function addBrowserCallFrameLocations(locations, frames = [], text = "") {
+  for (const frame of Array.isArray(frames) ? frames : []) {
+    addBrowserSourceLocation(
+      locations,
+      frame.url || frame.scriptUrl || "",
+      frame.lineNumber ?? frame.line ?? 0,
+      frame.columnNumber ?? frame.column ?? 0,
+      text || frame.functionName || "",
+      { zeroBased: true }
+    );
+  }
+}
+
+function extractBrowserTraceSourceLocations(trace = null, limit = 16) {
+  if (!trace || typeof trace !== "object") return [];
+  const locations = [];
+  const addExisting = (items = []) => {
+    for (const item of Array.isArray(items) ? items : []) locations.push(item);
+  };
+  for (const item of Array.isArray(trace.exceptions) ? trace.exceptions : []) {
+    addExisting(item.sourceLocations);
+    addBrowserSourceLocation(locations, item.url || "", item.line ?? 0, item.column ?? 0, item.text || item.message || item.description || "", { zeroBased: true });
+    addBrowserCallFrameLocations(locations, item.callFrames || item.stackTrace?.callFrames || [], item.text || item.message || item.description || "");
+    if (item.stack || item.text || item.message || item.description) {
+      addExisting(extractCommandSourceLocations([item.stack, item.text, item.message, item.description].filter(Boolean).join("\n")));
+    }
+  }
+  for (const item of Array.isArray(trace.console) ? trace.console : []) {
+    addExisting(item.sourceLocations);
+    addBrowserSourceLocation(locations, item.url || "", item.line ?? item.lineNumber ?? 0, item.column ?? item.columnNumber ?? 0, item.text || item.message || "", { zeroBased: true });
+    addBrowserCallFrameLocations(locations, item.callFrames || item.stackTrace?.callFrames || [], item.text || item.message || "");
+    if (item.location || item.text || item.message) {
+      addExisting(extractCommandSourceLocations([item.location, item.text, item.message].filter(Boolean).join("\n")));
+    }
+  }
+  return uniqueSourceLocations(locations, limit);
 }
 
 function commandItem(command = "", reason = "", extra = {}) {
@@ -5137,13 +5468,23 @@ function buildFailureRecoveryChain(command = "", result = {}, diagnostics = null
   const diagnosticCommands = Array.isArray(diagnostics?.verificationPlan?.commands)
     ? diagnostics.verificationPlan.commands
     : [];
+  const packageManagerFallbackCommands = failureAnalysis.category === "package-manager"
+    ? [
+        commandItem("node --check server.js", "npm/pnpm/yarn 损坏时先用 node 直跑后端语法检查，确认项目代码仍可验证。", { stage: "verify-toolchain-fallback" }),
+        commandItem("node --check app.js", "npm/pnpm/yarn 损坏时先用 node 直跑前端语法检查，绕开包管理器入口。", { stage: "verify-toolchain-fallback" }),
+        commandItem("node server.js --ui-smoke-test", "npm/pnpm/yarn 损坏时用 node 直跑 UI smoke，继续验证工作台入口。", { stage: "verify-toolchain-fallback" }),
+        commandItem("node server.js --api-smoke-section=fast", "npm/pnpm/yarn 损坏时用 node 直跑 fast smoke，覆盖核心写代码/调试链路。", { stage: "verify-toolchain-fallback" }),
+        commandItem("validate.bat --no-pause", "npm/pnpm/yarn 损坏时用无交互 validate.bat 跑完整本地验证链。", { stage: "verify-toolchain-fallback" })
+      ]
+    : [];
   const commands = dedupeCommandItems([
     commandItem(command, "复现最近一次失败，确认当前问题仍可稳定触发。", { stage: "reproduce" }),
-    ...diagnosticCommands.map((item) => commandItem(item.command || item, item.reason || "复用调试诊断推荐的验证命令。", { stage: "diagnose" })),
     commandItem(command, "修复后第一时间重跑原失败命令，确认根因已消除。", { stage: "verify-original" }),
     commandItem("node --check server.js", "复查后端入口语法，避免修复引入新的 JavaScript 语法错误。", { stage: "verify-syntax" }),
     commandItem("node --check app.js", "复查前端入口语法，避免修复引入新的 JavaScript 语法错误。", { stage: "verify-syntax" }),
-    commandItem("node server.js --api-smoke-section=debug", "运行调试闭环 smoke，验证失败分类、诊断和修复链路仍可用。", { stage: "verify-debug" })
+    commandItem("node server.js --api-smoke-section=debug", "运行调试闭环 smoke，验证失败分类、诊断和修复链路仍可用。", { stage: "verify-debug" }),
+    ...packageManagerFallbackCommands,
+    ...diagnosticCommands.map((item) => commandItem(item.command || item, item.reason || "复用调试诊断推荐的验证命令。", { stage: "diagnose" }))
   ]);
   const runnableCommands = commands
     .filter((item) => evaluateCommandPolicy(item.command).allowed)
@@ -5163,10 +5504,11 @@ function buildFailureRecoveryChain(command = "", result = {}, diagnostics = null
     sourceLocations,
     nextActions: [
       "先重跑原命令确认失败仍存在。",
+      failureAnalysis.category === "package-manager" ? "若 npm/pnpm/yarn 本身损坏，先用 node 直跑 smoke 或 validate.bat 继续项目验证。" : "",
       uniqueFiles.length ? "引用相关文件并定位最小根因。" : "根据失败输出定位最小根因。",
       "生成最小修复 diff 后先重跑原命令。",
       "最后运行语法检查和调试 smoke。"
-    ],
+    ].filter(Boolean),
     commands: runnableCommands,
     stages: [
       { id: "reproduce", label: "复现", command, status: "pending" },
@@ -5174,6 +5516,80 @@ function buildFailureRecoveryChain(command = "", result = {}, diagnostics = null
       { id: "repair", label: "修复", action: "repair-command", status: "pending" },
       { id: "verify", label: "复查", commands: runnableCommands.filter((item) => /verify/i.test(item.stage || "")), status: "pending" }
     ]
+  };
+}
+
+function summarizeCheckOutput(output = "") {
+  const text = String(output || "").trim();
+  if (!text) return "(无输出)";
+  return text.split(/\r?\n/).filter(Boolean).slice(0, 2).join(" · ").slice(0, 260);
+}
+
+function buildApplyVerificationRecovery({
+  finalStatus = "",
+  applied = [],
+  verification = {},
+  checkCommands = [],
+  repair = null,
+  repairError = "",
+  conflicts = [],
+  selectedHunks = [],
+  checkpoint = null
+} = {}) {
+  const checks = Array.isArray(verification?.checks) ? verification.checks : [];
+  const failedChecks = checks.filter((check) => check?.blocked || Number(check?.exitCode ?? 0) !== 0);
+  const verificationCommands = dedupeCommandItems([
+    ...checkCommands,
+    ...(Array.isArray(repair?.commands) ? repair.commands : []),
+    commandItem("node --check server.js", "写入后复查后端入口语法。", { stage: "post-apply-syntax" }),
+    commandItem("node --check app.js", "写入后复查前端入口语法。", { stage: "post-apply-syntax" })
+  ]).slice(0, 8);
+  const nextActions = [];
+  if (verification?.skipped) {
+    nextActions.push("自动检查被跳过或未发现命令，先运行写入后复查命令。");
+  } else if (verification?.ok) {
+    nextActions.push("自动检查已通过，可继续交付、提交或处理下一项任务。");
+  } else if (repair?.diff) {
+    nextActions.push("审查自动生成的修复 diff，批准写入后继续运行复查命令。");
+  } else {
+    nextActions.push("查看失败命令输出，把写入后验证恢复证据加入提示词后生成最小修复。");
+  }
+  if (conflicts.length) {
+    nextActions.push("处理剩余冲突文件或 hunk，再生成冲突解决草稿或重新应用。");
+  }
+  if (failedChecks.length) {
+    nextActions.push("优先重跑第一条失败检查，确认失败仍稳定复现。");
+  }
+  return {
+    status: finalStatus,
+    generatedAt: new Date().toISOString(),
+    checkpointId: checkpoint?.id || "",
+    changedFiles: applied.map((item) => item.path).filter(Boolean),
+    verification: {
+      ok: Boolean(verification?.ok),
+      skipped: Boolean(verification?.skipped),
+      checkCount: checks.length,
+      failedCount: failedChecks.length,
+      reason: verification?.reason || verification?.summary || ""
+    },
+    failedCommands: failedChecks.map((check) => ({
+      command: String(check.command || "").slice(0, 400),
+      exitCode: Number(check.exitCode ?? 1),
+      blocked: Boolean(check.blocked),
+      outputSummary: summarizeCheckOutput(check.output || ""),
+      policy: check.policy || null
+    })).slice(0, 8),
+    verificationCommands,
+    nextActions: nextActions.slice(0, 6),
+    repairSuggested: Boolean(repair?.diff),
+    repairError: String(repairError || "").slice(0, 1000),
+    conflicts: conflicts.slice(0, 8),
+    selectedHunks,
+    policy: {
+      executesExtraCommands: false,
+      writesFiles: false,
+      derivedFromApplyResult: true
+    }
   };
 }
 
@@ -5482,6 +5898,30 @@ function normalizeHealthRuleStatusList(value, aliases = []) {
     .slice(0, 12);
 }
 
+function compileHealthRulePatterns(patterns = []) {
+  const compiled = [];
+  for (const pattern of patterns || []) {
+    const text = String(pattern || "").trim();
+    if (!text) continue;
+    try {
+      compiled.push({ source: text, regex: new RegExp(text, "i") });
+    } catch {
+      compiled.push({ source: text, regex: null, invalid: true });
+    }
+    if (compiled.length >= 8) break;
+  }
+  return compiled;
+}
+
+function matchHealthRulePatterns(value = "", patterns = []) {
+  const text = String(value || "");
+  return (patterns || []).map((pattern) => ({
+    source: pattern.source,
+    matched: pattern.regex ? pattern.regex.test(text) : false,
+    invalid: Boolean(pattern.invalid)
+  }));
+}
+
 function normalizeProcessHealthRules(rawRules) {
   const source = Array.isArray(rawRules) ? rawRules : Array.isArray(rawRules?.rules) ? rawRules.rules : [];
   return source.slice(0, 40).map((rule, index) => {
@@ -5512,6 +5952,36 @@ function normalizeProcessHealthRules(rawRules) {
         [rule?.responseBodyIncludes, rule?.responseIncludes],
         8
       ),
+      expectedOutputMatches: compileHealthRulePatterns(normalizeHealthRuleTextList(
+        rule?.expectedOutputMatches || rule?.outputMatches || rule?.expectedOutputRegex || rule?.outputRegex,
+        [],
+        8
+      )),
+      expectedProbeBodyMatches: compileHealthRulePatterns(normalizeHealthRuleTextList(
+        rule?.expectedProbeBodyMatches || rule?.probeBodyMatches || rule?.responseBodyMatches || rule?.responseRegex,
+        [],
+        8
+      )),
+      unexpectedOutputIncludes: normalizeHealthRuleTextList(
+        rule?.unexpectedOutputIncludes || rule?.forbiddenOutputIncludes || rule?.outputExcludes,
+        [rule?.unexpectedBodyIncludes, rule?.bodyExcludes],
+        8
+      ),
+      unexpectedProbeBodyIncludes: normalizeHealthRuleTextList(
+        rule?.unexpectedProbeBodyIncludes || rule?.forbiddenProbeBodyIncludes || rule?.probeBodyExcludes || rule?.responseExcludes,
+        [],
+        8
+      ),
+      unexpectedOutputMatches: compileHealthRulePatterns(normalizeHealthRuleTextList(
+        rule?.unexpectedOutputMatches || rule?.forbiddenOutputMatches || rule?.outputExcludeRegex,
+        [],
+        8
+      )),
+      unexpectedProbeBodyMatches: compileHealthRulePatterns(normalizeHealthRuleTextList(
+        rule?.unexpectedProbeBodyMatches || rule?.forbiddenProbeBodyMatches || rule?.probeBodyExcludeRegex || rule?.responseExcludeRegex,
+        [],
+        8
+      )),
       requireProbe: rule?.requireProbe !== false
     };
   }).filter((rule) => rule.name && rule.commandIncludes.length);
@@ -5549,6 +6019,19 @@ function evaluateProcessHealthRules(row, rules = []) {
     if (missingOutput.length) {
       failures.push(`missing-output-evidence:${missingOutput.map((item) => item.slice(0, 40)).join("|")}`);
     }
+    const outputPatternMatches = matchHealthRulePatterns(outputTail, rule.expectedOutputMatches);
+    const missingOutputPatterns = outputPatternMatches.filter((item) => item.invalid || !item.matched);
+    if (missingOutputPatterns.length) {
+      failures.push(`missing-output-pattern:${missingOutputPatterns.map((item) => item.source.slice(0, 40)).join("|")}`);
+    }
+    const unexpectedOutput = (rule.unexpectedOutputIncludes || []).filter((needle) => outputTail.includes(needle));
+    if (unexpectedOutput.length) {
+      failures.push(`unexpected-output-evidence:${unexpectedOutput.map((item) => item.slice(0, 40)).join("|")}`);
+    }
+    const unexpectedOutputPatterns = matchHealthRulePatterns(outputTail, rule.unexpectedOutputMatches).filter((item) => item.matched || item.invalid);
+    if (unexpectedOutputPatterns.length) {
+      failures.push(`unexpected-output-pattern:${unexpectedOutputPatterns.map((item) => item.source.slice(0, 40)).join("|")}`);
+    }
     const missingProbeUrl = (rule.expectedProbeUrlIncludes || []).filter((needle) => !probeUrl.includes(needle));
     if (missingProbeUrl.length) {
       failures.push(`missing-probe-url:${missingProbeUrl.map((item) => item.slice(0, 40)).join("|")}`);
@@ -5556,6 +6039,19 @@ function evaluateProcessHealthRules(row, rules = []) {
     const missingProbeBody = (rule.expectedProbeBodyIncludes || []).filter((needle) => !probeBody.includes(needle));
     if (missingProbeBody.length) {
       failures.push(probe ? `missing-probe-body:${missingProbeBody.map((item) => item.slice(0, 40)).join("|")}` : "missing-probe-body:missing-probe");
+    }
+    const probeBodyPatternMatches = matchHealthRulePatterns(probeBody, rule.expectedProbeBodyMatches);
+    const missingProbeBodyPatterns = probeBodyPatternMatches.filter((item) => item.invalid || !item.matched);
+    if (missingProbeBodyPatterns.length) {
+      failures.push(probe ? `missing-probe-body-pattern:${missingProbeBodyPatterns.map((item) => item.source.slice(0, 40)).join("|")}` : "missing-probe-body-pattern:missing-probe");
+    }
+    const unexpectedProbeBody = (rule.unexpectedProbeBodyIncludes || []).filter((needle) => probeBody.includes(needle));
+    if (unexpectedProbeBody.length) {
+      failures.push(probe ? `unexpected-probe-body:${unexpectedProbeBody.map((item) => item.slice(0, 40)).join("|")}` : "unexpected-probe-body:missing-probe");
+    }
+    const unexpectedProbeBodyPatterns = matchHealthRulePatterns(probeBody, rule.unexpectedProbeBodyMatches).filter((item) => item.matched || item.invalid);
+    if (unexpectedProbeBodyPatterns.length) {
+      failures.push(probe ? `unexpected-probe-body-pattern:${unexpectedProbeBodyPatterns.map((item) => item.source.slice(0, 40)).join("|")}` : "unexpected-probe-body-pattern:missing-probe");
     }
     return {
       name: rule.name,
@@ -5571,8 +6067,14 @@ function evaluateProcessHealthRules(row, rules = []) {
       expectedStatus: rule.expectedStatus,
       expectedBodyIncludes: rule.expectedBodyIncludes,
       expectedOutputIncludes: rule.expectedOutputIncludes,
+      expectedOutputMatches: (rule.expectedOutputMatches || []).map((item) => item.source),
       expectedProbeUrlIncludes: rule.expectedProbeUrlIncludes,
       expectedProbeBodyIncludes: rule.expectedProbeBodyIncludes,
+      expectedProbeBodyMatches: (rule.expectedProbeBodyMatches || []).map((item) => item.source),
+      unexpectedOutputIncludes: rule.unexpectedOutputIncludes,
+      unexpectedOutputMatches: (rule.unexpectedOutputMatches || []).map((item) => item.source),
+      unexpectedProbeBodyIncludes: rule.unexpectedProbeBodyIncludes,
+      unexpectedProbeBodyMatches: (rule.unexpectedProbeBodyMatches || []).map((item) => item.source),
       requireProbe: rule.requireProbe
     };
   });
@@ -7224,17 +7726,35 @@ async function captureBrowserTrace(rawUrl, { width = 1365, height = 768, waitMs 
       await sleep(safeWaitMs);
       for (const event of client.events.slice(eventOffset)) {
         if (event.method === "Runtime.consoleAPICalled") {
+          const callFrames = event.params.stackTrace?.callFrames || [];
+          const topFrame = callFrames[0] || {};
           consoleEntries.push({
             type: event.params.type || "log",
             text: (event.params.args || []).map((arg) => arg.value ?? arg.description ?? arg.type ?? "").join(" ").slice(0, 1000),
-            timestamp: event.params.timestamp || 0
+            timestamp: event.params.timestamp || 0,
+            url: topFrame.url || "",
+            line: topFrame.lineNumber ?? 0,
+            column: topFrame.columnNumber ?? 0,
+            callFrames: callFrames.slice(0, 8)
           });
         } else if (event.method === "Runtime.exceptionThrown") {
+          const details = event.params.exceptionDetails || {};
+          const callFrames = details.stackTrace?.callFrames || [];
+          const exceptionText = [
+            details.text || "",
+            details.exception?.description || details.exception?.value || ""
+          ].filter(Boolean).join(" ").slice(0, 1200);
+          const exceptionItem = {
+            text: exceptionText || details.text || "",
+            url: details.url || callFrames[0]?.url || "",
+            line: details.lineNumber || 0,
+            column: details.columnNumber || 0,
+            stack: details.exception?.description || "",
+            callFrames: callFrames.slice(0, 12)
+          };
+          exceptionItem.sourceLocations = extractBrowserTraceSourceLocations({ exceptions: [exceptionItem] }, 8);
           exceptions.push({
-            text: event.params.exceptionDetails?.text || "",
-            url: event.params.exceptionDetails?.url || "",
-            line: event.params.exceptionDetails?.lineNumber || 0,
-            column: event.params.exceptionDetails?.columnNumber || 0
+            ...exceptionItem
           });
         } else if (event.method === "Network.requestWillBeSent") {
           requestMethods.set(event.params.requestId, event.params.request?.method || "GET");
@@ -7828,7 +8348,7 @@ function runLocalCommand(command, options = {}) {
       resolve({
         ok: !error,
         exitCode: error?.code ?? 0,
-        output: [stdout, stderr].filter(Boolean).join("\n").trim()
+        output: [stdout, stderr].filter(Boolean).join("\n").replace(/\s+$/g, "")
       });
     });
   });
@@ -7858,11 +8378,48 @@ function runLocalProcess(command, args = [], options = {}) {
     child.stderr?.on("data", (chunk) => stderr.push(chunk));
     child.on("error", (error) => finish({ ok: false, exitCode: error.code || 1, output: error.message }));
     child.on("close", (code) => {
-      const output = Buffer.concat([...stdout, ...stderr]).toString("utf8").trim();
+      const output = Buffer.concat([...stdout, ...stderr]).toString("utf8").replace(/\s+$/g, "");
       const clipped = output.slice(0, options.maxBuffer || 256 * 1024);
       finish({ ok: code === 0, exitCode: code ?? 0, output: clipped });
     });
   });
+}
+
+function isGitWarningLine(line = "") {
+  return /^\s*(?:warning|error):\s+unable to access\b/i.test(String(line || ""));
+}
+
+function parseGitStatusOutput(output = "") {
+  return String(output || "")
+    .split(/\r?\n/)
+    .filter((line) => line && !isGitWarningLine(line))
+    .filter((line) => /^(?:[ MADRCU?!]{2}|[ MADRCU?!]{1}[ MADRCU?!]{1})\s+/.test(line))
+    .slice(0, 80);
+}
+
+function changedFilesFromGitStatus(status = []) {
+  const files = [];
+  for (const line of Array.isArray(status) ? status : []) {
+    const value = String(line || "");
+    if (value.length < 4) continue;
+    const pathPart = value.slice(3).trim();
+    if (!pathPart || isGitWarningLine(pathPart)) continue;
+    const renamed = /\s+->\s+(.+)$/.exec(pathPart);
+    files.push(renamed ? renamed[1].trim() : pathPart);
+  }
+  return uniqueLimited(files.filter(Boolean), 120);
+}
+
+function assertGitSummaryIntegrity(git = {}) {
+  if (!git.available) return;
+  const status = Array.isArray(git.status) ? git.status : [];
+  const changedFiles = Array.isArray(git.changedFiles) ? git.changedFiles : [];
+  assertSmoke(!status.some((line) => isGitWarningLine(line)), "git summary status should not include local Git warning lines");
+  assertSmoke(!changedFiles.some((file) => isGitWarningLine(file) || /unable to access/i.test(String(file || ""))), "git summary changedFiles should not include Git warning lines");
+  assertSmoke(!changedFiles.some((file) => /^EADME\.md$/i.test(String(file || ""))), "git summary changedFiles should preserve leading status-space paths like README.md");
+  if (status.some((line) => /\sREADME\.md$/.test(line))) {
+    assertSmoke(changedFiles.includes("README.md"), "git summary changedFiles should include README.md when status reports it");
+  }
 }
 
 async function getGitSummary() {
@@ -7877,9 +8434,10 @@ async function getGitSummary() {
   const remoteResult = await runLocalCommand("git remote -v", { timeout: 5000 });
   const upstreamResult = await runLocalCommand("git rev-parse --abbrev-ref --symbolic-full-name @{upstream}", { timeout: 5000 });
 
-  const status = statusResult.output ? statusResult.output.split(/\r?\n/).slice(0, 80) : [];
+  const status = parseGitStatusOutput(statusResult.output);
   const remotes = remoteResult.output
     ? remoteResult.output.split(/\r?\n/)
+      .filter((line) => !isGitWarningLine(line))
       .map((line) => /^(\S+)\s+(\S+)\s+\((fetch|push)\)$/.exec(line))
       .filter(Boolean)
       .map((match) => ({ name: match[1], url: match[2], direction: match[3], provider: inferGitProvider(match[2]) }))
@@ -7889,7 +8447,7 @@ async function getGitSummary() {
     branch: branchResult.output,
     root: rootResult.output,
     status,
-    changedFiles: status.map((line) => line.slice(3).trim()).filter(Boolean),
+    changedFiles: changedFilesFromGitStatus(status),
     remotes,
     upstream: upstreamResult.ok ? upstreamResult.output : ""
   };
@@ -7899,9 +8457,183 @@ function inferGitProvider(remoteUrl = "") {
   const value = String(remoteUrl || "").toLowerCase();
   if (value.includes("github.com")) return "github";
   if (value.includes("gitlab.com")) return "gitlab";
+  if (value.includes("gitee.com")) return "gitee";
   if (value.includes("bitbucket.org")) return "bitbucket";
   if (value.includes("dev.azure.com") || value.includes("visualstudio.com")) return "azure-devops";
   return value ? "custom" : "";
+}
+
+function parseGitRemoteProject(remoteUrl = "") {
+  const raw = String(remoteUrl || "").trim();
+  if (!raw) return { provider: "", host: "", owner: "", repo: "", webUrl: "" };
+  const cleanRepo = (value = "") => value.replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+  const fromParts = (provider, host, owner, repo) => {
+    const normalizedRepo = cleanRepo(repo);
+    const webUrl = provider === "gitee" && owner && normalizedRepo
+      ? `https://gitee.com/${owner}/${normalizedRepo}`
+      : provider === "github" && owner && normalizedRepo
+        ? `https://github.com/${owner}/${normalizedRepo}`
+        : provider === "gitlab" && owner && normalizedRepo
+          ? `https://gitlab.com/${owner}/${normalizedRepo}`
+          : "";
+    return { provider, host, owner, repo: normalizedRepo, webUrl };
+  };
+  try {
+    const parsed = new URL(raw.replace(/^git@([^:]+):(.+)$/i, "ssh://git@$1/$2"));
+    const provider = inferGitProvider(parsed.hostname);
+    const parts = cleanRepo(decodeURIComponent(parsed.pathname || "")).split("/").filter(Boolean);
+    return fromParts(provider, parsed.hostname, parts[0] || "", parts.slice(1).join("/") || "");
+  } catch {
+    const scp = /^git@([^:]+):(.+)$/i.exec(raw);
+    if (scp) {
+      const provider = inferGitProvider(scp[1]);
+      const parts = cleanRepo(scp[2]).split("/").filter(Boolean);
+      return fromParts(provider, scp[1], parts[0] || "", parts.slice(1).join("/") || "");
+    }
+  }
+  return { provider: inferGitProvider(raw), host: "", owner: "", repo: "", webUrl: "" };
+}
+
+function primaryGitRemote(git = {}) {
+  return git.remotes?.find((item) => item.direction === "push")
+    || git.remotes?.find((item) => item.direction === "fetch")
+    || git.remotes?.[0]
+    || null;
+}
+
+async function readGitRemoteConfigSummary() {
+  const configPath = path.join(currentWorkspace, ".git", "config");
+  const text = await fs.readFile(configPath, "utf8").catch(() => "");
+  const remotes = [];
+  let currentRemote = "";
+  for (const line of text.split(/\r?\n/)) {
+    const section = /^\s*\[remote\s+"([^"]+)"\]\s*$/.exec(line);
+    if (section) {
+      currentRemote = section[1];
+      continue;
+    }
+    const url = /^\s*url\s*=\s*(.+?)\s*$/.exec(line);
+    if (currentRemote && url) {
+      remotes.push({
+        name: currentRemote,
+        url: url[1],
+        direction: "push",
+        provider: inferGitProvider(url[1])
+      });
+    }
+  }
+  const remote = primaryGitRemote({ remotes });
+  const remoteProject = parseGitRemoteProject(remote?.url || "");
+  return {
+    available: Boolean(text),
+    remotes,
+    primaryRemote: remote,
+    provider: remote?.provider || remoteProject.provider || "",
+    remoteProject
+  };
+}
+
+function buildRemoteProviderPermissionRows({ provider = "", remoteProject = {}, packages = null } = {}) {
+  const normalizedProvider = String(provider || remoteProject?.provider || "").toLowerCase();
+  const manualProvider = normalizedProvider === "gitee";
+  const remoteScope = remoteProject?.webUrl || "configuredRemotes";
+  const commonEvidence = [
+    "/api/pr-readiness",
+    "/api/remote-publish-plan",
+    "/api/remote-publish-preflight",
+    "/api/remote-publish-continuation",
+    "/api/remote-publish-evidence",
+    ".forge/remote-publish"
+  ];
+  const base = {
+    provider: "git-remote",
+    remoteProvider: normalizedProvider || "unknown",
+    manualProvider,
+    remoteProject: remoteProject || {},
+    scope: remoteScope,
+    writesRemote: false,
+    remoteWriteEnabled: false,
+    pushes: false,
+    createsRemotePr: false,
+    writesRemoteComments: false
+  };
+  const createAction = manualProvider
+    ? "create_gitee_pr_manual"
+    : normalizedProvider === "gitlab"
+      ? "create_gitlab_mr"
+      : normalizedProvider === "github"
+        ? "create_github_pr"
+        : "create_pr";
+  const commentAction = manualProvider
+    ? "comment_gitee_pr_manual"
+    : normalizedProvider === "gitlab"
+      ? "comment_gitlab_mr"
+      : normalizedProvider === "github"
+        ? "comment_github_pr"
+        : "comment_pr";
+  return [
+    {
+      ...base,
+      action: "read_pr_ci",
+      access: manualProvider ? "manual-evidence-read" : "remote-read-only",
+      requiresApproval: false,
+      requiresExternalExecution: manualProvider,
+      requiresExternalEvidence: manualProvider,
+      executesCommands: false,
+      writesFiles: true,
+      evidence: ["/api/pr-readiness", "/api/remote-pr-status", "/api/ci-status", ...commonEvidence]
+    },
+    {
+      ...base,
+      action: "push_branch",
+      access: "external-approval-required",
+      requiresApproval: true,
+      requiresExternalExecution: true,
+      requiresExternalEvidence: true,
+      executesCommands: false,
+      writesFiles: true,
+      actualRemoteWrite: "manual/external",
+      evidence: ["/api/remote-publish-plan", "/api/remote-publish-preflight", "/api/remote-publish-continuation", ".forge/approvals"]
+    },
+    {
+      ...base,
+      action: createAction,
+      access: manualProvider ? "manual-provider-external-action" : "external-cli-approval-required",
+      requiresApproval: true,
+      requiresExternalExecution: true,
+      requiresExternalEvidence: true,
+      executesCommands: false,
+      writesFiles: true,
+      actualRemoteWrite: "manual/external",
+      evidence: commonEvidence
+    },
+    {
+      ...base,
+      action: commentAction,
+      access: manualProvider ? "manual-provider-external-action" : "external-cli-approval-required",
+      requiresApproval: true,
+      requiresExternalExecution: true,
+      requiresExternalEvidence: true,
+      executesCommands: false,
+      writesFiles: true,
+      actualRemoteWrite: "manual/external",
+      evidence: commonEvidence
+    },
+    {
+      ...base,
+      action: "ingest_external_evidence",
+      access: "local-artifact-only",
+      requiresApproval: false,
+      requiresExternalExecution: false,
+      requiresExternalEvidence: false,
+      executesCommands: false,
+      writesFiles: true,
+      writesLocalArtifacts: true,
+      actualRemoteWrite: "none",
+      externalEvidencePackages: packages?.summary?.withExternalEvidence || 0,
+      evidence: ["/api/remote-publish-evidence", "external-evidence.json", "external-evidence-summary.md", ".forge/remote-publish"]
+    }
+  ];
 }
 
 async function findCiConfigs() {
@@ -8185,6 +8917,85 @@ function summarizeDebugFindings({ verificationPlan, ciStatus, processHealth, tra
   return findings;
 }
 
+function buildBrowserTraceTriage(trace = null) {
+  const findings = [];
+  const addFinding = (severity, area, message, evidence = "") => {
+    if (!message) return;
+    findings.push({
+      severity,
+      area,
+      message: String(message).slice(0, 500),
+      evidence: String(evidence || "").slice(0, 800)
+    });
+  };
+  if (!trace) {
+    return {
+      status: "not_captured",
+      counts: {},
+      findings: [],
+      nextActions: ["需要页面级调试时，填入本地 URL 并开启 Trace。"]
+    };
+  }
+  if (trace.ok === false) {
+    addFinding("error", "trace", "页面 Trace 采集失败。", trace.error || trace.reason || trace.url || trace.finalUrl || "");
+  }
+  for (const item of (Array.isArray(trace.exceptions) ? trace.exceptions : []).slice(0, 8)) {
+    const locationEvidence = (item.sourceLocations || [])
+      .map((location) => `${location.path}:${location.line}:${location.column}`)
+      .join(" · ");
+    addFinding("error", "exception", item.text || item.message || item.description || "浏览器运行时异常。", locationEvidence || item.stack || item.url || "");
+  }
+  for (const item of (Array.isArray(trace.console) ? trace.console : [])) {
+    const level = String(item.type || item.level || "").toLowerCase();
+    if (!/error|warning|warn|assert/.test(level)) continue;
+    addFinding(level.includes("error") || level.includes("assert") ? "error" : "warn", "console", item.text || item.message || "console 异常输出。", item.location || item.url || "");
+    if (findings.filter((finding) => finding.area === "console").length >= 8) break;
+  }
+  for (const item of (Array.isArray(trace.network) ? trace.network : [])) {
+    const status = Number(item.status || 0);
+    if (!item.failed && status < 400) continue;
+    addFinding(status >= 500 || item.failed ? "error" : "warn", "network", `${item.method || "GET"} ${item.url || item.requestUrl || ""}`.trim(), item.errorText || item.failure || (status ? `HTTP ${status}` : ""));
+    if (findings.filter((finding) => finding.area === "network").length >= 8) break;
+  }
+  if (!findings.length && trace.ok !== false) {
+    addFinding("pass", "browser", "未发现明显浏览器异常。", trace.finalUrl || trace.url || "");
+  }
+  const priority = { error: 3, warn: 2, review: 1, pass: 0 };
+  findings.sort((a, b) => (priority[b.severity] || 0) - (priority[a.severity] || 0));
+  const counts = findings.reduce((acc, item) => {
+    acc[item.severity] = (acc[item.severity] || 0) + 1;
+    return acc;
+  }, {});
+  const status = findings.some((item) => item.severity === "error")
+    ? "error"
+    : findings.some((item) => item.severity === "warn")
+      ? "warn"
+      : "pass";
+  const nextActions = status === "error"
+    ? [
+      "优先处理浏览器 error：runtime exception、console error、5xx 或 failed network。",
+      "修复后重新运行页面检查和 Trace，确认 error 数量归零。",
+      "如果异常来自 API 响应，同时运行后端语法检查和 debug smoke。"
+    ]
+    : status === "warn"
+      ? [
+        "复核 warning 是否影响当前功能路径。",
+        "修复或确认误报后重跑页面 Trace。",
+        "保留 warning 处置说明，避免后续调试重复追查。"
+      ]
+      : [
+        "继续验证目标功能路径。",
+        "需要 UI 回归保护时再跑截图、DOM 或视觉断言。",
+        "保留 Trace artifact 作为本轮页面健康证据。"
+      ];
+  return {
+    status,
+    counts,
+    findings: findings.slice(0, 16),
+    nextActions
+  };
+}
+
 function countSemanticDiagnosticIssues(semanticDiagnostics) {
   const summary = semanticDiagnostics?.summary || {};
   const summaryCount = Number(summary.issues ?? summary.total ?? summary.count ?? 0);
@@ -8192,7 +9003,7 @@ function countSemanticDiagnosticIssues(semanticDiagnostics) {
   return (semanticDiagnostics?.diagnostics || semanticDiagnostics?.items || []).length;
 }
 
-function buildDebugNextActions({ verificationPlan, processHealth, trace, findings, checksResult }) {
+function buildDebugNextActions({ verificationPlan, processHealth, trace, traceTriage = null, findings, checksResult }) {
   const actions = [];
   const addAction = (action) => {
     const normalized = {
@@ -8258,6 +9069,19 @@ function buildDebugNextActions({ verificationPlan, processHealth, trace, finding
   }
   if (trace && ((trace.summary?.exceptions || 0) || (trace.console || []).length)) {
     const failedNetwork = (trace.network || []).filter((item) => item.failed || item.status >= 400).slice(0, 4);
+    const traceSourceLocations = extractBrowserTraceSourceLocations(trace, 8);
+    if (traceSourceLocations.length) {
+      addAction({
+        id: "inspect-browser-source",
+        label: "定位浏览器异常源码",
+        priority: 99,
+        kind: "inspect",
+        command: "",
+        target: traceSourceLocations.map((item) => `${item.path}:${item.line}`).join(", "),
+        description: "把 Runtime exception 或 console error 的 URL/行号映射回工作区文件，优先读取附近源码修复。",
+        evidence: traceSourceLocations.map((item) => `${item.path}:${item.line}:${item.column}`).slice(0, 6)
+      });
+    }
     addAction({
       id: "inspect-browser-trace",
       label: "查看页面 Trace",
@@ -8270,6 +9094,38 @@ function buildDebugNextActions({ verificationPlan, processHealth, trace, finding
         `${trace.summary?.exceptions || 0} exceptions`,
         `${(trace.console || []).length} console entries`,
         ...failedNetwork.map((item) => `${item.status || "FAIL"} ${item.url || ""}`)
+      ]
+    });
+  }
+  if (traceTriage?.findings?.some((item) => item.severity === "error")) {
+    const firstError = traceTriage.findings.find((item) => item.severity === "error");
+    addAction({
+      id: "inspect-browser-triage",
+      label: "按异常分诊查页面",
+      priority: 97,
+      kind: "inspect",
+      command: "",
+      target: trace?.artifactPath || trace?.finalUrl || trace?.url || "",
+      description: "按浏览器异常分诊优先处理 runtime exception、console error、失败网络或页面检查错误。",
+      evidence: [
+        `${traceTriage.counts?.error || 0} browser errors`,
+        firstError ? `${firstError.area}: ${firstError.message}` : "",
+        ...(traceTriage.nextActions || []).slice(0, 2)
+      ]
+    });
+  } else if (traceTriage?.findings?.some((item) => item.severity === "warn")) {
+    const firstWarn = traceTriage.findings.find((item) => item.severity === "warn");
+    addAction({
+      id: "review-browser-triage",
+      label: "复核页面 warning",
+      priority: 83,
+      kind: "inspect",
+      command: "",
+      target: trace?.artifactPath || trace?.finalUrl || trace?.url || "",
+      description: "页面 Trace 没有 error，但存在 warning，需要确认是否影响当前功能路径。",
+      evidence: [
+        `${traceTriage.counts?.warn || 0} browser warnings`,
+        firstWarn ? `${firstWarn.area}: ${firstWarn.message}` : ""
       ]
     });
   }
@@ -8352,6 +9208,8 @@ async function buildDebugDiagnostics({
   });
   const severityRank = { error: 3, warn: 2, info: 1 };
   findings.sort((a, b) => (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0));
+  const browserTriage = buildBrowserTraceTriage(trace);
+  const browserSourceLocations = extractBrowserTraceSourceLocations(trace, max);
   const status = findings.some((item) => item.severity === "error")
     ? "failing"
     : findings.some((item) => item.severity === "warn")
@@ -8369,10 +9227,14 @@ async function buildDebugDiagnostics({
       checksRun: Boolean(runChecks),
       processRows: processHealth.rows?.length || 0,
       traceCaptured: Boolean(trace),
+      browserTriageStatus: browserTriage.status,
+      browserSourceLocations: browserSourceLocations.length,
       semanticIssues: countSemanticDiagnosticIssues(semanticDiagnostics)
     },
     findings,
-    nextActions: buildDebugNextActions({ verificationPlan, processHealth, trace, findings, checksResult }),
+    browserTriage,
+    browserSourceLocations,
+    nextActions: buildDebugNextActions({ verificationPlan, processHealth, trace, traceTriage: browserTriage, findings, checksResult }),
     verificationPlan: {
       status: verificationPlan.status,
       summary: verificationPlan.summary,
@@ -8566,11 +9428,37 @@ async function readGitlabRemoteStatus(git) {
   };
 }
 
+async function readGiteeRemoteStatus(git) {
+  const remote = primaryGitRemote(git);
+  const project = parseGitRemoteProject(remote?.url || "");
+  return {
+    provider: "gitee",
+    available: false,
+    authenticated: false,
+    reason: project.webUrl
+      ? `已识别 Gitee 仓库 ${project.webUrl}；当前仅生成本地只读准备包，不调用 Gitee API 或执行远端写入。请在发布继续包中回填 Pull Request / CI / 评论链接。`
+      : "已识别 Gitee remote；当前仅生成本地只读准备包，不调用 Gitee API 或执行远端写入。",
+    cli: "",
+    project,
+    pr: null,
+    checks: [],
+    summary: {
+      totalChecks: 0,
+      failingChecks: 0,
+      manualProvider: true,
+      projectUrl: project.webUrl || ""
+    },
+    nextActions: [
+      project.webUrl ? `在 Gitee 打开仓库：${project.webUrl}` : "确认 Gitee 仓库地址。",
+      "人工创建或更新 Pull Request 后，把 PR 链接、CI 链接和评论链接填入 external-evidence-template.json。",
+      "回到本地运行 publish/gates smoke 作为发布前复查。"
+    ]
+  };
+}
+
 async function readRemotePrStatus(git = null) {
   const summary = git || await getGitSummary();
-  const provider = summary.remotes?.find((item) => item.direction === "push")?.provider
-    || summary.remotes?.[0]?.provider
-    || "";
+  const provider = primaryGitRemote(summary)?.provider || "";
   if (!summary.available) {
     return {
       provider: "",
@@ -8580,6 +9468,12 @@ async function readRemotePrStatus(git = null) {
       pr: null,
       checks: [],
       policy: { access: "remote-read-only", pushes: false, createsRemotePr: false }
+    };
+  }
+  if (provider === "gitee") {
+    return {
+      ...await readGiteeRemoteStatus(summary),
+      policy: { access: "remote-read-only", pushes: false, createsRemotePr: false, manualProvider: true }
     };
   }
   if (provider === "github") {
@@ -8607,25 +9501,34 @@ async function readRemotePrStatus(git = null) {
 
 async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
   const evidence = await getCurrentDiffEvidence({ includeDiff: deep });
-  const git = deep ? await getGitSummary() : evidence.git;
+  const liveGit = await getGitSummary().catch(() => null);
+  const git = liveGit?.available
+    ? {
+        ...evidence.git,
+        ...liveGit,
+        changedFiles: liveGit.changedFiles?.length ? liveGit.changedFiles : (evidence.git?.changedFiles || [])
+      }
+    : evidence.git;
   const ci = await findCiConfigs();
   const verificationPlan = await buildVerificationPlan({ limit: 12 });
   const tasks = await listTaskLogs(5);
   const checks = tasks.flatMap((task) => task.checks || []).slice(0, 12);
   const reviews = await listReviewArtifacts(5);
-  const provider = git.remotes?.find((item) => item.direction === "push")?.provider
-    || git.remotes?.[0]?.provider
-    || "";
+  const remoteProject = parseGitRemoteProject(primaryGitRemote(git)?.url || "");
+  const provider = primaryGitRemote(git)?.provider || "";
   const remote = deep
     ? await readRemotePrStatus(git)
     : {
       provider,
       available: false,
       authenticated: false,
-      reason: "默认 PR readiness 跳过远端 CLI 探测；使用 /api/pr-readiness?deep=1 执行远端 PR/CI 读取。",
+      reason: provider === "gitee"
+        ? "已识别 Gitee remote；默认 PR readiness 不调用 Gitee API，使用发布继续包回填 PR/CI/评论链接。"
+        : "默认 PR readiness 跳过远端 CLI 探测；使用 /api/pr-readiness?deep=1 执行远端 PR/CI 读取。",
+      project: remoteProject,
       pr: null,
       checks: [],
-      policy: { access: "remote-read-only", pushes: false, createsRemotePr: false, skipped: true }
+      policy: { access: "remote-read-only", pushes: false, createsRemotePr: false, skipped: true, manualProvider: provider === "gitee" }
     };
   const title = String(prompt || tasks[0]?.prompt || `Forge changes on ${git.branch || "workspace"}`).trim();
   const changedFiles = git.changedFiles || [];
@@ -8644,8 +9547,9 @@ async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
       `Workspace: ${currentWorkspace}`,
       `Branch: ${git.branch || "n/a"}`,
       `Remote provider: ${provider || "unknown"}`,
+      remoteProject.webUrl ? `Remote project: ${remoteProject.webUrl}` : "",
       `Changed files: ${changedFiles.length}`
-    ]),
+    ].filter(Boolean)),
     "",
     "## Changed Files",
     markdownList(changedFiles),
@@ -8682,6 +9586,7 @@ async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
     status: blockers.length ? "needs_attention" : "ready",
     title,
     provider,
+    remoteProject,
     git,
     remotes: git.remotes || [],
     ci,
@@ -8704,7 +9609,8 @@ async function buildPullRequestReadiness(prompt = "", { deep = false } = {}) {
       scope: "currentWorkspace",
       pushes: false,
       createsRemotePr: false,
-      readsRemoteCi: Boolean(remote.available)
+      readsRemoteCi: Boolean(remote.available),
+      manualProvider: provider === "gitee"
       ,
       deep
     }
@@ -8715,9 +9621,10 @@ async function buildRemotePublishPlan(prompt = "") {
   const readiness = await buildPullRequestReadiness(prompt);
   const git = readiness.git || await getGitSummary();
   const provider = readiness.provider || "";
+  const remoteProject = readiness.remoteProject || parseGitRemoteProject(primaryGitRemote(git)?.url || "");
+  const providerPolicy = buildRemoteProviderPermissionRows({ provider, remoteProject });
   const branch = git.branch || "current-branch";
-  const pushRemote = git.remotes?.find((item) => item.direction === "push")?.name
-    || git.remotes?.[0]?.name
+  const pushRemote = primaryGitRemote(git)?.name
     || "origin";
   const commands = [];
   const notes = [];
@@ -8737,6 +9644,7 @@ async function buildRemotePublishPlan(prompt = "") {
     `Workspace: ${currentWorkspace}`,
     `Branch: ${branch}`,
     `Provider: ${provider || "unknown"}`,
+    remoteProject.webUrl ? `Remote project: ${remoteProject.webUrl}` : "",
     latestReview ? `Latest review: ${latestReview.id}` : "Latest review: none",
     "",
     "## Readiness",
@@ -8802,10 +9710,33 @@ async function buildRemotePublishPlan(prompt = "") {
         label: "Create GitLab MR",
         command: `glab mr create --draft --title "${title.replace(/"/g, "\\\"")}" --description "$(Get-Content ${quotePath(prBodyPath)} -Raw)"`,
         risk: "high",
-        requiresApproval: true,
-        reason: "Creates a remote GitLab MR from the current branch."
+      requiresApproval: true,
+      reason: "Creates a remote GitLab MR from the current branch."
       });
     }
+  } else if (provider === "gitee") {
+    const compareUrl = remoteProject.webUrl
+      ? `${remoteProject.webUrl}/compare/${encodeURIComponent(branch)}...master`
+      : "";
+    commands.push({
+      id: "create-gitee-pr-manual",
+      label: "Create Gitee PR manually",
+      command: compareUrl ? `manual:gitee-pr ${compareUrl}` : "manual:gitee-pr",
+      risk: "high",
+      requiresApproval: true,
+      manual: true,
+      reason: "Open Gitee manually after push, create a Pull Request, then paste PR/CI/comment URLs into the continuation evidence template."
+    });
+    commands.push({
+      id: "comment-gitee-pr-manual",
+      label: "Comment on Gitee PR manually",
+      command: `manual:gitee-comment ${quotePath(reviewSummaryPath)}`,
+      risk: "high",
+      requiresApproval: true,
+      manual: true,
+      reason: "Copy the generated review summary into the Gitee Pull Request comment box and record the resulting comment URL in the evidence template."
+    });
+    notes.push("Gitee is recognized as a manual-provider path: Forge generates publish artifacts, but does not call Gitee APIs or write remote PR comments.");
   } else {
     notes.push(provider ? `Remote provider ${provider} is not supported for publish planning yet.` : "No recognized remote provider for PR/MR creation.");
   }
@@ -8815,6 +9746,7 @@ async function buildRemotePublishPlan(prompt = "") {
     workspace: currentWorkspace,
     status: commands.length ? "approval_required" : "needs_attention",
     provider,
+    remoteProject,
     title,
     body,
     package: {
@@ -8832,6 +9764,7 @@ async function buildRemotePublishPlan(prompt = "") {
     },
     commands,
     notes,
+    providerPolicy,
     policy: {
       access: "approval-plan-only",
       executesCommands: false,
@@ -8868,6 +9801,8 @@ async function listRemotePublishPackages({ limit = 20 } = {}) {
     const plan = await readJsonOrNull(path.join(packageDir, "plan.json"));
     if (!plan || plan.workspace !== currentWorkspace) continue;
     const approval = approvals.find((item) => item.type === "remote_publish_plan" && item.command === (plan.commands || []).map((command) => command.command).join("\n"));
+    const externalEvidence = await readJsonOrNull(path.join(packageDir, "external-evidence.json"));
+    const externalEvidenceSummary = summarizeRemotePublishEvidence(externalEvidence);
     packages.push({
       id: entry.name,
       generatedAt: plan.generatedAt || "",
@@ -8880,11 +9815,15 @@ async function listRemotePublishPackages({ limit = 20 } = {}) {
       remoteAvailable: Boolean(plan.readiness?.remoteAvailable),
       approvalId: approval?.id || "",
       approvalStatus: approval?.status || "",
+      externalEvidence: externalEvidenceSummary,
+      externalEvidenceStatus: externalEvidenceSummary?.status || "",
       paths: {
         dir: toPosix(path.relative(APP_ROOT, packageDir)),
         plan: toPosix(path.relative(APP_ROOT, path.join(packageDir, "plan.json"))),
         prBody: toPosix(path.relative(APP_ROOT, path.join(packageDir, "pr-body.md"))),
-        reviewSummary: toPosix(path.relative(APP_ROOT, path.join(packageDir, "review-summary.md")))
+        reviewSummary: toPosix(path.relative(APP_ROOT, path.join(packageDir, "review-summary.md"))),
+        externalEvidence: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(packageDir, "external-evidence.json"))) : "",
+        externalEvidenceSummary: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(packageDir, "external-evidence-summary.md"))) : ""
       }
     });
   }
@@ -8894,7 +9833,9 @@ async function listRemotePublishPackages({ limit = 20 } = {}) {
     summary: {
       total: packages.length,
       approvalRequired: packages.filter((item) => item.status === "approval_required").length,
-      withApproval: packages.filter((item) => item.approvalId).length
+      withApproval: packages.filter((item) => item.approvalId).length,
+      withExternalEvidence: packages.filter((item) => item.externalEvidence).length,
+      readyExternalEvidence: packages.filter((item) => item.externalEvidence?.status === "ready").length
     },
     packages: packages
       .sort((left, right) => String(right.generatedAt).localeCompare(String(left.generatedAt)))
@@ -8906,6 +9847,27 @@ async function listRemotePublishPackages({ limit = 20 } = {}) {
       createsRemotePr: false,
       writesRemoteComments: false
     }
+  };
+}
+
+function summarizeRemotePublishEvidence(artifact = null) {
+  if (!artifact || typeof artifact !== "object") return null;
+  const external = artifact.evidence?.externalExecution || {};
+  return {
+    generatedAt: artifact.generatedAt || "",
+    packageId: artifact.packageId || "",
+    provider: artifact.provider || artifact.evidence?.provider || "",
+    status: artifact.status || "",
+    remoteUrl: external.remoteUrl || "",
+    prOrMrNumber: external.prOrMrNumber || "",
+    ciUrl: external.ciUrl || "",
+    reviewCommentUrl: external.reviewCommentUrl || "",
+    executedBy: external.executedBy || "",
+    executedAt: external.executedAt || "",
+    blockers: artifact.validation?.blockers || [],
+    warnings: artifact.validation?.warnings || [],
+    summary: artifact.validation?.summary || {},
+    paths: artifact.paths || {}
   };
 }
 
@@ -8922,18 +9884,23 @@ async function readRemotePublishPackage(id = "") {
   if (!plan || plan.workspace !== currentWorkspace) throw new Error("未找到当前工作区的 remote publish package。");
   const prBody = await fs.readFile(path.join(full, "pr-body.md"), "utf8").catch(() => "");
   const reviewSummary = await fs.readFile(path.join(full, "review-summary.md"), "utf8").catch(() => "");
+  const externalEvidence = await readJsonOrNull(path.join(full, "external-evidence.json"));
+  const externalEvidenceSummary = summarizeRemotePublishEvidence(externalEvidence);
   return {
     id,
     generatedAt: plan.generatedAt || "",
     workspace: plan.workspace || "",
     plan,
+    externalEvidence: externalEvidenceSummary,
     prBody: prBody.slice(0, 60000),
     reviewSummary: reviewSummary.slice(0, 60000),
     paths: {
       dir: toPosix(path.relative(APP_ROOT, full)),
       plan: toPosix(path.relative(APP_ROOT, path.join(full, "plan.json"))),
       prBody: toPosix(path.relative(APP_ROOT, path.join(full, "pr-body.md"))),
-      reviewSummary: toPosix(path.relative(APP_ROOT, path.join(full, "review-summary.md")))
+      reviewSummary: toPosix(path.relative(APP_ROOT, path.join(full, "review-summary.md"))),
+      externalEvidence: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(full, "external-evidence.json"))) : "",
+      externalEvidenceSummary: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(full, "external-evidence-summary.md"))) : ""
     },
     policy: {
       access: "local-read-only",
@@ -8981,6 +9948,18 @@ async function probeRemotePublishCli(provider = "", { deep = false } = {}) {
         : cli.output
     };
   }
+  if (normalizedProvider === "gitee") {
+    return {
+      provider: "gitee",
+      cli: "",
+      installed: false,
+      authenticated: false,
+      authChecked: false,
+      version: "",
+      manualProvider: true,
+      reason: "Gitee publish is handled through manual continuation evidence; no local Gitee CLI/API probe is executed."
+    };
+  }
   return {
     provider: normalizedProvider || "unknown",
     cli: "",
@@ -9022,16 +10001,24 @@ async function buildRemotePublishPreflight({ id = "", limit = 20, deep = false }
     };
   });
   const cli = plan?.provider && deep ? await probeRemotePublishCli(plan.provider, { deep }) : {
-    provider: "",
+    provider: plan?.provider || "",
     cli: plan?.provider === "github" ? "gh" : plan?.provider === "gitlab" ? "glab" : "",
     installed: false,
     authenticated: false,
     authChecked: false,
     version: "",
+    manualProvider: plan?.provider === "gitee",
     reason: plan?.provider
-      ? "CLI probing skipped in shallow preflight; pass deep=1 to check installation and authentication."
+      ? (plan.provider === "gitee"
+        ? "Gitee publish uses manual continuation evidence; no Gitee CLI/API probe is executed."
+        : "CLI probing skipped in shallow preflight; pass deep=1 to check installation and authentication.")
       : "No package provider to probe."
   };
+  const providerPolicy = buildRemoteProviderPermissionRows({
+    provider: plan?.provider || "",
+    remoteProject: plan?.remoteProject || {},
+    packages: packageIndex
+  });
   const remote = deep ? await readRemotePrStatus(git).catch((error) => ({
     provider: plan?.provider || "",
     available: false,
@@ -9054,8 +10041,8 @@ async function buildRemotePublishPreflight({ id = "", limit = 20, deep = false }
   if (detail && deep && !git.available) blockers.push("Current workspace is not a Git repository.");
   if (detail && deep && !git.branch) blockers.push("Current Git branch could not be resolved.");
   if (detail && deep && !git.remotes?.length) blockers.push("No Git remote is configured.");
-  if (detail && deep && plan?.provider && !cli.installed) blockers.push(`Required CLI is not installed for ${plan.provider}.`);
-  if (detail && plan?.provider && deep && cli.installed && !cli.authenticated) blockers.push(`Required CLI is not authenticated for ${plan.provider}.`);
+  if (detail && deep && plan?.provider && !cli.manualProvider && !cli.installed) blockers.push(`Required CLI is not installed for ${plan.provider}.`);
+  if (detail && plan?.provider && deep && !cli.manualProvider && cli.installed && !cli.authenticated) blockers.push(`Required CLI is not authenticated for ${plan.provider}.`);
   if (detail && commandChecks.some((item) => item.policy.allowed)) blockers.push("At least one remote publish command unexpectedly passes local safe-command policy.");
   const status = !detail ? "needs_package" : blockers.length ? "blocked" : "ready_for_external_execution";
   return {
@@ -9084,6 +10071,7 @@ async function buildRemotePublishPreflight({ id = "", limit = 20, deep = false }
     },
     cli,
     remote,
+    providerPolicy,
     commandChecks,
     blockers,
     summary: {
@@ -9101,9 +10089,306 @@ async function buildRemotePublishPreflight({ id = "", limit = 20, deep = false }
       pushes: false,
       createsRemotePr: false,
       writesRemoteComments: false,
-      requiresExplicitApproval: true
+      requiresExplicitApproval: true,
+      providerActions: providerPolicy.map((item) => item.action),
+      manualProvider: providerPolicy.some((item) => item.manualProvider)
     }
   };
+}
+
+function remotePublishContinuationCommands(preflight = {}) {
+  return [
+    { command: "node --check server.js", reason: "复查远端发布包、预检和继续包接口语法。" },
+    { command: "node --check app.js", reason: "复查远端发布继续包前端入口语法。" },
+    { command: "node server.js --ui-smoke-test", reason: "确认发布继续包按钮和提示入口仍被 UI smoke 覆盖。" },
+    { command: "node server.js --api-smoke-section=publish", reason: "复查 PR readiness、发布审批、预检和继续包只读链路。" },
+    { command: "node server.js --api-smoke-section=core", reason: "复查审批状态、健康接口和核心恢复链路。" },
+    ...(preflight?.status === "ready_for_external_execution"
+      ? [{ command: "node server.js --api-smoke-section=debug", reason: "远端人工执行后，继续用调试 smoke 复查失败证据入口。" }]
+      : [])
+  ];
+}
+
+async function buildRemotePublishContinuation({ id = "", limit = 20, deep = false } = {}) {
+  const preflight = await buildRemotePublishPreflight({ id, limit, deep });
+  const detail = preflight.packageId ? await readRemotePublishPackage(preflight.packageId) : null;
+  const packageDir = detail?.paths?.dir ? path.join(APP_ROOT, detail.paths.dir) : "";
+  const continuationPath = packageDir ? path.join(packageDir, "continuation.md") : "";
+  const evidenceTemplatePath = packageDir ? path.join(packageDir, "external-evidence-template.json") : "";
+  const commands = detail?.plan?.commands || [];
+  const manualSteps = commands.map((item, index) => ({
+    order: index + 1,
+    id: item.id || `remote-command-${index + 1}`,
+    label: item.label || item.id || `Remote command ${index + 1}`,
+    command: item.command || "",
+    risk: item.risk || "high",
+    requiresApproval: item.requiresApproval !== false,
+    reason: item.reason || "Remote write action requires external approval."
+  }));
+  const evidenceTemplate = {
+    packageId: preflight.packageId || "",
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    provider: preflight.package?.provider || detail?.plan?.provider || "",
+    approval: preflight.approval || {},
+    statusToFill: "pending_external_execution",
+    externalExecution: {
+      executedBy: "",
+      executedAt: "",
+      commandsRun: manualSteps.map((item) => ({ id: item.id, command: item.command, status: "", outputSummary: "" })),
+      remoteUrl: "",
+      prOrMrNumber: "",
+      ciUrl: "",
+      reviewCommentUrl: "",
+      rollbackPlan: "",
+      notes: ""
+    },
+    localFollowUp: {
+      verificationCommands: remotePublishContinuationCommands(preflight),
+      expectedArtifacts: [
+        detail?.paths?.prBody || "",
+        detail?.paths?.reviewSummary || "",
+        detail?.paths?.plan || "",
+        "external-evidence-template.json",
+        "continuation.md"
+      ].filter(Boolean)
+    },
+    policy: {
+      access: "local-artifact-only",
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      requiresManualExternalExecution: true
+    }
+  };
+  const continuationMarkdown = [
+    `# Remote Publish Continuation - ${preflight.packageId || "none"}`,
+    "",
+    `Workspace: ${currentWorkspace}`,
+    `Package: ${preflight.packageId || ""}`,
+    `Provider: ${preflight.package?.provider || detail?.plan?.provider || "unknown"}`,
+    `Approval: ${preflight.approval?.id || ""} (${preflight.approval?.status || "unknown"})`,
+    `Preflight: ${preflight.status || "unknown"}`,
+    "",
+    "## Manual External Actions",
+    manualSteps.length
+      ? manualSteps.map((item) => [
+          `${item.order}. ${item.label}`,
+          `   - Command: \`${item.command}\``,
+          `   - Risk: ${item.risk}`,
+          `   - Reason: ${item.reason}`
+        ].join("\n")).join("\n")
+      : "- No remote command was generated.",
+    "",
+    "## Blockers",
+    preflight.blockers?.length ? markdownList(preflight.blockers) : "- No preflight blockers reported.",
+    "",
+    "## Evidence To Fill After Manual Execution",
+    "- executedBy",
+    "- executedAt",
+    "- commandsRun[].status and outputSummary",
+    "- remoteUrl / prOrMrNumber / ciUrl / reviewCommentUrl",
+    "- rollbackPlan",
+    "- notes",
+    "",
+    "## Local Follow-Up Verification",
+    remotePublishContinuationCommands(preflight).map((item) => `- \`${item.command}\` - ${item.reason}`).join("\n"),
+    "",
+    "## Safety Policy",
+    "- This artifact does not execute git push, create PR/MR, or write remote comments.",
+    "- Use it to hand off manual external execution and bring the resulting evidence back into the local gate."
+  ].join("\n");
+  if (packageDir) {
+    await fs.mkdir(packageDir, { recursive: true });
+    await fs.writeFile(continuationPath, continuationMarkdown, "utf8");
+    await fs.writeFile(evidenceTemplatePath, JSON.stringify(evidenceTemplate, null, 2), "utf8");
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status: preflight.status === "ready_for_external_execution" ? "ready_for_manual_external_execution" : "needs_attention",
+    packageId: preflight.packageId || "",
+    package: preflight.package || null,
+    approval: preflight.approval || {},
+    preflight: {
+      status: preflight.status,
+      summary: preflight.summary,
+      blockers: preflight.blockers,
+      cli: preflight.cli,
+      remote: {
+        provider: preflight.remote?.provider || "",
+        available: Boolean(preflight.remote?.available),
+        authenticated: Boolean(preflight.remote?.authenticated),
+        reason: preflight.remote?.reason || ""
+      }
+    },
+    manualSteps,
+    evidenceTemplate,
+    providerPolicy: detail?.plan?.providerPolicy || buildRemoteProviderPermissionRows({
+      provider: preflight.package?.provider || detail?.plan?.provider || "",
+      remoteProject: detail?.plan?.remoteProject || {}
+    }),
+    verificationCommands: remotePublishContinuationCommands(preflight),
+    paths: packageDir ? {
+      continuation: toPosix(path.relative(APP_ROOT, continuationPath)),
+      evidenceTemplate: toPosix(path.relative(APP_ROOT, evidenceTemplatePath)),
+      prBody: detail?.paths?.prBody || "",
+      reviewSummary: detail?.paths?.reviewSummary || "",
+      plan: detail?.paths?.plan || ""
+    } : {},
+    policy: {
+      access: "local-artifact-only",
+      writesLocalArtifacts: Boolean(packageDir),
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      requiresManualExternalExecution: true,
+      providerActions: (detail?.plan?.providerPolicy || []).map((item) => item.action),
+      manualProvider: Boolean(preflight.cli?.manualProvider || detail?.plan?.provider === "gitee")
+    }
+  };
+}
+
+function remotePublishEvidenceVerificationCommands(evidence = {}) {
+  const commands = [
+    { command: "node --check server.js", reason: "复查远端证据回填、发布包和门禁接口语法。" },
+    { command: "node --check app.js", reason: "复查远端证据回填前端入口语法。" },
+    { command: "node server.js --api-smoke-section=publish", reason: "复查远端发布、继续包和证据回填链路。" },
+    { command: "node server.js --api-smoke-section=gates", reason: "复查 PR readiness、CI 状态和合并门禁汇总。" }
+  ];
+  if (evidence?.externalExecution?.ciUrl || evidence?.externalExecution?.remoteUrl) {
+    commands.push({ command: "node server.js --api-smoke-section=core", reason: "回填远端证据后复查核心恢复状态。" });
+  }
+  return commands;
+}
+
+function validateRemotePublishExternalEvidence(evidence = {}, detail = null) {
+  const external = evidence.externalExecution || {};
+  const commandsRun = Array.isArray(external.commandsRun) ? external.commandsRun : [];
+  const warnings = [];
+  const blockers = [];
+  const addMissing = (field, label) => {
+    if (!String(field || "").trim()) blockers.push(`${label} 未回填。`);
+  };
+  addMissing(external.executedBy, "执行人 executedBy");
+  addMissing(external.executedAt, "执行时间 executedAt");
+  if (!String(external.remoteUrl || external.prOrMrNumber || "").trim()) blockers.push("remoteUrl 或 prOrMrNumber 至少需要回填一项。");
+  if (!String(external.ciUrl || "").trim()) warnings.push("ciUrl 未回填，无法把远端 CI 证据纳入门禁。");
+  if (!String(external.reviewCommentUrl || "").trim()) warnings.push("reviewCommentUrl 未回填，无法证明评论/回写动作已完成。");
+  if (!String(external.rollbackPlan || "").trim()) blockers.push("rollbackPlan 未回填。");
+  if (!commandsRun.length) {
+    blockers.push("commandsRun 为空，无法确认外部动作状态。");
+  } else {
+    const incomplete = commandsRun.filter((item) => !String(item.status || "").trim());
+    if (incomplete.length) blockers.push(`${incomplete.length} 个 commandsRun.status 未回填。`);
+    const failed = commandsRun.filter((item) => /fail|error|blocked|cancel/i.test(String(item.status || "")));
+    if (failed.length) blockers.push(`${failed.length} 个外部动作状态为失败或阻塞。`);
+  }
+  if (detail && evidence.packageId && evidence.packageId !== detail.id) blockers.push(`回填 packageId ${evidence.packageId} 与当前发布包 ${detail.id} 不一致。`);
+  return {
+    status: blockers.length ? "needs_attention" : warnings.length ? "ready_with_warnings" : "ready",
+    blockers,
+    warnings,
+    summary: {
+      commands: commandsRun.length,
+      completedCommands: commandsRun.filter((item) => /done|pass|success|completed|ok/i.test(String(item.status || ""))).length,
+      hasRemoteUrl: Boolean(String(external.remoteUrl || "").trim()),
+      hasPrOrMrNumber: Boolean(String(external.prOrMrNumber || "").trim()),
+      hasCiUrl: Boolean(String(external.ciUrl || "").trim()),
+      hasReviewCommentUrl: Boolean(String(external.reviewCommentUrl || "").trim()),
+      hasRollbackPlan: Boolean(String(external.rollbackPlan || "").trim())
+    }
+  };
+}
+
+async function buildRemotePublishEvidence({ id = "", evidence = null, limit = 20 } = {}) {
+  const detail = await readRemotePublishPackage(id || "");
+  const packageDir = detail?.paths?.dir ? path.join(APP_ROOT, detail.paths.dir) : "";
+  const templatePath = path.join(packageDir, "external-evidence-template.json");
+  const evidencePath = path.join(packageDir, "external-evidence.json");
+  const summaryPath = path.join(packageDir, "external-evidence-summary.md");
+  const sourceEvidence = evidence && typeof evidence === "object"
+    ? evidence
+    : await readJsonOrNull(templatePath);
+  if (!sourceEvidence || typeof sourceEvidence !== "object") {
+    throw new Error("未找到可读取的 external-evidence-template.json，请先生成继续包或在请求中提供 evidence。");
+  }
+  const normalized = {
+    ...sourceEvidence,
+    packageId: sourceEvidence.packageId || detail.id,
+    ingestedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    provider: sourceEvidence.provider || detail.plan?.provider || "",
+    source: evidence ? "request-body" : "external-evidence-template.json"
+  };
+  const validation = validateRemotePublishExternalEvidence(normalized, detail);
+  const verificationCommands = remotePublishEvidenceVerificationCommands(normalized).slice(0, Math.max(1, Number(limit) || 20));
+  const artifact = {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    packageId: detail.id,
+    provider: normalized.provider || "",
+    status: validation.status,
+    evidence: normalized,
+    validation,
+    providerPolicy: detail?.plan?.providerPolicy || buildRemoteProviderPermissionRows({
+      provider: normalized.provider || detail.plan?.provider || "",
+      remoteProject: detail.plan?.remoteProject || {}
+    }),
+    verificationCommands,
+    paths: {
+      packageDir: detail.paths.dir,
+      template: toPosix(path.relative(APP_ROOT, templatePath)),
+      evidence: toPosix(path.relative(APP_ROOT, evidencePath)),
+      summary: toPosix(path.relative(APP_ROOT, summaryPath)),
+      prBody: detail.paths.prBody,
+      reviewSummary: detail.paths.reviewSummary,
+      plan: detail.paths.plan
+    },
+    policy: {
+      access: "local-artifact-only",
+      writesLocalArtifacts: true,
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      readsRemoteProvider: false,
+      providerActions: (detail?.plan?.providerPolicy || []).map((item) => item.action),
+      manualProvider: Boolean((normalized.provider || detail.plan?.provider || "") === "gitee")
+    }
+  };
+  const external = normalized.externalExecution || {};
+  const summaryMarkdown = [
+    `# Remote Publish External Evidence - ${detail.id}`,
+    "",
+    `Status: ${validation.status}`,
+    `Provider: ${artifact.provider || "unknown"}`,
+    `Executed by: ${external.executedBy || ""}`,
+    `Executed at: ${external.executedAt || ""}`,
+    external.remoteUrl ? `Remote URL: ${external.remoteUrl}` : "",
+    external.prOrMrNumber ? `PR/MR: ${external.prOrMrNumber}` : "",
+    external.ciUrl ? `CI: ${external.ciUrl}` : "",
+    external.reviewCommentUrl ? `Review comment: ${external.reviewCommentUrl}` : "",
+    "",
+    "## Blockers",
+    validation.blockers.length ? markdownList(validation.blockers) : "- None",
+    "",
+    "## Warnings",
+    validation.warnings.length ? markdownList(validation.warnings) : "- None",
+    "",
+    "## Commands Run",
+    Array.isArray(external.commandsRun) && external.commandsRun.length
+      ? external.commandsRun.map((item) => `- ${item.id || ""}: ${item.status || "unknown"}${item.outputSummary ? ` - ${item.outputSummary}` : ""}`).join("\n")
+      : "- None",
+    "",
+    "## Local Follow-Up Verification",
+    verificationCommands.map((item) => `- \`${item.command}\` - ${item.reason}`).join("\n")
+  ].filter((line) => line !== "").join("\n");
+  await fs.writeFile(evidencePath, JSON.stringify(artifact, null, 2), "utf8");
+  await fs.writeFile(summaryPath, summaryMarkdown, "utf8");
+  return artifact;
 }
 
 async function buildMergeGateStatus({ prompt = "", deep = false, limit = 20 } = {}) {
@@ -9120,6 +10405,7 @@ async function buildMergeGateStatus({ prompt = "", deep = false, limit = 20 } = 
   const preflight = latestPackageId
     ? await buildRemotePublishPreflight({ id: latestPackageId, limit: max, deep: false })
     : null;
+  const latestExternalEvidence = packages.packages?.find((item) => item.externalEvidence)?.externalEvidence || null;
   const failedTasks = tasks.filter((task) => task.checksOk === false || String(task.status || "").includes("failed"));
   const pendingApprovals = approvals.filter((approval) => ["blocked", "pending"].includes(approval.status || ""));
   const approvedRemotePackages = packages.packages?.filter((item) => item.approvalStatus === "approved") || [];
@@ -9159,6 +10445,23 @@ async function buildMergeGateStatus({ prompt = "", deep = false, limit = 20 } = 
       evidence: preflight
         ? (preflight.blockers?.length ? preflight.blockers : [`Package ${preflight.packageId || latestPackageId} preflight ${preflight.status}`])
         : ["No remote publish package generated yet."]
+    },
+    {
+      id: "remote-publish-external-evidence",
+      label: "Remote publish external evidence",
+      status: latestExternalEvidence
+        ? (latestExternalEvidence.status === "ready" ? "pass" : latestExternalEvidence.status === "ready_with_warnings" ? "warn" : "block")
+        : (packages.summary?.total ? "warn" : "warn"),
+      evidence: latestExternalEvidence
+        ? [
+            latestExternalEvidence.remoteUrl ? `Remote: ${latestExternalEvidence.remoteUrl}` : "",
+            latestExternalEvidence.prOrMrNumber ? `PR/MR: ${latestExternalEvidence.prOrMrNumber}` : "",
+            latestExternalEvidence.ciUrl ? `CI: ${latestExternalEvidence.ciUrl}` : "",
+            latestExternalEvidence.reviewCommentUrl ? `Comment: ${latestExternalEvidence.reviewCommentUrl}` : "",
+            ...(latestExternalEvidence.blockers || []).map((item) => `Blocker: ${item}`),
+            ...(latestExternalEvidence.warnings || []).map((item) => `Warning: ${item}`)
+          ].filter(Boolean)
+        : ["No external publish evidence has been backfilled yet."]
     }
   ];
   if (failedTasks.length) {
@@ -9186,7 +10489,9 @@ async function buildMergeGateStatus({ prompt = "", deep = false, limit = 20 } = 
       reviews: reviews.length,
       approvals: approvals.length,
       remotePackages: packages.summary?.total || 0,
-      approvedRemotePackages: approvedRemotePackages.length
+      approvedRemotePackages: approvedRemotePackages.length,
+      remoteExternalEvidence: packages.summary?.withExternalEvidence || 0,
+      readyRemoteExternalEvidence: packages.summary?.readyExternalEvidence || 0
     },
     gates,
     blockers,
@@ -9208,8 +10513,10 @@ async function buildMergeGateStatus({ prompt = "", deep = false, limit = 20 } = 
       id: preflight.packageId,
       status: preflight.status,
       approval: preflight.approval,
-      blockers: preflight.blockers || []
+      blockers: preflight.blockers || [],
+      externalEvidence: latestExternalEvidence
     } : null,
+    externalEvidence: latestExternalEvidence,
     reviews: reviews.slice(0, 8),
     approvals: approvals.slice(0, 8),
     policy: {
@@ -9498,6 +10805,7 @@ function buildGoalRecoverySummary({ goal = null, tasks = [], capabilities = null
   const currentGoal = goal || defaultGoalState();
   const recentTask = Array.isArray(tasks) ? tasks[0] : null;
   const recommended = capabilities?.recommendedNext || null;
+  const capabilityGapSummary = capabilities?.gapSummary || null;
   const pendingProposal = currentGoal.pendingProposal || null;
   const verification = currentGoal.lastVerification || null;
   const changedFiles = Array.isArray(recentTask?.changedFiles) ? recentTask.changedFiles.slice(0, 12) : [];
@@ -9517,6 +10825,7 @@ function buildGoalRecoverySummary({ goal = null, tasks = [], capabilities = null
     changedFiles.length ? `变更文件：${changedFiles.slice(0, 3).join("、")}${changedFiles.length > 3 ? ` 等 ${changedFiles.length} 个` : ""}` : "",
     selectedHunks.length ? `已选 hunk：${selectedHunks.reduce((sum, item) => sum + Number(item.selectedHunks || 0), 0)} 个` : "",
     recommended?.capability?.area ? `推荐缺口：${recommended.capability.area} (${recommended.capability.status || "partial"})` : "",
+    capabilityGapSummary ? `能力缺口：本地 ${capabilityGapSummary.localActionableCount || 0} 个 / 外部 ${capabilityGapSummary.externalBlockedCount || 0} 个` : "",
     contextRollup?.summary?.entries ? `滚动摘要：${contextRollup.summary.entries} 条` : ""
   ].filter(Boolean);
   const blockers = [
@@ -9529,7 +10838,8 @@ function buildGoalRecoverySummary({ goal = null, tasks = [], capabilities = null
     pendingProposal?.diff ? "检查恢复的 diff 是否仍适用；需要时用逐 hunk 部分应用。" : "",
     lastFailedCommand ? `复现失败命令：${lastFailedCommand}` : "",
     verificationCommands.length ? `复查命令：${verificationCommands[0]}` : "",
-    recommended?.capability?.area ? `补齐推荐能力：${recommended.capability.area}` : ""
+    recommended?.capability?.area ? `补齐推荐能力：${recommended.capability.area}` : "",
+    capabilityGapSummary?.nextLocalAction?.area ? `优先本地缺口：${capabilityGapSummary.nextLocalAction.area}` : ""
   ].filter(Boolean).slice(0, 6);
   return {
     status: currentGoal.status || "idle",
@@ -9544,6 +10854,7 @@ function buildGoalRecoverySummary({ goal = null, tasks = [], capabilities = null
       reason: recommended.reason || "",
       next: recommended.capability.next || ""
     } : null,
+    capabilityGapSummary,
     lastFailedCommand,
     changedFiles,
     selectedHunks,
@@ -10274,13 +11585,13 @@ async function getCurrentDiffEvidence({ includeDiff = true } = {}) {
       maxBuffer: 32000
     })
   ]);
-  const status = statusResult.output ? statusResult.output.split(/\r?\n/).slice(0, 80) : [];
+  const status = parseGitStatusOutput(statusResult.output);
   const git = {
     available: true,
     branch: branchResult.output,
     root: rootResult.output,
     status,
-    changedFiles: status.map((line) => line.slice(3).trim()).filter(Boolean),
+    changedFiles: changedFilesFromGitStatus(status),
     remotes: [],
     upstream: "",
     light: true
@@ -10450,6 +11761,201 @@ async function createHandoffDraft(prompt = "", { deep = false } = {}) {
   };
 }
 
+function isExternalCapabilityDependency(capability = {}) {
+  return Boolean(capability.externalDependency)
+    || /(远端|真实 PR|push|provider|云端|凭据|认证|扩展市场|签名链|跨站点|账单直连|系统级沙箱)/i.test(`${capability.area || ""} ${capability.next || ""}`);
+}
+
+function buildCapabilityFocusFiles(capability = {}) {
+  const text = `${capability.area || ""} ${capability.next || ""}`;
+  const files = new Set(["server.js", "app.js", "README.md"]);
+  if (/浏览器|视觉|Trace|DOM|进程|调试|长任务|界面|UI|按钮|面板|工作台|能力矩阵/i.test(text)) {
+    files.add("index.html");
+    files.add("styles.css");
+  }
+  if (/启动|端口|本地运行/i.test(text)) files.add("start.bat");
+  if (/验证|validate|smoke|检查/i.test(text)) files.add("validate.bat");
+  return [...files];
+}
+
+function buildCapabilityVerificationCommands(capability = {}) {
+  const text = `${capability.area || ""} ${capability.next || ""}`;
+  const commands = [
+    commandItem("node --check server.js", "后端 API、agent loop 和 smoke 脚本语法检查。", { source: "capability-task" }),
+    commandItem("node --check app.js", "前端工作台交互脚本语法检查。", { source: "capability-task" })
+  ];
+  const add = (command, reason) => {
+    if (!commands.some((item) => item.command === command)) {
+      commands.push(commandItem(command, reason, { source: "capability-task" }));
+    }
+  };
+  if (/浏览器|视觉|Trace|DOM|调试|进程|长任务/i.test(text)) {
+    add("node server.js --api-smoke-section=debug", "验证浏览器、调试诊断、长任务和源码定位闭环。");
+    add("node server.js --api-smoke-section=browser", "验证浏览器检查、Trace、截图、DOM 和视觉入口。");
+  } else if (/工具|MCP|扩展|资产|多模态/i.test(text)) {
+    add("node server.js --api-smoke-section=integrations", "验证扩展、MCP、资产和本地工具入口。");
+  } else if (/发布|PR|CI|远端|权限|审批|门禁/i.test(text)) {
+    add("node server.js --api-smoke-section=publish", "验证 PR readiness、发布审批和远端预检只读链路。");
+    add("node server.js --api-smoke-section=gates", "验证验证计划、CI 状态、合并门禁和权限矩阵。");
+  } else if (/语义|上下文|符号|依赖|引用|重命名/i.test(text)) {
+    add("node server.js --api-smoke-section=semantic", "验证语义索引、定义、引用、影响面和诊断。");
+  } else {
+    add("node server.js --api-smoke-section=fast", "快速覆盖核心写代码、调试、上下文和门禁链路。");
+  }
+  add("git diff --check -- server.js app.js README.md index.html styles.css package.json start.bat validate.bat", "检查补丁空白和格式问题。");
+  return commands.slice(0, 8);
+}
+
+function buildExternalCapabilityPreparation(capability = {}) {
+  if (!isExternalCapabilityDependency(capability)) return null;
+  const text = `${capability.area || ""} ${capability.next || ""}`;
+  const authorizationItems = [];
+  const addAuth = (item) => {
+    if (item && !authorizationItems.includes(item)) authorizationItems.push(item);
+  };
+  if (/PR|CI|远端|发布|push|代码托管|provider|GitHub|GitLab|Gitee|评论/i.test(text)) {
+    addAuth("确认代码托管平台、目标仓库、默认分支和可用 CLI（gh / glab / git）。");
+    addAuth("准备只读 PR/CI 查询权限；如需发布，再单独审批 push、PR 创建和评论回写权限。");
+  }
+  if (/MCP|扩展|工具|provider|市场|签名/i.test(text)) {
+    addAuth("准备 MCP server 配置、扩展 manifest、信任来源和可执行工具白名单。");
+    addAuth("确认是否允许本地探测 tools/resources/prompts，远端 tools/call 需单独审批。");
+  }
+  if (/浏览器|跨站点|云端/i.test(text)) {
+    addAuth("确认允许访问的站点范围、登录状态来源、浏览器 profile 策略和截图/Trace 数据留存规则。");
+  }
+  if (/模型|账单|成本|provider/i.test(text)) {
+    addAuth("准备模型 provider、候选模型、预算上限、价格表和账单核对数据来源。");
+  }
+  if (/权限|审批|沙箱|系统级/i.test(text)) {
+    addAuth("明确哪些命令、目录、网络、远端写入或系统级操作必须走用户审批。");
+  }
+  if (!authorizationItems.length) {
+    addAuth("明确需要用户提供的凭据、CLI 登录、远端平台权限和允许执行范围。");
+  }
+  const localReadinessCommands = buildCapabilityVerificationCommands(capability).slice(0, 5);
+  return {
+    title: `本地准备清单 · ${capability.area || "外部能力"}`,
+    authorizationItems: authorizationItems.slice(0, 6),
+    localReadinessCommands,
+    localArtifacts: buildCapabilityFocusFiles(capability),
+    prompt: [
+      `请为 ${capability.area || "这项外部能力"} 生成授权准备和本地预检方案。`,
+      "不要执行远端写入；先列出需要用户确认的权限、凭据、CLI 登录和风险边界。",
+      "然后给出当前本地可运行的只读预检、smoke 或替代验证路径。"
+    ].join("\n")
+  };
+}
+
+function buildCapabilityTaskPlan(capability = {}) {
+  if (!capability?.area) return null;
+  const externalBlocked = isExternalCapabilityDependency(capability);
+  const verificationCommands = buildCapabilityVerificationCommands(capability);
+  const externalPreparation = externalBlocked ? buildExternalCapabilityPreparation(capability) : null;
+  const acceptance = externalBlocked
+    ? [
+        "明确列出需要用户提供的授权、凭据、CLI 登录或远端平台权限。",
+        "保留本地只读预检或替代验证路径，不把外部阻塞项标为已完成。",
+        "拿到授权后能直接执行对应只读探测、预检或审批包生成。"
+      ]
+    : [
+        "补齐一个能从 UI 直接进入提示词、验证命令或修复代理的最小闭环。",
+        "更新能力矩阵证据和 README，说明新链路如何帮助写代码/调试程序。",
+        "至少通过语法检查和相关 API smoke，必要时跑全量 api-smoke。"
+      ];
+  return {
+    title: `${externalBlocked ? "授权/替代路径" : "本地补齐闭环"} · ${capability.area}`,
+    blocked: externalBlocked,
+    objective: externalBlocked
+      ? "把外部依赖拆成可执行授权清单，并给出本地替代验证方式。"
+      : "把这项能力推进到可演示、可验证、可恢复的开发调试闭环。",
+    focusFiles: buildCapabilityFocusFiles(capability),
+    acceptance,
+    verificationCommands,
+    externalPreparation,
+    nextAction: capability.next || "",
+    evidence: (capability.evidence || []).slice(0, 8),
+    policy: {
+      writesFiles: false,
+      executesCommands: false,
+      externalDependency: externalBlocked,
+      source: "capability-task-plan"
+    }
+  };
+}
+
+function enrichCapabilityForAudit(capability = {}) {
+  const externalDependency = isExternalCapabilityDependency(capability);
+  const normalized = {
+    ...capability,
+    externalDependency
+  };
+  return {
+    ...normalized,
+    taskPlan: buildCapabilityTaskPlan(normalized)
+  };
+}
+
+function compactCapabilityGap(capability = {}, { includeCommands = false } = {}) {
+  const taskPlan = capability.taskPlan || buildCapabilityTaskPlan(capability);
+  return {
+    area: capability.area || "",
+    status: capability.status || "partial",
+    next: capability.next || taskPlan?.nextAction || "",
+    externalDependency: Boolean(capability.externalDependency),
+    focusFiles: (taskPlan?.focusFiles || []).slice(0, 6),
+    acceptance: (taskPlan?.acceptance || []).slice(0, 3),
+    verificationCommands: includeCommands
+      ? (taskPlan?.verificationCommands || []).slice(0, 4)
+      : (taskPlan?.verificationCommands || []).slice(0, 4).map((item) => item.command || item).filter(Boolean),
+    externalPreparation: taskPlan?.externalPreparation ? {
+      title: taskPlan.externalPreparation.title || "",
+      authorizationItems: (taskPlan.externalPreparation.authorizationItems || []).slice(0, 4),
+      localReadinessCommands: (taskPlan.externalPreparation.localReadinessCommands || []).slice(0, 4).map((item) => item.command || item).filter(Boolean)
+    } : null,
+    evidence: (capability.evidence || []).slice(0, 4)
+  };
+}
+
+function buildCapabilityGapSummary(comparison = {}, recommendedNext = null) {
+  const outstandingGaps = Array.isArray(comparison.outstandingGaps) ? comparison.outstandingGaps : [];
+  const localActionableGaps = Array.isArray(comparison.localActionableGaps)
+    ? comparison.localActionableGaps
+    : outstandingGaps.filter((item) => !item.externalDependency);
+  const externalBlockedGaps = Array.isArray(comparison.externalBlockedGaps)
+    ? comparison.externalBlockedGaps
+    : outstandingGaps.filter((item) => item.externalDependency);
+  const topLocalGaps = localActionableGaps.slice(0, 5).map((item) => compactCapabilityGap(item));
+  const topExternalGaps = externalBlockedGaps.slice(0, 5).map((item) => compactCapabilityGap(item));
+  const nextLocalAction = topLocalGaps[0] || null;
+  const recommendedGap = recommendedNext?.capability
+    ? compactCapabilityGap(recommendedNext.capability, { includeCommands: true })
+    : null;
+  return {
+    status: comparison.status || (outstandingGaps.length ? "partial" : "implemented"),
+    totalOutstanding: outstandingGaps.length,
+    localActionableCount: localActionableGaps.length,
+    externalBlockedCount: externalBlockedGaps.length,
+    requirementSummary: comparison.summary || {},
+    recommendedGap,
+    nextLocalAction,
+    topLocalGaps,
+    topExternalGaps,
+    externalPreparation: externalBlockedGaps.length ? {
+      title: "外部缺口本地准备",
+      count: externalBlockedGaps.length,
+      authorizationItems: uniqueLimited(topExternalGaps.flatMap((gap) => gap.externalPreparation?.authorizationItems || []), 8),
+      localReadinessCommands: uniqueLimited(topExternalGaps.flatMap((gap) => gap.externalPreparation?.localReadinessCommands || []), 8),
+      firstAction: topExternalGaps[0]?.externalPreparation?.title || topExternalGaps[0]?.area || ""
+    } : null,
+    guidance: localActionableGaps.length
+      ? "优先推进本地可验证缺口；外部授权项保留为清单，不阻塞当前编码/调试体验改进。"
+      : externalBlockedGaps.length
+        ? "剩余缺口主要依赖外部授权、凭据或远端平台；继续前先准备授权清单。"
+        : "当前能力矩阵没有未完成缺口，继续用真实任务和 smoke 验证体验。"
+  };
+}
+
 function buildCapabilityComparison(capabilities = []) {
   const byArea = new Map((Array.isArray(capabilities) ? capabilities : []).map((item) => [item.area, item]));
   const requirementDefs = [
@@ -10514,13 +12020,13 @@ function buildCapabilityComparison(capabilities = []) {
   const outstandingGaps = (Array.isArray(capabilities) ? capabilities : [])
     .filter((item) => item && item.status !== "implemented")
     .map((item) => {
-      const externalDependency = /(远端|真实 PR|push|provider|云端|凭据|认证|扩展市场|签名链|跨站点|账单直连|系统级沙箱)/i.test(`${item.area || ""} ${item.next || ""}`);
       return {
         area: item.area,
         status: item.status,
-        externalDependency,
+        externalDependency: Boolean(item.externalDependency),
         evidence: (item.evidence || []).slice(0, 8),
-        next: item.next || ""
+        next: item.next || "",
+        taskPlan: item.taskPlan || null
       };
     });
   return {
@@ -10570,14 +12076,14 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "验证与修复闭环",
       status: "implemented",
-      evidence: ["discoverCheckCommands", "discoverTypecheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status"],
-      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、TypeScript 类型检查发现、CI 配置、最近验证证据、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
+      evidence: ["discoverCheckCommands", "discoverTypecheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status", "stageRepairVerificationCommands", "reviewArtifactVerificationCommands", "reviewCommentsVerificationCommands", "gateEvidenceVerificationCommands", "审查失败证据自动排队验证", "门禁失败证据自动排队验证"],
+      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、TypeScript 类型检查发现、CI 配置、最近验证证据、审查/PR 评论复查命令、门禁失败复查命令、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
     },
     {
       area: "代码审查证据",
       status: "implemented",
-      evidence: ["/api/review", "/api/reviews", "/api/review-comments", ".forge/reviews"],
-      next: "已补审查 artifact 和 PR 行级评论草稿导出；可继续接入真实 PR review 发布。"
+      evidence: ["/api/review", "/api/reviews", "/api/review-comments", ".forge/reviews", "审查记录排队验证", "PR 评论草稿排队验证", "审查动作失败证据卡", "coding/debug smoke fallback"],
+      next: "已补审查 artifact、PR 行级评论草稿导出、历史审查/评论验证命令排队和审查动作失败后的本地复查命令自动恢复；可继续接入真实 PR review 发布。"
     },
     {
       area: "Git 隔离",
@@ -10600,14 +12106,14 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "可恢复状态",
       status: "implemented",
-      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", "/api/health recoverySummary", "lastFailedCommand", "verificationCommands", goal.phase || "idle"],
-      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact、语义索引持久化、刷新后的 recoverySummary 下一步线索、最近失败命令、变更文件、选中 hunk 和可重跑验证命令；可继续增加更细粒度的摘要裁剪策略。"
+      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", "/api/health recoverySummary", "lastFailedCommand", "verificationCommands", "contextEvidenceVerificationCommands", "上下文失败自动排队验证", goal.phase || "idle"],
+      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact、语义索引持久化、刷新后的 recoverySummary 下一步线索、最近失败命令、变更文件、选中 hunk、上下文证据排队验证和失败后的本地复查命令自动恢复；可继续增加更细粒度的摘要裁剪策略。"
     },
     {
       area: "长任务管理",
       status: "implemented",
-      evidence: ["/api/processes", "/api/process-health", "/api/process-search", ".forge/process-logs", ".forge/process-health-rules.json", `${managedProcessCount} 个受管进程`, "独立健康探针汇总", "可配置健康规则匹配"],
-      next: "已补启动命令发现/脚本展开/发现并启动、启动后自动识别页面 URL、受管进程输出搜索、独立健康探针、可配置健康规则、日志 artifact 持久化和历史回放；可继续增加更多服务健康规则类型。"
+      evidence: ["/api/processes", "/api/process-health", "/api/process-search", ".forge/process-logs", ".forge/process-health-rules.json", `${managedProcessCount} 个受管进程`, "独立健康探针汇总", "可配置健康规则匹配", "健康规则正则匹配", "负向错误信号守卫"],
+      next: "已补启动命令发现/脚本展开/发现并启动、启动后自动识别页面 URL、受管进程输出搜索、独立健康探针、日志 artifact 持久化和历史回放；健康规则支持状态码、输出/响应包含匹配、输出/响应正则匹配和负向错误信号守卫。"
     },
     {
       area: "交付草稿",
@@ -10693,6 +12199,10 @@ async function buildCapabilityAudit({ light = false } = {}) {
         "model_cost_policy",
         "model_billing",
         ".forge/state/model-usage.json",
+        "modelEvidenceVerificationCommands",
+        "stageModelEvidenceVerificationCommands",
+        "agentFailureVerificationCommands",
+        "代理失败验证命令排队",
         `候选模型：${modelRuntime.candidates.join(", ")}`,
         modelRuntime.lastModel ? `最近使用：${modelRuntime.lastModel}` : "尚未发起模型请求",
         `请求数：${modelRuntime.requestCount}，成功：${modelRuntime.successCount}，失败：${modelRuntime.failureCount}`,
@@ -10700,23 +12210,26 @@ async function buildCapabilityAudit({ light = false } = {}) {
         modelRuntime.lastFallbacks.length ? `最近 fallback：${modelRuntime.lastFallbacks.length} 次` : "最近无 fallback"
       ],
       next: modelRuntime.candidates.length > 1
-        ? "已补运行时遥测、只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、fallback 视图和 provider token SSE 流式输出；可继续增加 provider API 账单直连和真实成本扣减。"
-        : "已补只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对和 provider token SSE 流式输出；可通过 FORGE_MODELS 配置多模型 fallback，后续再增加 provider API 账单直连和真实成本扣减。"
+        ? "已补运行时遥测、只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、fallback 视图、provider token SSE 流式输出、模型证据验证命令排队和代理失败后的本地复查命令自动恢复；可继续增加 provider API 账单直连和真实成本扣减。"
+        : "已补只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、provider token SSE 流式输出、模型证据验证命令排队和代理失败后的本地复查命令自动恢复；可通过 FORGE_MODELS 配置多模型 fallback，后续再增加 provider API 账单直连和真实成本扣减。"
     }
   ];
-  const summary = capabilities.reduce((acc, item) => {
+  const enrichedCapabilities = capabilities.map(enrichCapabilityForAudit);
+  const summary = enrichedCapabilities.reduce((acc, item) => {
     acc[item.status] = (acc[item.status] || 0) + 1;
     return acc;
   }, {});
-  const recommendedNext = selectCapabilityRecommendation(capabilities);
-  const comparison = buildCapabilityComparison(capabilities);
+  const recommendedNext = selectCapabilityRecommendation(enrichedCapabilities);
+  const comparison = buildCapabilityComparison(enrichedCapabilities);
+  const gapSummary = buildCapabilityGapSummary(comparison, recommendedNext);
   return {
     generatedAt: new Date().toISOString(),
     workspace: currentWorkspace,
     summary,
     recommendedNext,
+    gapSummary,
     comparison,
-    capabilities,
+    capabilities: enrichedCapabilities,
     recentEvidence: { tasks, threads, reviews, approvals, extensions: extensions.summary, mcp: mcp.summary, assets: assets.summary, goal }
   };
 }
@@ -10739,22 +12252,33 @@ function selectCapabilityRecommendation(capabilities = []) {
     ["真实远端发布与平台同步", 78],
     ["多模态与浏览器执行", 74]
   ]);
-  const scored = capabilities
-    .filter((item) => item && item.status !== "implemented")
+  const candidates = capabilities.filter((item) => item && item.status !== "implemented");
+  const hasLocalActionable = candidates.some((item) => !isExternalCapabilityDependency(item));
+  const scored = candidates
     .map((item) => {
+      const externalDependency = isExternalCapabilityDependency(item);
       const statusScore = item.status === "missing" ? 1000 : item.status === "partial" ? 500 : 100;
       const impact = impactRank.get(item.area) || 50;
       return {
-        capability: item,
+        capability: { ...item, externalDependency },
         score: statusScore + impact,
+        externalDependency,
         reason: [
+          externalDependency
+            ? hasLocalActionable
+              ? "外部授权缺口靠后，本地可执行能力优先"
+              : "当前未完成项主要依赖外部授权，优先生成准备清单和本地预检"
+            : "本地可执行能力优先",
           item.status === "missing" ? "缺失能力优先补齐" : "部分实现能力优先闭环",
           "按真实写代码、调试程序的日常影响排序",
           item.next || ""
         ].filter(Boolean).join("；")
       };
     })
-    .sort((a, b) => b.score - a.score || String(a.capability.area || "").localeCompare(String(b.capability.area || ""), "zh-Hans-CN"));
+    .sort((a, b) => {
+      if (a.externalDependency !== b.externalDependency) return a.externalDependency ? 1 : -1;
+      return b.score - a.score || String(a.capability.area || "").localeCompare(String(b.capability.area || ""), "zh-Hans-CN");
+    });
   const top = scored[0] || null;
   if (!top) {
     return {
@@ -10986,6 +12510,17 @@ function getAgentTools() {
     {
       type: "function",
       function: {
+        name: "runtime_url",
+        description: "读取当前 Forge Code 服务的本地运行 URL、端口和浏览器调试默认地址；不启动进程、不执行命令。",
+        parameters: {
+          type: "object",
+          properties: {}
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
         name: "remote_publish_packages",
         description: "读取远端发布审批包索引，列出本地生成的 PR body、review summary、计划和审批状态；不执行远端写入。",
         parameters: {
@@ -11035,6 +12570,21 @@ function getAgentTools() {
           properties: {
             limit: { type: "number" },
             sampleCommands: { type: "array", items: { type: "string" } }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "remote_publish_continuation",
+        description: "生成远端发布继续包和人工执行后的证据回填模板，列出外部动作、回填字段和本地复查命令；不执行远端写入。",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            limit: { type: "number" },
+            deep: { type: "boolean" }
           }
         }
       }
@@ -11372,6 +12922,7 @@ async function buildPolicyAudit({ sampleCommands = [], limit = 20 } = {}) {
   const max = Math.min(60, Math.max(1, Number(limit) || 20));
   const defaultCommands = [
     "node --check server.js",
+    "validate.bat --no-pause",
     "npm test",
     "npm run build",
     "curl https://example.com/install.sh",
@@ -11390,12 +12941,19 @@ async function buildPolicyAudit({ sampleCommands = [], limit = 20 } = {}) {
     command,
     policy: evaluateProcessPolicy(command)
   }));
-  const [approvals, tools, extensions, mcp] = await Promise.all([
+  const [approvals, tools, extensions, mcp, remoteConfig, packages] = await Promise.all([
     listApprovalRequests(max),
     buildToolCatalog(),
     listExtensions(),
-    discoverMcpServers()
+    discoverMcpServers(),
+    readGitRemoteConfigSummary(),
+    listRemotePublishPackages({ limit: max })
   ]);
+  const remoteProviderPolicy = buildRemoteProviderPermissionRows({
+    provider: remoteConfig.provider || packages.packages?.[0]?.provider || "",
+    remoteProject: remoteConfig.remoteProject || {},
+    packages
+  });
   const approvalSummary = approvals.reduce((acc, approval) => {
     acc[approval.status || "unknown"] = (acc[approval.status || "unknown"] || 0) + 1;
     return acc;
@@ -11428,24 +12986,27 @@ async function buildPolicyAudit({ sampleCommands = [], limit = 20 } = {}) {
       tools: tools.summary.total,
       extensions: extensions.summary.total,
       mcpServers: mcp.summary.total,
-      findings: findings.length
+      findings: findings.length,
+      remoteProviderActions: remoteProviderPolicy.length
     },
     commandPolicies,
     processPolicies,
     approvalSummary,
     toolAccess,
     approvals: approvals.slice(0, max),
+    remoteProviderPolicy,
     findings,
     guardrails: [
       "Unsafe shell control operators and destructive/network-download commands are blocked.",
       "Remote publish plans create approval artifacts but do not execute git push or PR creation.",
+      "Remote provider actions are declared per provider/action; push, PR creation, PR comment, and external evidence ingestion are separated.",
       "Extension and MCP tool calls require approval before execution.",
       "Approved requests are re-checked against current policy before execution.",
       "Read-only tools are scoped to the current workspace."
     ],
     gaps: [
       "No system-level sandbox privilege escalation is performed locally.",
-      "No remote provider permission model is enforced beyond generated approval plans.",
+      "Remote provider permission model is declared locally; actual remote execution still requires user/platform authorization and external evidence backfill.",
       "No signed extension marketplace trust root is configured."
     ],
     policy: {
@@ -11461,12 +13022,20 @@ async function buildPolicyAudit({ sampleCommands = [], limit = 20 } = {}) {
 
 async function buildPermissionMatrix({ limit = 20 } = {}) {
   const max = Math.min(80, Math.max(1, Number(limit) || 20));
-  const [approvals, toolCatalog, extensions, mcp] = await Promise.all([
+  const [approvals, toolCatalog, extensions, mcp, remoteConfig, packages] = await Promise.all([
     listApprovalRequests(max),
     buildToolCatalog(),
     listExtensions(),
-    discoverMcpServers()
+    discoverMcpServers(),
+    readGitRemoteConfigSummary(),
+    listRemotePublishPackages({ limit: max })
   ]);
+  const latestPackageProvider = packages.packages?.[0]?.provider || "";
+  const remoteProviderRows = buildRemoteProviderPermissionRows({
+    provider: remoteConfig.provider || latestPackageProvider,
+    remoteProject: remoteConfig.remoteProject || {},
+    packages
+  });
   const rows = [
     {
       provider: "workspace",
@@ -11570,31 +13139,7 @@ async function buildPermissionMatrix({ limit = 20 } = {}) {
       writesRemote: false,
       evidence: ["/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "/api/approval-execute"]
     },
-    {
-      provider: "git-remote",
-      action: "read_pr_ci",
-      access: "remote-read-only",
-      scope: "configuredRemotes",
-      requiresApproval: false,
-      executesCommands: false,
-      writesFiles: true,
-      writesRemote: false,
-      evidence: ["/api/pr-readiness", "/api/remote-pr-status", "/api/ci-status"]
-    },
-    {
-      provider: "git-remote",
-      action: "publish_pr",
-      access: "approval-plan-only",
-      scope: "configuredRemotes",
-      requiresApproval: true,
-      executesCommands: false,
-      writesFiles: true,
-      writesRemote: false,
-      pushes: false,
-      createsRemotePr: false,
-      writesRemoteComments: false,
-      evidence: ["/api/remote-publish-plan", "/api/remote-publish-preflight", ".forge/remote-publish"]
-    }
+    ...remoteProviderRows
   ];
   const byProvider = rows.reduce((acc, row) => {
     acc[row.provider] = acc[row.provider] || {
@@ -11603,13 +13148,17 @@ async function buildPermissionMatrix({ limit = 20 } = {}) {
       approvalRequired: 0,
       executesCommands: 0,
       writesFiles: 0,
-      writesRemote: 0
+      writesRemote: 0,
+      requiresExternalExecution: 0,
+      requiresExternalEvidence: 0
     };
     acc[row.provider].actions += 1;
     if (row.requiresApproval) acc[row.provider].approvalRequired += 1;
     if (row.executesCommands) acc[row.provider].executesCommands += 1;
     if (row.writesFiles) acc[row.provider].writesFiles += 1;
     if (row.writesRemote) acc[row.provider].writesRemote += 1;
+    if (row.requiresExternalExecution) acc[row.provider].requiresExternalExecution += 1;
+    if (row.requiresExternalEvidence) acc[row.provider].requiresExternalEvidence += 1;
     return acc;
   }, {});
   return {
@@ -11621,15 +13170,38 @@ async function buildPermissionMatrix({ limit = 20 } = {}) {
       approvalRequired: rows.filter((row) => row.requiresApproval).length,
       commandExecuting: rows.filter((row) => row.executesCommands).length,
       remoteWriteEnabled: rows.filter((row) => row.writesRemote).length,
+      remoteProviderActions: remoteProviderRows.length,
+      remoteProvider: remoteProviderRows[0]?.remoteProvider || "unknown",
+      manualProviderActions: remoteProviderRows.filter((row) => row.manualProvider).length,
+      externalExecutionRequired: rows.filter((row) => row.requiresExternalExecution).length,
+      externalEvidenceRequired: rows.filter((row) => row.requiresExternalEvidence).length,
       tools: toolCatalog.summary.total,
       extensions: extensions.summary.total,
       mcpServers: mcp.summary.total,
       approvals: approvals.length
     },
     providers: Object.values(byProvider),
+    remoteProviderPolicy: {
+      provider: remoteProviderRows[0]?.remoteProvider || "unknown",
+      manualProvider: remoteProviderRows.some((row) => row.manualProvider),
+      remoteProject: remoteProviderRows[0]?.remoteProject || {},
+      actions: remoteProviderRows.map((row) => ({
+        action: row.action,
+        access: row.access,
+        requiresApproval: row.requiresApproval,
+        requiresExternalExecution: Boolean(row.requiresExternalExecution),
+        requiresExternalEvidence: Boolean(row.requiresExternalEvidence),
+        writesRemote: Boolean(row.writesRemote),
+        pushes: Boolean(row.pushes),
+        createsRemotePr: Boolean(row.createsRemotePr),
+        writesRemoteComments: Boolean(row.writesRemoteComments),
+        evidence: row.evidence || []
+      }))
+    },
     rows,
     guardrails: [
-      "Remote publish remains approval-plan-only and reports pushes/create/comment writes as false.",
+      "Remote publish permissions are declared per provider/action and keep push/create/comment remote writes disabled locally.",
+      "Manual providers such as Gitee require external execution evidence before merge gates can treat remote publishing as complete.",
       "Workspace writes require checkpointed /api/apply approval and support partial hunk conflict evidence.",
       "Local extension and MCP tool calls require approval artifacts before execution.",
       "Model endpoints expose redacted provider metadata and enforce budget checks before provider requests.",
@@ -12694,6 +14266,9 @@ async function runReadTool(name, args) {
       limit: Number(args.limit || 50)
     }));
   }
+  if (name === "runtime_url") {
+    return JSON.stringify(await readRuntimeUrlState());
+  }
   if (name === "remote_publish_packages") {
     return JSON.stringify(await listRemotePublishPackages({ limit: Number(args.limit || 20) }));
   }
@@ -12702,6 +14277,13 @@ async function runReadTool(name, args) {
   }
   if (name === "remote_publish_preflight") {
     return JSON.stringify(await buildRemotePublishPreflight({
+      id: String(args.id || ""),
+      limit: Number(args.limit || 20),
+      deep: Boolean(args.deep)
+    }));
+  }
+  if (name === "remote_publish_continuation") {
+    return JSON.stringify(await buildRemotePublishContinuation({
       id: String(args.id || ""),
       limit: Number(args.limit || 20),
       deep: Boolean(args.deep)
@@ -13032,7 +14614,21 @@ async function generateRepairDiff({ prompt, applied, checks, diagnostics = null 
 
 async function repairFromFailedCommand({ prompt = "", command = "", result = null, diagnostics = null }) {
   if (!result || result.exitCode === 0) {
-    return { reply: "命令通过，无需修复。", plan: [], diff: "", review: [], commands: [], patches: [] };
+    return {
+      reply: "命令通过，无需修复。",
+      plan: [],
+      diff: "",
+      review: [],
+      commands: [],
+      patches: [],
+      proposal: null,
+      goal: {},
+      policy: {
+        writesFiles: false,
+        updatesPendingProposal: false,
+        requiresApplyApproval: false
+      }
+    };
   }
   const repairDiagnostics = diagnostics || result.diagnostics || await buildDebugDiagnostics({
     commands: [command],
@@ -13044,7 +14640,7 @@ async function repairFromFailedCommand({ prompt = "", command = "", result = nul
     summary: { findings: 1, errors: 0, warnings: 1 },
     findings: [{ severity: "warn", area: "debug", message: error.message, evidence: [] }]
   }));
-  return await generateRepairDiff({
+  const repair = await generateRepairDiff({
     prompt,
     applied: [],
     checks: [{
@@ -13055,16 +14651,174 @@ async function repairFromFailedCommand({ prompt = "", command = "", result = nul
     }],
     diagnostics: repairDiagnostics
   });
+  let proposal = null;
+  let goal = {};
+  if (repair.diff) {
+    proposal = {
+      id: `failed-command-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+      type: "failed_command_repair",
+      createdAt: new Date().toISOString(),
+      prompt: prompt || `修复失败命令：${command}`,
+      command,
+      reply: repair.reply || "",
+      plan: repair.plan || [],
+      diff: repair.diff || "",
+      patches: repair.patches || [],
+      commands: repair.commands || [],
+      review: repair.review || [],
+      failure: {
+        exitCode: Number(result.exitCode ?? 1),
+        outputSummary: summarizeCheckOutput(result.output || ""),
+        category: result.failureAnalysis?.category || repairDiagnostics?.commandFailure?.category || ""
+      }
+    };
+    const previousGoal = await readGoalState();
+    const updatedGoal = await writeGoalState({
+      objective: prompt || previousGoal.objective || proposal.prompt,
+      phase: "awaiting_failed_command_repair_approval",
+      status: "awaiting_approval",
+      lastPrompt: prompt || previousGoal.lastPrompt || proposal.prompt,
+      pendingProposal: proposal,
+      nextStep: "复核失败命令修复 diff 后批准写入，并优先重跑原失败命令。"
+    });
+    goal = {
+      phase: updatedGoal.phase,
+      status: updatedGoal.status,
+      pendingProposalId: updatedGoal.pendingProposal?.id || ""
+    };
+  }
+  return {
+    ...repair,
+    proposal,
+    goal,
+    recovery: buildFailureRecoveryChain(command, result, repairDiagnostics),
+    policy: {
+      writesFiles: false,
+      updatesPendingProposal: Boolean(proposal),
+      requiresApplyApproval: Boolean(proposal),
+      source: "failed-command-repair"
+    }
+  };
+}
+
+async function buildSourceContextRepairDraft({
+  prompt = "",
+  command = "",
+  result = null,
+  diagnostics = null,
+  locations = [],
+  contextLines = 6,
+  limit = 8,
+  dryRun = false
+} = {}) {
+  const contexts = await readWorkspaceSourceLocationContexts(locations, contextLines, limit);
+  const sourceContextBlock = contexts.length
+    ? contexts.map((item) => [
+        `@${item.path}:${item.line}${item.column ? `:${item.column}` : ""}`,
+        item.error ? `ERROR: ${item.error}` : item.context || ""
+      ].filter(Boolean).join("\n")).join("\n\n")
+    : "(未读取到源码定位上下文)";
+  const sourcePrompt = [
+    prompt || `修复失败命令：${command}`,
+    "",
+    "请优先基于这些源码定位上下文生成最小修复 diff。",
+    "",
+    "失败命令：",
+    command ? `$ ${command}` : "(未提供)",
+    "",
+    "源码定位上下文：",
+    sourceContextBlock,
+    "",
+    "要求：只修改与源码定位上下文或失败命令直接相关的文件；生成 diff 后必须给出可安全运行的验证命令。"
+  ].filter(Boolean).join("\n");
+  const draft = dryRun
+    ? {
+        reply: "dry-run：已生成源码定位修复提示，未请求模型、未写入文件。",
+        plan: ["读取源码定位上下文", "生成源码定位修复提示", "等待用户或模型生成最小 diff"],
+        diff: "",
+        review: [],
+        commands: command ? [{ command, reason: "修复后优先重跑原失败命令。" }] : [],
+        patches: [],
+        proposal: null,
+        goal: {},
+        policy: {
+          writesFiles: false,
+          updatesPendingProposal: false,
+          requiresApplyApproval: false,
+          dryRun: true
+        }
+      }
+    : await repairFromFailedCommand({
+        prompt: sourcePrompt,
+        command,
+        result,
+        diagnostics
+      });
+  let proposal = draft.proposal || null;
+  let goal = draft.goal || {};
+  if (proposal) {
+    proposal = {
+      ...proposal,
+      id: proposal.id.replace(/^failed-command-/, "source-context-"),
+      type: "source_context_repair",
+      prompt: sourcePrompt,
+      sourceContexts: contexts,
+      sourceContextSummary: {
+        requested: Array.isArray(locations) ? locations.length : 0,
+        returned: contexts.length,
+        errors: contexts.filter((item) => item.error).length
+      }
+    };
+    const previousGoal = await readGoalState();
+    const updatedGoal = await writeGoalState({
+      objective: sourcePrompt || previousGoal.objective || proposal.prompt,
+      phase: "awaiting_source_context_repair_approval",
+      status: "awaiting_approval",
+      lastPrompt: sourcePrompt || previousGoal.lastPrompt || proposal.prompt,
+      pendingProposal: proposal,
+      nextStep: "复核源码定位修复 diff 后批准写入，并优先重跑原失败命令。"
+    });
+    goal = {
+      phase: updatedGoal.phase,
+      status: updatedGoal.status,
+      pendingProposalId: updatedGoal.pendingProposal?.id || ""
+    };
+  }
+  return {
+    ...draft,
+    proposal,
+    goal,
+    contexts,
+    sourceContextSummary: {
+      requested: Array.isArray(locations) ? locations.length : 0,
+      returned: contexts.length,
+      errors: contexts.filter((item) => item.error).length
+    },
+    policy: {
+      ...(draft.policy || {}),
+      writesFiles: false,
+      updatesPendingProposal: Boolean(proposal),
+      requiresApplyApproval: Boolean(proposal),
+      source: "source-context-repair",
+      dryRun: Boolean(dryRun)
+    }
+  };
 }
 
 function normalizeAgentDebugContext(debugContext = null) {
   if (!debugContext || typeof debugContext !== "object") return null;
-  const referencedFiles = Array.isArray(debugContext.referencedFiles)
-    ? [...new Set(debugContext.referencedFiles
-        .map((item) => toPosix(String(item || "").replace(/^\.?[\\/]/, "")))
-        .filter(Boolean))]
-        .slice(0, 16)
-    : [];
+  const browserSourceLocations = uniqueSourceLocations([
+    ...(Array.isArray(debugContext.browserSourceLocations) ? debugContext.browserSourceLocations : []),
+    ...(Array.isArray(debugContext.debugContext?.browserSourceLocations) ? debugContext.debugContext.browserSourceLocations : [])
+  ], 16);
+  const referencedFiles = [...new Set([
+    ...(Array.isArray(debugContext.referencedFiles) ? debugContext.referencedFiles : []),
+    ...(Array.isArray(debugContext.debugContext?.referencedFiles) ? debugContext.debugContext.referencedFiles : []),
+    ...browserSourceLocations.map((item) => item.path)
+  ]
+    .map((item) => toPosix(String(item || "").replace(/^\.?[\\/]/, "")))
+    .filter(Boolean))]
+    .slice(0, 16);
   const findings = Array.isArray(debugContext.findings)
     ? debugContext.findings.slice(0, 10).map((item) => ({
         severity: String(item?.severity || "info").slice(0, 24),
@@ -13117,12 +14871,32 @@ function normalizeAgentDebugContext(debugContext = null) {
         network: Array.isArray(debugContext.browserTrace.network) ? debugContext.browserTrace.network.slice(0, 8) : []
       }
     : null;
+  const browserTriage = debugContext.browserTriage && typeof debugContext.browserTriage === "object"
+    ? {
+        status: String(debugContext.browserTriage.status || "").slice(0, 80),
+        counts: debugContext.browserTriage.counts || {},
+        findings: Array.isArray(debugContext.browserTriage.findings)
+          ? debugContext.browserTriage.findings.slice(0, 10).map((item) => ({
+              severity: String(item?.severity || "info").slice(0, 24),
+              area: String(item?.area || "browser").slice(0, 80),
+              message: String(item?.message || "").slice(0, 800),
+              evidence: Array.isArray(item?.evidence)
+                ? item.evidence.slice(0, 6).map((entry) => String(entry).slice(0, 500))
+                : String(item?.evidence || "").slice(0, 800)
+            }))
+          : [],
+        nextActions: Array.isArray(debugContext.browserTriage.nextActions)
+          ? debugContext.browserTriage.nextActions.slice(0, 6).map((item) => String(item || "").slice(0, 500))
+          : []
+      }
+    : null;
   const normalized = {
     source: String(debugContext.source || "lastDebugDiagnostics").slice(0, 80),
     generatedAt: String(debugContext.generatedAt || "").slice(0, 80),
     status: String(debugContext.status || "").slice(0, 80),
     summary: debugContext.summary || {},
     referencedFiles,
+    browserSourceLocations,
     findings,
     nextActions,
     verificationPlan: debugContext.verificationPlan ? {
@@ -13133,9 +14907,10 @@ function normalizeAgentDebugContext(debugContext = null) {
       summary: debugContext.processHealth.summary || {},
       rows: processRows
     } : null,
-    browserTrace: trace
+    browserTrace: trace,
+    browserTriage
   };
-  const hasEvidence = referencedFiles.length || findings.length || nextActions.length || commands.length || processRows.length || trace;
+  const hasEvidence = referencedFiles.length || browserSourceLocations.length || findings.length || nextActions.length || commands.length || processRows.length || trace || browserTriage;
   return hasEvidence ? normalized : null;
 }
 
@@ -13386,7 +15161,7 @@ async function handleApi(req, res) {
       const deep = url.searchParams.get("deep") === "1";
       const lightGit = { available: false, branch: "", root: "", status: [], changedFiles: [], remotes: [], upstream: "", skipped: "Use /api/health?deep=1 for git status." };
       const lightAssets = { summary: { total: 0, image: 0, document: 0, data: 0, media: 0 }, assets: [] };
-      const [checkpoints, git, tasks, threads, queue, reviews, approvals, processes, extensions, mcp, assets, contextSnapshot, contextRollup, modelUsage, goal, capabilities] = await Promise.all([
+      const [checkpoints, git, tasks, threads, queue, reviews, approvals, processes, extensions, mcp, assets, contextSnapshot, contextRollup, modelUsage, goal, capabilities, runtimeUrl] = await Promise.all([
         listCheckpoints(),
         deep ? getGitSummary() : Promise.resolve(lightGit),
         listTaskLogs(),
@@ -13402,7 +15177,8 @@ async function handleApi(req, res) {
         readContextRollup(),
         readModelUsageLedger(),
         readGoalState(),
-        buildCapabilityAudit({ light: !deep })
+        buildCapabilityAudit({ light: !deep }),
+        readRuntimeUrlState()
       ]);
       const recoverySummary = buildGoalRecoverySummary({ goal, tasks, capabilities, contextRollup });
       return send(res, 200, {
@@ -13416,6 +15192,7 @@ async function handleApi(req, res) {
         modelPolicy: buildModelPolicy({ includeRecent: false, usageLedger: modelUsage }),
         hasApiKey: Boolean(process.env.DEEPSEEK_API_KEY),
         ...getWorkspaceInfo(),
+        runtimeUrl,
         checkpoints,
         git,
         tasks,
@@ -13435,6 +15212,10 @@ async function handleApi(req, res) {
         recoverySummary,
         capabilities
       });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/runtime-url") {
+      return send(res, 200, { runtimeUrl: await readRuntimeUrlState() });
     }
 
     if (req.method === "GET" && url.pathname === "/api/context-snapshot") {
@@ -14081,6 +15862,30 @@ async function handleApi(req, res) {
       });
     }
 
+    if (req.method === "POST" && url.pathname === "/api/source-context-repair-draft") {
+      const {
+        prompt = "",
+        command = "",
+        result = null,
+        diagnostics = null,
+        locations = [],
+        contextLines = 6,
+        limit = 8,
+        dryRun = false
+      } = await readJson(req);
+      if (!command || typeof command !== "string") throw new Error("缺少 command。");
+      return send(res, 200, await buildSourceContextRepairDraft({
+        prompt,
+        command,
+        result,
+        diagnostics,
+        locations,
+        contextLines,
+        limit,
+        dryRun: Boolean(dryRun)
+      }));
+    }
+
     if (req.method === "POST" && url.pathname === "/api/prompt-references") {
       const { prompt = "" } = await readJson(req);
       const files = await listPromptReferenceFiles();
@@ -14306,6 +16111,17 @@ async function handleApi(req, res) {
             ? "repair_suggested"
             : "failed";
       const finalStatus = analysis.conflicts.length ? `partial_${status}` : status;
+      const recovery = buildApplyVerificationRecovery({
+        finalStatus,
+        applied,
+        verification,
+        checkCommands,
+        repair,
+        repairError,
+        conflicts: analysis.conflicts,
+        selectedHunks: selectedHunkSummary,
+        checkpoint
+      });
       const taskRepairContext = normalizedRepairContext ? {
         ...normalizedRepairContext,
         status: finalStatus,
@@ -14334,6 +16150,7 @@ async function handleApi(req, res) {
         repairDiff: repair?.diff || "",
         repairReview: repair?.review || [],
         repairContext: taskRepairContext,
+        verificationRecovery: recovery,
         repairError,
         git
       });
@@ -14346,7 +16163,10 @@ async function handleApi(req, res) {
         lastVerification: {
           ok: verification.ok,
           skipped: verification.skipped,
-          checkCount: verification.checks.length
+          checkCount: verification.checks.length,
+          failedCount: recovery.verification.failedCount,
+          recoveryStatus: recovery.status,
+          nextAction: recovery.nextActions[0] || ""
         },
         pendingProposal: repair?.diff ? {
           id: `repair-${new Date().toISOString().replace(/[:.]/g, "-")}`,
@@ -14377,6 +16197,7 @@ async function handleApi(req, res) {
         verification,
         repair,
         repairContext: taskRepairContext,
+        recovery,
         repairError,
         git,
         task,
@@ -14494,6 +16315,35 @@ async function handleApi(req, res) {
       }) });
     }
 
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/remote-publish-continuation") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            id: url.searchParams.get("id") || "",
+            limit: Number(url.searchParams.get("limit") || 20),
+            deep: url.searchParams.get("deep") === "1"
+          };
+      return send(res, 200, { continuation: await buildRemotePublishContinuation({
+        id: String(payload.id || ""),
+        limit: Number(payload.limit || 20),
+        deep: Boolean(payload.deep)
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/remote-publish-evidence") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            id: url.searchParams.get("id") || "",
+            limit: Number(url.searchParams.get("limit") || 20)
+          };
+      return send(res, 200, { evidence: await buildRemotePublishEvidence({
+        id: String(payload.id || ""),
+        evidence: payload.evidence || null,
+        limit: Number(payload.limit || 20)
+      }) });
+    }
+
     if (req.method === "GET" && url.pathname === "/api/git") {
       return send(res, 200, await getGitSummary());
     }
@@ -14557,11 +16407,53 @@ function createAppServer() {
   });
 }
 
-const server = createAppServer();
+function listenAppServerWithRetry({
+  startPort = PORT,
+  retryLimit = PORT_RETRY_LIMIT,
+  autoRetry = PORT_AUTO_RETRY,
+  createServer = createAppServer,
+  onRetry,
+  onError,
+  onListening
+} = {}) {
+  return new Promise((resolve, reject) => {
+    const maxRetryPort = Math.min(65535, startPort + retryLimit);
+    const tryListen = (activePort) => {
+      const runtimeServer = createServer(activePort);
+      let settled = false;
+      runtimeServer.once("error", (error) => {
+        if (settled) return;
+        settled = true;
+        const retryableListenError = error && (error.code === "EADDRINUSE" || error.code === "EACCES");
+        if (retryableListenError) {
+          const reason = error.code === "EACCES" ? "not allowed" : "already in use";
+          if (autoRetry && activePort < maxRetryPort) {
+            const nextPort = activePort + 1;
+            onRetry?.({ activePort, nextPort, reason, error });
+            setImmediate(() => tryListen(nextPort));
+            return;
+          }
+          onError?.({ activePort, reason, error });
+        }
+        reject(error);
+      });
+      runtimeServer.listen({ port: activePort, host: "127.0.0.1", exclusive: true }, () => {
+        if (settled) return;
+        settled = true;
+        onListening?.({ activePort, server: runtimeServer });
+        activeRuntimeServer = runtimeServer;
+        resolve({ port: activePort, server: runtimeServer });
+      });
+    };
+    tryListen(startPort);
+  });
+}
 
 async function runSmokeTest() {
   const context = await collectContext();
   const repoMap = await buildRepoMap();
+  const git = await getGitSummary();
+  assertGitSummaryIntegrity(git);
   console.log(JSON.stringify({
     ok: true,
     model: currentModelName(),
@@ -14573,11 +16465,76 @@ async function runSmokeTest() {
     contextLimitBytes: CONTEXT_LIMIT_BYTES,
     symbolCount: repoMap.symbols.length,
     checkpoints: await listCheckpoints(),
-    git: await getGitSummary(),
+    git,
     tasks: await listTaskLogs(),
     queue: await listQueuedTasks()
   }));
 }
+
+async function runPortConflictSmokeTest() {
+  const blockedPort = 49500;
+  let attempts = 0;
+  const retryEvents = [];
+  let runtimeServer;
+  try {
+    const result = await listenAppServerWithRetry({
+      startPort: blockedPort,
+      retryLimit: 3,
+      autoRetry: true,
+      createServer(activePort) {
+        attempts += 1;
+        if (activePort === blockedPort) {
+          return {
+            once(eventName, handler) {
+              if (eventName === "error") this.errorHandler = handler;
+              return this;
+            },
+            listen() {
+              setImmediate(() => this.errorHandler?.(Object.assign(new Error("forced port conflict"), { code: "EADDRINUSE" })));
+            }
+          };
+        }
+        return createAppServer();
+      },
+      onRetry(event) {
+        retryEvents.push(event);
+      }
+    });
+    runtimeServer = result.server;
+    const selectedPort = result.port;
+
+    console.log(JSON.stringify({
+      ok: true,
+      portConflictSmoke: true,
+      blockedPort,
+      selectedPort,
+      url: `http://127.0.0.1:${selectedPort}`,
+      attempts,
+      retries: retryEvents.length,
+      autoRetried: selectedPort !== blockedPort
+    }));
+  } finally {
+    await closeSmokeServer(runtimeServer);
+  }
+}
+
+const server = {
+  listen(...args) {
+    const runtimeServer = createAppServer();
+    activeRuntimeServer = runtimeServer;
+    return runtimeServer.listen(...args);
+  },
+  close(callback) {
+    if (!activeRuntimeServer) {
+      callback?.();
+      return undefined;
+    }
+    return activeRuntimeServer.close(callback);
+  },
+  address() {
+    return activeRuntimeServer?.address?.() || null;
+  }
+};
 
 async function requestJson(baseUrl, route, options = {}) {
   const controller = new AbortController();
@@ -14862,10 +16819,13 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(health.ok === true, "health did not return ok=true");
       assertSmoke(Array.isArray(health.queue), "health did not include queue");
       assertSmoke(Array.isArray(health.approvals), "health did not include approvals");
+      assertSmoke(health.runtimeUrl?.url || health.runtimeUrl?.source === "missing", "health missing runtime URL state");
       const files = await requestJson(baseUrl, "/api/files");
       assertSmoke(Array.isArray(files.files), "files did not include file list");
       const capabilities = await requestJson(baseUrl, "/api/capabilities");
       assertSmoke(capabilities.capabilities.some((item) => item.area === "可恢复状态"), "capabilities missing resumable state");
+      assertSmoke(capabilities.recommendedNext?.capability?.taskPlan?.verificationCommands?.length >= 1, "capabilities missing recommended task plan commands");
+      assertSmoke(capabilities.comparison?.outstandingGaps?.every((item) => item.taskPlan?.policy?.source === "capability-task-plan"), "capabilities missing task plans on outstanding gaps");
       const tools = await requestJson(baseUrl, "/api/tools");
       assertSmoke(tools.tools.some((item) => item.name === "repo_map"), "tools missing repo_map");
       checked.push("health", "files", "capabilities", "tools");
@@ -14890,6 +16850,7 @@ async function runApiSmokeSectionTest(sectionValue = "") {
         body: JSON.stringify({ url: `${baseUrl}/`, includeTrace: false, runChecks: false, limit: 8 })
       });
       assertSmoke(Array.isArray(debugDiagnostics.diagnostics?.findings), "debug diagnostics missing findings");
+      assertSmoke(debugDiagnostics.diagnostics?.browserTriage?.status === "not_captured", "debug diagnostics missing not_captured browser triage");
       assertSmoke(
         debugDiagnostics.diagnostics?.verificationPlan?.commands?.some((item) => String(item.command || "").includes("--api-smoke-section=debug")),
         "debug diagnostics verification plan missing debug smoke command"
@@ -14902,7 +16863,35 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(Number.isFinite(Number(debugNextAction?.priority)), "debug diagnostics next action missing priority");
       assertSmoke(debugNextAction?.kind === "command", "debug diagnostics next action missing kind");
       assertSmoke(Array.isArray(debugNextAction?.evidence), "debug diagnostics next action missing evidence");
-      checked.push("browser-check", "browser-audit", "debug-diagnostics");
+      const sourceContextDraft = await requestJson(baseUrl, "/api/source-context-repair-draft", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({
+          prompt: "api smoke source context repair",
+          command: "node --check server.js",
+          result: {
+            exitCode: 1,
+            output: "SyntaxError: api smoke fixture at server.js:1:1",
+            failureAnalysis: { category: "syntax", summary: "api smoke source context fixture" }
+          },
+          diagnostics: debugDiagnostics.diagnostics,
+          locations: [{ path: "server.js", line: 1, column: 1 }],
+          contextLines: 2,
+          limit: 1,
+          dryRun: true
+        })
+      });
+      assertSmoke(sourceContextDraft.policy?.source === "source-context-repair", "source context repair missing policy source");
+      assertSmoke(sourceContextDraft.policy?.dryRun === true, "source context repair smoke should run in dry-run mode");
+      assertSmoke(sourceContextDraft.policy?.writesFiles === false, "source context repair should not write files directly");
+      assertSmoke(sourceContextDraft.sourceContextSummary?.requested === 1, "source context repair missing requested source location count");
+      assertSmoke(sourceContextDraft.sourceContextSummary?.returned >= 1, "source context repair did not return source context");
+      assertSmoke(Array.isArray(sourceContextDraft.contexts), "source context repair missing contexts");
+      assertSmoke(
+        sourceContextDraft.reply || sourceContextDraft.diff || sourceContextDraft.proposal || sourceContextDraft.policy,
+        "source context repair did not return a usable draft payload"
+      );
+      checked.push("browser-check", "browser-audit", "debug-diagnostics", "source-context-repair-draft");
     }
 
     if (shouldRun("semantic")) {
@@ -15064,6 +17053,9 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(partialApply.status?.startsWith("partial_"), "partial apply missing partial status");
       assertSmoke(partialApply.selectedHunks?.[0]?.path === applyFixtureAName, "partial apply missing selected hunk audit");
       assertSmoke(partialApply.policy?.selectedHunks === 1, "partial apply missing selected hunk policy count");
+      assertSmoke(partialApply.recovery?.verification?.skipped === true, "partial apply missing skipped recovery summary");
+      assertSmoke(partialApply.recovery?.verificationCommands?.length >= 1, "partial apply missing recovery verification commands");
+      assertSmoke(partialApply.recovery?.nextActions?.some((item) => /复查|检查/.test(item)), "partial apply missing recovery next action");
       checked.push("apply", "diff-conflicts", "partial-apply");
     }
 
@@ -15163,7 +17155,16 @@ async function runApiSmokeSectionTest(sectionValue = "") {
         body: JSON.stringify({ id: remotePublishPlan.package.id, limit: 5 })
       });
       assertSmoke(remotePublishPreflight.preflight?.policy?.pushes === false, "remote publish preflight should not push");
-      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight");
+      const remotePublishContinuation = await requestJson(baseUrl, "/api/remote-publish-continuation", {
+        method: "POST",
+        body: JSON.stringify({ id: remotePublishPlan.package.id, limit: 5 })
+      });
+      assertSmoke(remotePublishContinuation.continuation?.policy?.pushes === false, "remote publish continuation should not push");
+      assertSmoke(remotePublishContinuation.continuation?.policy?.writesLocalArtifacts === true, "remote publish continuation missing local artifact policy");
+      assertSmoke(remotePublishContinuation.continuation?.paths?.continuation?.endsWith("continuation.md"), "remote publish continuation missing continuation artifact");
+      assertSmoke(remotePublishContinuation.continuation?.paths?.evidenceTemplate?.endsWith("external-evidence-template.json"), "remote publish continuation missing evidence template artifact");
+      assertSmoke(Array.isArray(remotePublishContinuation.continuation?.verificationCommands), "remote publish continuation missing verification commands");
+      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight", "remote-publish-continuation");
     }
 
     console.log(JSON.stringify({
@@ -15215,6 +17216,8 @@ async function runUiSmokeTest() {
     "referencePreview",
     "approveBtn",
     "approvePartialBtn",
+    "preApplyReviewBtn",
+    "pendingDiffImpactBtn",
     "toggleAllDiffBtn",
     "copyAllDiffBtn",
     "reviewBtn",
@@ -15291,13 +17294,32 @@ async function runUiSmokeTest() {
     "function buildCapabilityGapListContext",
     "function appendCapabilityGapListToPrompt",
     "function runCapabilityGapListRepair",
+    "function capabilityTaskPlan",
+    "function capabilityExternalDependency",
+    "function capabilityVerificationCommandPlan",
+    "function formatCapabilityTaskPlan",
+    "function appendCapabilityTaskCard",
+    "function stageCapabilityTaskCommands",
+    "能力补齐任务",
+    "任务卡",
+    "能力任务验证命令已放入面板",
     "写代码/调试覆盖",
+    "本地可执行能力优先",
     "Codex 对标需求",
     "本地补齐",
     "授权清单",
     "本地能力缺口补齐",
     "外部阻塞授权清单",
     "capability-scorecard",
+    "capability-gap-summary",
+    "剩余差距摘要",
+    "能力差距摘要",
+    "准备清单",
+    "预检命令",
+    "function stageExternalPreparationReadinessCommands",
+    "外部准备预检命令已放入面板",
+    "外部缺口准备清单已加入提示词",
+    "externalPreparation",
     "recommendedNext",
     "function selectCapabilityRecommendation",
     "function buildCapabilityGapContext",
@@ -15311,12 +17333,20 @@ async function runUiSmokeTest() {
     "能力补齐验证上下文",
     "能力差距已加入提示词",
     "已启动能力差距补齐",
+    "已启动外部能力准备",
     "function renderToolCatalog",
     "function renderExtensionCatalog",
     "function renderMcpCatalog",
     "function buildCatalogEvidenceContext",
     "function appendCatalogEvidenceToPrompt",
     "function runCatalogEvidenceRepair",
+    "function catalogEvidenceGuidance",
+    "function catalogRepairActionLabel",
+    "function catalogCallActionLabel",
+    "动作语义",
+    "安全边界",
+    "目录修复",
+    "审批示例",
     "function buildMcpResourceEvidenceContext",
     "function appendMcpResourceEvidenceToPrompt",
     "function runMcpResourceEvidenceRepair",
@@ -15336,6 +17366,7 @@ async function runUiSmokeTest() {
     "function renderThreads",
     "function renderMessages",
     "function buildThreadPromptContext",
+    "会话关联浏览器异常分诊",
     "function appendThreadContextToPrompt",
     "function runThreadContinuation",
     "function appendThreadFailureEvidence",
@@ -15345,18 +17376,24 @@ async function runUiSmokeTest() {
     "function refreshThreads",
     "function renderGoal",
     "function recommendedCapabilityFromState",
+    "function formatBrowserTriageContinuation",
     "function buildGoalContinuationPrompt",
     "lastRecoverySummary",
     "恢复摘要",
+    "页面调试线索",
     "goal-recovery-summary",
     "function appendGoalContinuationToPrompt",
     "function runGoalContinuation",
     "data-goal-action",
+    "data-goal-action=\"readiness\"",
+    "能力缺口：本地",
+    "本地预检：",
     "可恢复状态已加入提示词",
     "已启动可恢复状态继续",
     "继续目标",
     "function restorePendingProposal",
     "function buildQueuePromptContext",
+    "队列关联浏览器异常分诊",
     "function appendQueueContextToPrompt",
     "function runQueueContinuation",
     "async function stageQueueVerificationCommands",
@@ -15387,6 +17424,11 @@ async function runUiSmokeTest() {
     "function runProcessEvidenceRepair",
     "function appendProcessFailureEvidence",
     "function runProcessBrowserEvidence",
+    "function processBrowserDebugVerificationCommands",
+    "function appendProcessBrowserDebugRecovery",
+    "function browserTraceTriage",
+    "browserTriage",
+    "浏览器异常分诊",
     "async function startManagedProcessCommand",
     "async function waitForManagedProcessProbe",
     "async function discoverStartupCommand",
@@ -15403,6 +17445,10 @@ async function runUiSmokeTest() {
     "发现并启动失败",
     "启动命令发现失败",
     "进程页面一键调试",
+    "启动后页面调试恢复",
+    "启动后页面复查命令",
+    "启动后页面调试恢复已加入提示词",
+    "异常分诊",
     "process-browser-debug",
     "进程页面检查",
     "进程页面 Trace",
@@ -15413,6 +17459,7 @@ async function runUiSmokeTest() {
     "function buildTaskPromptContext",
     "function appendTaskContextToPrompt",
     "function runTaskContinuation",
+    "任务关联浏览器异常分诊",
     "async function stageTaskVerificationCommands",
     "部分应用 hunk",
     "失败命令",
@@ -15432,15 +17479,26 @@ async function runUiSmokeTest() {
     "function buildApprovalPromptContext",
     "function appendApprovalContextToPrompt",
     "function runApprovalSafeAlternative",
+    "function approvalVerificationCommands",
+    "function stageApprovalVerificationCommands",
+    "function buildApprovalBlockerPrompt",
+    "function appendApprovalBlockerPromptToPrompt",
+    "function runApprovalBlockerFix",
     "function appendApprovalEscalationEvidence",
     "function createApprovalEscalationEvidence",
     "function appendApprovalPlanCard",
     "function appendApprovalExecutionCard",
+    "审批验证命令已放入面板",
+    "审批阻塞提示已加入提示词",
+    "已启动审批阻塞修复",
     "升级证据",
     "审批升级证据包",
     "function buildActionFailureContext",
+    "function actionFailureVerificationCommands",
+    "function stageActionFailureVerificationCommands",
     "function appendActionFailureEvidence",
     "动作失败证据已加入提示词",
+    "动作失败验证命令已放入面板",
     "已启动动作失败诊断修复",
     "刷新工作台失败证据",
     "任务入队失败证据",
@@ -15456,6 +17514,10 @@ async function runUiSmokeTest() {
     "/api/model-cost-policy",
     "/api/model-billing",
     "function buildModelEvidencePrompt",
+    "function modelEvidenceVerificationCommands",
+    "function stageModelEvidenceVerificationCommands",
+    "function agentFailureVerificationCommands",
+    "function stageAgentFailureVerificationCommands",
     "function appendModelEvidenceCard",
     "function runModelEvidenceRepair",
     "function buildModelVerificationPrompt",
@@ -15466,32 +17528,45 @@ async function runUiSmokeTest() {
     "function buildAgentFailureContext",
     "function appendAgentFailureEvidence",
     "模型证据已加入提示词",
+    "验证命令已放入面板",
     "已启动模型证据优化",
     "模型验证提示已加入提示词",
     "已启动模型验证修复",
     "代理失败证据已加入提示词",
     "代理失败相关文件已引用",
+    "代理失败验证命令已放入面板",
     "代理失败验证提示已加入提示词",
     "已启动代理失败验证修复",
     "调试诊断相关文件",
     "已启动代理失败诊断修复",
     "function buildApplyFailureContext",
     "function appendApplyFailureEvidence",
+    "function buildApplyVerificationRecoveryContext",
+    "function appendApplyVerificationRecovery",
+    "写入后验证恢复",
+    "写入后复查命令",
+    "写入后验证恢复证据已加入提示词",
     "写入失败证据已加入提示词",
     "已启动写入失败诊断修复",
     "function buildWorkspaceSafetyFailureContext",
+    "function workspaceSafetyVerificationCommands",
+    "function stageWorkspaceSafetyVerificationCommands",
     "function appendWorkspaceSafetyFailureEvidence",
     "工作区安全失败证据已加入提示词",
+    "工作区安全验证命令已放入面板",
     "已启动工作区安全失败诊断修复",
     "/api/context-snapshot",
     "/api/context-compact",
     "/api/context-rollup",
     "function buildContextEvidencePrompt",
+    "function contextEvidenceVerificationCommands",
+    "function stageContextEvidenceVerificationCommands",
     "function appendContextEvidenceCard",
     "function appendContextFailureEvidence",
     "上下文摘要已加入提示词",
     "上下文压缩已加入提示词",
     "上下文滚动摘要已加入提示词",
+    "上下文摘要验证命令已放入面板",
     "已启动上下文继续",
     "/api/verification-plan",
     "/api/ci-status",
@@ -15517,13 +17592,23 @@ async function runUiSmokeTest() {
     "/api/remote-pr-status",
     "/api/remote-publish-plan",
     "/api/remote-publish-packages",
-    "/api/remote-publish-package",
-    "/api/remote-publish-preflight",
-    "function buildBrowserEvidenceContext",
+      "/api/remote-publish-package",
+      "/api/remote-publish-preflight",
+      "/api/remote-publish-continuation",
+      "/api/remote-publish-evidence",
+      "function buildBrowserEvidenceContext",
+    "function browserEvidenceVerificationCommands",
+    "function stageBrowserEvidenceVerificationCommands",
     "browserTrace",
     "browserCheck",
     "function appendBrowserEvidenceToPrompt",
     "function runBrowserEvidenceRepair",
+    "function browserSourceLocations",
+    "function fetchBrowserSourceContexts",
+    "function browserSourceVerificationCommands",
+    "function buildBrowserSourceContextPrompt",
+    "function appendBrowserSourcePromptToPrompt",
+    "function runBrowserSourceContextRepair",
     "function buildBrowserVerificationPrompt",
     "function appendBrowserVerificationPromptToPrompt",
     "function runBrowserVerificationFix",
@@ -15533,8 +17618,16 @@ async function runUiSmokeTest() {
     "function appendBrowserFailureEvidence",
     "浏览器证据已加入提示词",
     "已启动浏览器证据修复",
+    "浏览器源码修复提示已加入",
+    "浏览器源码修复草稿已生成",
+    "浏览器源码修复验证命令已放入命令面板",
+    "data-action=\"source-prompt\"",
+    "data-action=\"source-fix\"",
+    "data-debug-action=\"browser-source-prompt\"",
+    "data-debug-action=\"browser-source-fix\"",
     "浏览器证据验证提示已加入提示词",
     "已启动浏览器证据验证修复",
+    "复查命令已放入命令面板",
     "已引用浏览器证据文件",
     "function renderBrowserCheck",
     "function renderBrowserBaseline",
@@ -15550,6 +17643,7 @@ async function runUiSmokeTest() {
     "function referenceSemanticEvidenceFilesInPrompt",
     "function runSemanticEvidenceRepair",
     "function semanticEvidenceVerificationCommands",
+    "function stageSemanticEvidenceVerificationCommands",
     "function buildSemanticSymbolImpactPrompt",
     "function stageSemanticSymbolImpactCommands",
     "function runSemanticSymbolImpactFix",
@@ -15559,11 +17653,13 @@ async function runUiSmokeTest() {
     "function runSemanticRenamePreviewFix",
     "async function createSemanticRenameDraft",
     "function buildSemanticVerificationPrompt",
+    "语义证据关联浏览器异常分诊",
     "function appendSemanticVerificationPromptToPrompt",
     "function runSemanticVerificationFix",
     "function appendSemanticFailureEvidence",
     "语义证据已加入提示词",
     "已启动语义证据修复",
+    "语义证据验证命令已放入面板",
     "符号影响验证命令已放入面板",
     "符号影响修复证据链已创建",
     "符号影响修复提示已加入提示词",
@@ -15580,6 +17676,12 @@ async function runUiSmokeTest() {
     "function buildGateEvidenceContext",
     "function appendGateEvidenceToPrompt",
     "function buildGateVerificationPrompt",
+    "function gateEvidenceBlockerSummary",
+    "function buildGateBlockerPrompt",
+    "function appendGateBlockerPromptToPrompt",
+    "门禁关联浏览器异常分诊",
+    "function gateEvidenceVerificationCommands",
+    "function stageGateEvidenceVerificationCommands",
     "function appendGateVerificationPromptToPrompt",
     "function runGateVerificationFix",
     "function stageGateEvidenceCommands",
@@ -15593,12 +17695,25 @@ async function runUiSmokeTest() {
     "已启动门禁验证修复",
     "已启动门禁证据修复",
     "已引用门禁证据文件",
+    "门禁阻塞提示已加入提示词",
+    "blocker-prompt",
+    "阻塞提示",
     "门禁检查命令已放入面板",
+    "门禁请求失败验证命令已放入面板",
     "调试验证计划运行失败证据",
     "远端发布审批计划已生成",
     "远端发布包索引已读取",
-    "远端发布预检已生成",
+      "远端发布预检已生成",
+      "远端发布继续包已生成",
+      "function appendRemotePublishContinuationCard",
+      "function appendRemotePublishEvidenceCard",
+      "外部发布证据已回填",
+      "data-action=\"release-evidence\"",
+      "发布回填提示",
     "function renderDebugDiagnostics",
+    "lastDebugDiagnostics",
+    "function pruneDebugDiagnosticsForStorage",
+    "已恢复最近调试诊断",
     "function renderLastFailedCommandCard",
     "function splitPatchHunks",
     "function collectSelectedDiff",
@@ -15620,29 +17735,53 @@ async function runUiSmokeTest() {
     "修复验证证据链",
     "repairContext",
     "function failedCommandItems",
+    "function failedCommandSourceContextItems",
+    "async function appendFailedCommandSourceContexts",
+    "async function runFailedCommandSourceContextRepair",
+    "prompt-failed-source-contexts",
+    "run-failed-source-context-fix",
+    "失败源码上下文已加入提示词",
+    "失败源码上下文汇总",
+    "批量失败源码上下文读取失败",
+    "批量源码修复草稿已生成",
+    "批量源码修复验证命令已放入命令面板",
+    "批量源码修复启动失败",
     "function buildAgentDebugContext",
     "function buildDebugFixPrompt",
+    "浏览器异常分诊修复上下文",
+    "页面复查要求",
+    "分诊建议验证命令",
     "debugContext.referencedFiles",
+    "debugContext.browserTriage",
     "function buildReviewFixPrompt",
     "function buildReviewArtifactPromptContext",
     "function appendReviewArtifactContextToPrompt",
     "function runReviewArtifactRepair",
     "function buildReviewArtifactVerificationPrompt",
+    "审查关联浏览器异常分诊",
     "function appendReviewArtifactVerificationPromptToPrompt",
     "function runReviewArtifactVerificationFix",
+    "function reviewArtifactVerificationCommands",
+    "function stageReviewArtifactVerificationCommands",
     "function appendReviewArtifactFailureEvidence",
+    "审查验证命令已放入面板",
+    "审查失败证据",
     "function buildReviewCommentsContext",
     "function appendReviewCommentsToPrompt",
     "function runReviewCommentsRepair",
     "function buildReviewCommentsVerificationPrompt",
+    "PR 评论关联浏览器异常分诊",
     "function appendReviewCommentsVerificationPromptToPrompt",
     "function runReviewCommentsVerificationFix",
+    "function reviewCommentsVerificationCommands",
+    "function stageReviewCommentsVerificationCommands",
     "function appendReviewCommentsCard",
     "审查证据已加入提示词",
     "已启动历史审查修复",
     "审查验证提示已加入提示词",
     "已启动审查验证修复",
     "PR 评论草稿已加入提示词",
+    "PR 评论验证命令已放入面板",
     "已启动 PR 评论修复",
     "PR 评论验证提示已加入提示词",
     "已启动 PR 评论验证修复",
@@ -15657,6 +17796,8 @@ async function runUiSmokeTest() {
     "function referenceDebugEvidenceFilesInPrompt",
     "已引用调试诊断文件",
     "function buildDebugPromptContext",
+    "浏览器分诊摘要",
+    "分诊下一步",
     "function appendDebugContextToPrompt",
     "function buildCommandTranscript",
     "function formatCommandRecoveryChain",
@@ -15666,6 +17807,16 @@ async function runUiSmokeTest() {
     "function buildCommandSourceContextPrompt",
     "function commandSourceVerificationCommands",
     "function runCommandSourceContextFix",
+    "data-action=\"source-context\"",
+    "data-action=\"source-context-prompt\"",
+    "data-action=\"source-context-fix\"",
+    "命令行源码定位",
+    "命令行源码修复提示已加入",
+    "命令行源码修复提示生成失败",
+    "/api/source-context-repair-draft",
+    "source_context_repair",
+    "源码定位修复草稿已生成",
+    "源码定位修复草稿已加入证据链",
     "sourceLocations",
     "/api/source-context",
     "function appendCommandTranscriptToPrompt",
@@ -15673,6 +17824,9 @@ async function runUiSmokeTest() {
     "function appendCommandVerificationPromptToPrompt",
     "function runCommandVerificationFix",
     "function runLastFailedCommandVerificationFix",
+    "失败命令修复草稿已生成",
+    "failed_command_repair",
+    "proposalId",
     "function extractReferencedFilesFromCommandRun",
     "function referenceCommandFilesInPrompt",
     "function appendCommandReferencedFilesEvidence",
@@ -15688,6 +17842,7 @@ async function runUiSmokeTest() {
     "可恢复状态验证命令已放入面板",
     "function appendDebugEvidence",
     "function stageDebugActionCommand",
+    "function stageDebugActionCommands",
     "async function runRecommendedDebugAction",
     "function stageManualCommand",
     "function renderCommandHistory",
@@ -15708,17 +17863,24 @@ async function runUiSmokeTest() {
     "快捷检查命令已发现",
     "快捷检查命令",
     "已加入下一步验证命令",
+    "调试建议命令已批量放入面板",
+    "data-debug-action=\"stage-actions\"",
+    "排队建议",
     "已复制下一步验证命令",
     "function verificationPlanCommands",
     "async function runVerificationPlanCommands",
     "function normalizeCommandItems",
     "function buildCommandBatchPromptContext",
     "function appendCommandBatchEvidenceToPrompt",
+    "function buildCommandBatchVerificationPrompt",
+    "function appendCommandBatchVerificationPromptToPrompt",
     "function commandBatchReferencedFiles",
     "function recordRepairVerificationFromBatch",
     "function referenceCommandBatchFilesInPrompt",
     "function commandBatchNeedsRepair",
     "function runCommandBatchEvidenceRepair",
+    "失败命令调试摘要",
+    "最近浏览器异常分诊",
     "function renderCommandToolbar",
     "async function runCommandBatch",
     "function summarizeDiffPatch",
@@ -15750,6 +17912,8 @@ async function runUiSmokeTest() {
     "暂无失败命令可修复",
     "reference-batch-files",
     "prompt-batch-evidence",
+    "batch-verification-prompt",
+    "批量命令验证提示已加入提示词",
     "run-batch-evidence",
     "copy-all-commands",
     "run-fast-smoke",
@@ -15795,6 +17959,18 @@ async function runUiSmokeTest() {
     "直接修复",
     "已生成并启动诊断修复",
     "已复制全部 diff",
+    "function pendingDiffImpactPaths",
+    "async function analyzePendingDiffImpact",
+    "async function runPreApplyReview",
+    "function ensurePreApplyReviewBeforeApply",
+    "批准写入前自动预审查",
+    "预应用审查清单已生成",
+    "批准前自动预审查清单已生成",
+    "lastPreApplyReviewKey",
+    "pre-apply-review",
+    "待审批 diff 影响面已生成",
+    "当前没有待审批 diff",
+    "pending-diff-impact",
     "copy-file-diff",
     "toggle-file-diff",
     "reference-file-from-diff",
@@ -15812,8 +17988,14 @@ async function runUiSmokeTest() {
     "function renderConflictResolution",
     "function createConflictResolutionDraftFromPanel",
     "function buildHandoffPromptContext",
+    "function handoffVerificationCommands",
+    "function stageHandoffVerificationCommands",
+    "function buildHandoffVerificationPrompt",
+    "function appendHandoffVerificationPromptToPrompt",
     "function appendHandoffEvidenceCard",
     "交付草稿已加入提示词",
+    "交付草稿验证命令已放入面板",
+    "交付草稿验证提示已加入提示词",
     "已启动交付草稿继续",
     "/api/health",
     "/api/threads",
@@ -15850,7 +18032,9 @@ async function runUiSmokeTest() {
     "/api/process-startup-commands",
     "/api/process-health",
     "/api/process-search",
-    "/api/process-history"
+    "/api/process-history",
+    "/api/runtime-url",
+    "runtime_url"
   ];
   for (const hook of appHooks) {
     assertIncludes(app, hook, `app.js missing ${hook}`);
@@ -15862,6 +18046,7 @@ async function runUiSmokeTest() {
     ".capability-score-actions",
     ".capability-requirement",
     ".capability-recommendation",
+    ".capability-actions",
     ".capability-row",
     ".goal-state",
     ".goal-actions",
@@ -15912,6 +18097,9 @@ async function runUiSmokeTest() {
     "missingReferences",
     "debugContextAttached",
     "/api/prompt-references",
+    "if (req.method === \"POST\" && url.pathname === \"/api/source-context-repair-draft\")",
+    "function buildSourceContextRepairDraft",
+    "function isExternalCapabilityDependency",
     "未命中的 @file 引用",
     "referencedFiles",
     "promptReferences"
@@ -16124,6 +18312,7 @@ async function runApiSmokeTest() {
   const originalContextCompact = await fs.readFile(CONTEXT_COMPACT_PATH, "utf8").catch(() => null);
   const originalContextRollup = await fs.readFile(CONTEXT_ROLLUP_PATH, "utf8").catch(() => null);
   const originalSemanticIndex = await fs.readFile(SEMANTIC_INDEX_PATH, "utf8").catch(() => null);
+  const originalRuntimeUrl = await fs.readFile(RUNTIME_URL_PATH, "utf8").catch(() => null);
   smokeStep("snapshot-approvals");
   const originalApprovals = await snapshotApprovalDir();
   smokeStep("listen");
@@ -16150,6 +18339,10 @@ async function runApiSmokeTest() {
     processFixturePath: "",
     commandFailureFixturePath: "",
     commandFailureFixturePaths: [],
+    browserSourceTracePagePath: "",
+    browserSourceTraceScriptPath: "",
+    browserSourceTracePath: "",
+    browserSourceDebugTracePath: "",
     extensionFixtureDir: "",
     mcpFixturePath: "",
     mcpOriginalFixture: null,
@@ -16171,7 +18364,8 @@ async function runApiSmokeTest() {
     browserVisualDiffPath: "",
     browserVisualScreenshotPaths: [],
     processLogPaths: [],
-    processId: ""
+    processId: "",
+    semanticApiContractFixturePath: ""
   };
   try {
     smokeStep("health");
@@ -16196,6 +18390,10 @@ async function runApiSmokeTest() {
     assertSmoke(Array.isArray(health.modelBudget?.checks), "health model budget missing checks");
     assertSmoke(health.modelCost?.policy?.bundledPrices === false, "health model cost should not use bundled prices");
     assertSmoke(typeof health.modelCost?.estimatedCost === "number", "health model cost missing estimate");
+    assertSmoke(health.runtimeUrl?.url?.startsWith(baseUrl), "health missing current runtime URL");
+    const runtimeUrlStatus = await requestJson(baseUrl, "/api/runtime-url");
+    assertSmoke(runtimeUrlStatus.runtimeUrl?.url?.startsWith(baseUrl), "runtime-url endpoint missing current URL");
+    assertSmoke(runtimeUrlStatus.runtimeUrl?.policy?.executesCommands === false, "runtime-url endpoint should be read-only");
     assertSmoke(Array.isArray(health.tools?.tools), "health did not include tool catalog");
     assertSmoke(Array.isArray(health.extensions?.extensions), "health did not include extension catalog");
     assertSmoke(Array.isArray(health.mcp?.servers), "health did not include MCP catalog");
@@ -16307,6 +18505,39 @@ async function runApiSmokeTest() {
     assertSmoke(browserTrace.summary?.network >= 1, "browser trace did not capture network evidence");
     cleanup.browserTracePath = path.join(APP_ROOT, browserTrace.artifactPath);
 
+    smokeStep("browser-trace-source-locations");
+    const browserSourceId = `.forge-browser-source-smoke-${Date.now()}`;
+    const browserSourcePageName = `${browserSourceId}.html`;
+    const browserSourceScriptName = `${browserSourceId}.js`;
+    cleanup.browserSourceTracePagePath = path.join(APP_ROOT, browserSourcePageName);
+    cleanup.browserSourceTraceScriptPath = path.join(APP_ROOT, browserSourceScriptName);
+    await fs.writeFile(cleanup.browserSourceTraceScriptPath, [
+      "function forgeBrowserSourceSmoke() {",
+      "  throw new Error('forge browser source smoke');",
+      "}",
+      "setTimeout(forgeBrowserSourceSmoke, 0);",
+      ""
+    ].join("\n"), "utf8");
+    await fs.writeFile(cleanup.browserSourceTracePagePath, [
+      "<!doctype html>",
+      "<html lang=\"en\">",
+      "<head><meta charset=\"utf-8\"><title>Forge Browser Source Smoke</title></head>",
+      "<body><script src=\"./" + browserSourceScriptName + "\"></script></body>",
+      "</html>",
+      ""
+    ].join("\n"), "utf8");
+    const browserSourceTrace = await requestJson(baseUrl, "/api/browser-trace", {
+      method: "POST",
+      timeoutMs: 150000,
+      body: JSON.stringify({ url: `${baseUrl}/${browserSourcePageName}`, waitMs: 1200 })
+    });
+    cleanup.browserSourceTracePath = browserSourceTrace.artifactPath ? path.join(APP_ROOT, browserSourceTrace.artifactPath) : "";
+    assertSmoke(browserSourceTrace.summary?.exceptions >= 1, "browser source trace did not capture runtime exception");
+    assertSmoke(
+      browserSourceTrace.exceptions?.some((item) => item.sourceLocations?.some((location) => location.path === browserSourceScriptName && location.line >= 1)),
+      "browser source trace did not map exception to workspace source"
+    );
+
     smokeStep("debug-diagnostics");
     const debugDiagnostics = await requestJson(baseUrl, "/api/debug-diagnostics", {
       method: "POST",
@@ -16315,10 +18546,28 @@ async function runApiSmokeTest() {
     });
     assertSmoke(debugDiagnostics.diagnostics?.policy?.executesCommands === false, "debug diagnostics should be read-only by default");
     assertSmoke(debugDiagnostics.diagnostics?.summary?.traceCaptured === true, "debug diagnostics missing browser trace");
+    assertSmoke(debugDiagnostics.diagnostics?.browserTriage?.status, "debug diagnostics missing browser triage");
+    assertSmoke(Array.isArray(debugDiagnostics.diagnostics?.browserTriage?.findings), "debug diagnostics browser triage missing findings");
     assertSmoke(Array.isArray(debugDiagnostics.diagnostics?.findings), "debug diagnostics missing findings array");
     assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item) => Number.isFinite(Number(item.priority))), "debug diagnostics actions missing priorities");
     assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item) => item.kind), "debug diagnostics actions missing kind");
     assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item, index, list) => index === 0 || Number(list[index - 1].priority) >= Number(item.priority)), "debug diagnostics actions are not priority sorted");
+    const browserSourceDebugDiagnostics = await requestJson(baseUrl, "/api/debug-diagnostics", {
+      method: "POST",
+      timeoutMs: 150000,
+      body: JSON.stringify({ url: `${baseUrl}/${browserSourcePageName}`, includeTrace: true, runChecks: false, limit: 8 })
+    });
+    cleanup.browserSourceDebugTracePath = browserSourceDebugDiagnostics.diagnostics?.browserTrace?.artifactPath
+      ? path.join(APP_ROOT, browserSourceDebugDiagnostics.diagnostics.browserTrace.artifactPath)
+      : "";
+    assertSmoke(
+      browserSourceDebugDiagnostics.diagnostics?.browserSourceLocations?.some((location) => location.path === browserSourceScriptName && location.line >= 1),
+      "debug diagnostics missing browser source location evidence"
+    );
+    assertSmoke(
+      browserSourceDebugDiagnostics.diagnostics?.nextActions?.some((item) => item.id === "inspect-browser-source" && item.evidence?.some((entry) => entry.includes(browserSourceScriptName))),
+      "debug diagnostics missing browser source inspection action"
+    );
 
     smokeStep("command-failure-diagnostics");
     cleanup.commandFailureFixturePath = path.join(currentWorkspace, `.forge-command-failure-smoke-${Date.now()}.js`);
@@ -16361,13 +18610,20 @@ async function runApiSmokeTest() {
       },
       {
         name: "missing-file",
-        body: "const fs = require('node:fs');\nfs.readFileSync('./missing-command-failure-fixture.txt', 'utf8');\n",
+        body: "import fs from 'node:fs';\nfs.readFileSync('./missing-command-failure-fixture.txt', 'utf8');\n",
         assertOutput: /ENOENT|no such file or directory/i
       },
       {
         name: "port-in-use",
-        body: "const http = require('node:http');\nconst first = http.createServer((req, res) => res.end('first'));\nfirst.listen(0, '127.0.0.1', () => {\n  const address = first.address();\n  http.createServer((req, res) => res.end('second')).listen(address.port, '127.0.0.1');\n});\nsetTimeout(() => {}, 2000);\n",
+        body: "import http from 'node:http';\nconst first = http.createServer((req, res) => res.end('first'));\nfirst.listen(0, '127.0.0.1', () => {\n  const address = first.address();\n  http.createServer((req, res) => res.end('second')).listen(address.port, '127.0.0.1');\n});\nsetTimeout(() => {}, 2000);\n",
         assertOutput: /EADDRINUSE|address already in use/i
+      },
+      {
+        name: "package-manager",
+        command: "npm run check",
+        body: "node:internal/modules/cjs/loader:1520\n  throw err;\n  ^\n\nError: Cannot find module 'C:\\Users\\tester\\AppData\\Roaming\\npm\\node_modules\\npm\\bin\\npm-cli.js'\n    at Module._resolveFilename (node:internal/modules/cjs/loader:1517:15) {\n  code: 'MODULE_NOT_FOUND'\n}\n\nNode.js v24.18.0\n",
+        exitCode: 1,
+        assertOutput: /npm-cli\.js|MODULE_NOT_FOUND/i
       }
     ];
     for (const testCase of commandFailureCases) {
@@ -16375,11 +18631,21 @@ async function runApiSmokeTest() {
       cleanup.commandFailureFixturePaths.push(fixturePath);
       await fs.writeFile(fixturePath, testCase.body, "utf8");
       const fixtureName = toPosix(path.relative(currentWorkspace, fixturePath));
-      const commandFailure = await requestJson(baseUrl, "/api/command", {
-        method: "POST",
-        timeoutMs: 120000,
-        body: JSON.stringify({ command: `node ${fixtureName} --smoke-test` })
-      });
+      const commandFailure = testCase.command
+        ? {
+            exitCode: testCase.exitCode || 1,
+            output: testCase.body,
+            failureAnalysis: classifyCommandFailure(testCase.command, { exitCode: testCase.exitCode || 1, output: testCase.body })
+          }
+        : await requestJson(baseUrl, "/api/command", {
+            method: "POST",
+            timeoutMs: 120000,
+            body: JSON.stringify({ command: `node ${fixtureName} --smoke-test` })
+          });
+      if (testCase.command) {
+        commandFailure.diagnostics = { commandFailure: commandFailure.failureAnalysis, findings: [{ area: "command", message: commandFailure.failureAnalysis.summary }] };
+        commandFailure.recoveryChain = buildFailureRecoveryChain(testCase.command, commandFailure, commandFailure.diagnostics);
+      }
       assertSmoke(commandFailure.exitCode !== 0, `${testCase.name} command failure unexpectedly passed`);
       assertSmoke(testCase.assertOutput.test(String(commandFailure.output || "")), `${testCase.name} command failure missing expected output evidence`);
       assertSmoke(commandFailure.failureAnalysis?.category === testCase.name, `${testCase.name} command failure classification mismatch`);
@@ -16388,6 +18654,10 @@ async function runApiSmokeTest() {
       assertSmoke(commandFailure.failureAnalysis?.nextActions?.length >= 1, `${testCase.name} command failure missing next action`);
       assertSmoke(commandFailure.recoveryChain?.category === testCase.name, `${testCase.name} recovery chain category mismatch`);
       assertSmoke(commandFailure.recoveryChain?.commands?.length >= 2, `${testCase.name} recovery chain missing commands`);
+      if (testCase.name === "package-manager") {
+        assertSmoke(commandFailure.recoveryChain?.commands?.some((item) => item.stage === "verify-toolchain-fallback" && /^node /.test(item.command)), "package-manager recovery chain missing node fallback command");
+        assertSmoke(commandFailure.recoveryChain?.commands?.some((item) => item.command === "validate.bat --no-pause"), "package-manager recovery chain missing validate.bat fallback command");
+      }
     }
 
     smokeStep("browser-interact");
@@ -16685,6 +18955,27 @@ async function runApiSmokeTest() {
     assertSmoke(semanticDiagnostics.summary && typeof semanticDiagnostics.summary.total === "number", "semantic diagnostics missing summary");
     assertSmoke(Array.isArray(semanticDiagnostics.diagnostics), "semantic diagnostics missing diagnostics list");
     assertSmoke(semanticDiagnostics.checked?.indexedFiles >= 1, "semantic diagnostics missing checked evidence");
+    assertSmoke(typeof semanticDiagnostics.checked?.apiMethodContracts === "number", "semantic diagnostics missing API method contract count");
+    cleanup.semanticApiContractFixturePath = path.join(currentWorkspace, `.forge-api-contract-smoke-${Date.now()}.js`);
+    await fs.writeFile(cleanup.semanticApiContractFixturePath, [
+      "async function api(path, options = {}) { return { path, options }; }",
+      "api('/api/health', { method: 'POST' });",
+      "api('/api/command', { method: 'POST' });",
+      ""
+    ].join("\n"), "utf8");
+    await requestJson(baseUrl, "/api/semantic-index", { method: "POST" });
+    const semanticContractDiagnostics = await requestJson(baseUrl, "/api/semantic-diagnostics", {
+      method: "POST",
+      body: JSON.stringify({ limit: 120, includeContext: true })
+    });
+    assertSmoke(
+      semanticContractDiagnostics.diagnostics?.some((item) => item.category === "api-method-mismatch" && item.evidence?.route === "/api/health" && item.evidence?.clientMethod === "POST"),
+      "semantic diagnostics missing API method mismatch evidence"
+    );
+    assertSmoke(
+      !semanticContractDiagnostics.diagnostics?.some((item) => item.category === "api-method-mismatch" && item.evidence?.route === "/api/command"),
+      "semantic diagnostics reported false API method mismatch for POST /api/command"
+    );
     smokeStep("semantic-impact");
     const semanticImpact = await requestJson(baseUrl, "/api/semantic-impact", {
       method: "POST",
@@ -16765,8 +19056,26 @@ async function runApiSmokeTest() {
     assertSmoke(capabilities.capabilities.some((item) => item.status !== "implemented"), "capabilities endpoint should expose remaining gaps");
     assertSmoke(capabilities.recommendedNext?.capability?.area, "capabilities endpoint missing recommended next gap");
     assertSmoke(capabilities.recommendedNext?.reason, "capabilities endpoint missing recommendation reason");
+    assertSmoke(capabilities.recommendedNext?.capability?.taskPlan?.verificationCommands?.length >= 1, "capabilities endpoint missing recommended task plan commands");
+    assertSmoke(capabilities.recommendedNext?.capability?.taskPlan?.acceptance?.length >= 1, "capabilities endpoint missing recommended task plan acceptance criteria");
+    assertSmoke(capabilities.gapSummary?.totalOutstanding >= 1, "capabilities endpoint missing gap summary total");
+    assertSmoke(typeof capabilities.gapSummary?.localActionableCount === "number", "capabilities endpoint missing local gap summary count");
+    assertSmoke(typeof capabilities.gapSummary?.externalBlockedCount === "number", "capabilities endpoint missing external gap summary count");
+    assertSmoke(Array.isArray(capabilities.gapSummary?.topLocalGaps), "capabilities endpoint missing top local gap summary");
+    assertSmoke(Array.isArray(capabilities.gapSummary?.topExternalGaps), "capabilities endpoint missing top external gap summary");
+    assertSmoke(capabilities.gapSummary?.recommendedGap?.verificationCommands?.length >= 1, "capabilities endpoint missing recommended gap summary commands");
+    assertSmoke(capabilities.gapSummary?.externalPreparation?.authorizationItems?.length >= 1, "capabilities endpoint missing external preparation authorization list");
+    assertSmoke(capabilities.gapSummary?.externalPreparation?.localReadinessCommands?.length >= 1, "capabilities endpoint missing external preparation local readiness commands");
+    assertSmoke(capabilities.gapSummary?.topExternalGaps?.some((item) => item.externalPreparation?.authorizationItems?.length >= 1), "capabilities endpoint missing per-gap external preparation");
     assertSmoke(capabilities.comparison?.requirements?.some((item) => item.id === "debug-loop"), "capabilities endpoint missing code/debug comparison");
     assertSmoke(Array.isArray(capabilities.comparison?.outstandingGaps), "capabilities endpoint missing outstanding gap list");
+    assertSmoke(capabilities.comparison?.outstandingGaps?.every((item) => item.taskPlan?.policy?.source === "capability-task-plan"), "capabilities endpoint missing task plan evidence on outstanding gaps");
+    assertSmoke(Array.isArray(capabilities.comparison?.localActionableGaps), "capabilities endpoint missing local actionable gap list");
+    assertSmoke(Array.isArray(capabilities.comparison?.externalBlockedGaps), "capabilities endpoint missing external blocked gap list");
+    const reviewCapability = capabilities.capabilities.find((item) => item.area === "代码审查证据");
+    assertSmoke(reviewCapability?.evidence?.some((item) => String(item).includes("排队验证")), "capabilities endpoint missing review verification staging evidence");
+    const verificationCapability = capabilities.capabilities.find((item) => item.area === "验证与修复闭环");
+    assertSmoke(verificationCapability?.evidence?.some((item) => String(item).includes("reviewArtifactVerificationCommands")), "capabilities endpoint missing review verification command evidence");
 
     smokeStep("tools");
     const tools = await requestJson(baseUrl, "/api/tools");
@@ -16779,6 +19088,8 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "model_cost_policy"), "tools endpoint missing model_cost_policy");
     assertSmoke(tools.tools.some((item) => item.name === "model_billing"), "tools endpoint missing model_billing");
     assertSmoke(tools.tools.some((item) => item.name === "context_rollup"), "tools endpoint missing context_rollup");
+    const modelCapability = capabilities.capabilities.find((item) => item.area === "模型运行层");
+    assertSmoke(modelCapability?.evidence?.some((item) => String(item).includes("agentFailureVerificationCommands")), "capabilities endpoint missing agent failure verification command evidence");
     assertSmoke(tools.tools.some((item) => item.name === "verification_plan"), "tools endpoint missing verification_plan");
     assertSmoke(tools.tools.some((item) => item.name === "ci_status"), "tools endpoint missing ci_status");
     assertSmoke(tools.tools.some((item) => item.name === "debug_diagnostics"), "tools endpoint missing debug_diagnostics");
@@ -16787,11 +19098,13 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "remote_publish_packages"), "tools endpoint missing remote_publish_packages");
     assertSmoke(tools.tools.some((item) => item.name === "remote_publish_package"), "tools endpoint missing remote_publish_package");
     assertSmoke(tools.tools.some((item) => item.name === "remote_publish_preflight"), "tools endpoint missing remote_publish_preflight");
+    assertSmoke(tools.tools.some((item) => item.name === "remote_publish_continuation"), "tools endpoint missing remote_publish_continuation");
     assertSmoke(tools.tools.some((item) => item.name === "policy_audit"), "tools endpoint missing policy_audit");
     assertSmoke(tools.tools.some((item) => item.name === "permission_matrix"), "tools endpoint missing permission_matrix");
     assertSmoke(tools.tools.some((item) => item.name === "extension_trust"), "tools endpoint missing extension_trust");
     assertSmoke(tools.tools.some((item) => item.name === "queue_isolation"), "tools endpoint missing queue_isolation");
     assertSmoke(tools.tools.some((item) => item.name === "process_health"), "tools endpoint missing process_health");
+    assertSmoke(tools.tools.some((item) => item.name === "runtime_url"), "tools endpoint missing runtime_url");
     assertSmoke(tools.tools.some((item) => item.name === "code_intelligence"), "tools endpoint missing code_intelligence");
     assertSmoke(tools.tools.some((item) => item.name === "semantic_index"), "tools endpoint missing semantic_index");
     assertSmoke(tools.tools.some((item) => item.name === "symbol_outline"), "tools endpoint missing symbol_outline");
@@ -17130,6 +19443,10 @@ async function runApiSmokeTest() {
     assertSmoke(partialApply.policy?.allowPartial === true, "partial apply missing allowPartial policy");
     assertSmoke(partialApply.applied?.some((item) => item.path === applyFixtureAName), "partial apply did not write applicable file");
     assertSmoke(partialApply.conflicts?.some((item) => item.path === applyFixtureBName), "partial apply did not preserve conflict evidence");
+    assertSmoke(partialApply.recovery?.status === partialApply.status, "partial apply recovery missing status");
+    assertSmoke(partialApply.recovery?.changedFiles?.includes(applyFixtureAName), "partial apply recovery missing changed file");
+    assertSmoke(partialApply.recovery?.verificationCommands?.some((item) => item.command === "node --check server.js"), "partial apply recovery missing syntax command");
+    assertSmoke(partialApply.recovery?.nextActions?.length >= 1, "partial apply recovery missing next action");
     assertSmoke((await fs.readFile(cleanup.applyFixtureAPath, "utf8")) === "alpha changed\n", "partial apply did not update applicable file");
     assertSmoke((await fs.readFile(cleanup.applyFixtureBPath, "utf8")) === "bravo\n", "partial apply changed conflicting file");
     cleanup.applyConflictCheckpointPath = partialApply.checkpoint?.id ? path.join(CHECKPOINT_DIR, `${partialApply.checkpoint.id}.json`) : "";
@@ -17165,6 +19482,7 @@ async function runApiSmokeTest() {
     assertSmoke(hunkPartialApply.analysis?.summary?.conflictHunks === 1, "partial hunk apply did not count conflicting hunk");
     assertSmoke(hunkPartialApply.selectedHunks?.[0]?.path === applyHunkFixtureName, "partial hunk apply missing selected hunk audit");
     assertSmoke(hunkPartialApply.policy?.selectedHunks === 1, "partial hunk apply missing selected hunk policy count");
+    assertSmoke(hunkPartialApply.recovery?.selectedHunks?.[0]?.path === applyHunkFixtureName, "partial hunk apply recovery missing selected hunk audit");
     assertSmoke(hunkPartialApply.applied?.some((item) => item.path === applyHunkFixtureName && item.status === "partial" && item.applicableHunks === 1), "partial hunk apply did not write partial file evidence");
     assertSmoke(hunkPartialApply.conflicts?.some((item) => item.path === applyHunkFixtureName && item.hunk?.includes("@@ -4")), "partial hunk apply did not preserve hunk conflict evidence");
     assertSmoke((await fs.readFile(cleanup.applyHunkFixturePath, "utf8")) === "one changed\ntwo\nthree\nfour\n", "partial hunk apply did not update only applicable hunk");
@@ -17355,6 +19673,8 @@ async function runApiSmokeTest() {
     assertSmoke(runningProcess.artifactPath?.includes(".forge/process-logs/"), "managed process missing persistent artifact path");
     const startupCommands = await requestJson(baseUrl, "/api/process-startup-commands?limit=8");
     assertSmoke(startupCommands.policy?.access === "read-only-startup-discovery", "startup discovery missing read-only policy");
+    assertSmoke(startupCommands.policy?.readsRuntimeUrl === true, "startup discovery missing runtime URL policy");
+    assertSmoke(startupCommands.runtimeUrl && typeof startupCommands.runtimeUrl === "object", "startup discovery missing runtime URL state");
     assertSmoke(startupCommands.commands?.[0]?.command === "node server.js", "startup discovery should prioritize expanded direct node start command");
     assertSmoke(startupCommands.commands?.some((item) => item.command === "npm start"), "startup discovery missing package start command fallback");
     assertSmoke(startupCommands.commands?.every((item) => item.policy?.allowed === true), "startup discovery returned non-policy-approved command");
@@ -17374,8 +19694,14 @@ async function runApiSmokeTest() {
         commandIncludes: [".forge-process-smoke.js"],
         expectedStatus: 200,
         expectedOutputIncludes: [processSmokeToken],
+        expectedOutputMatches: ["forge-process-smoke-\\d+"],
         expectedProbeUrlIncludes: ["127.0.0.1"],
-        expectedProbeBodyIncludes: [processSmokeToken]
+        expectedProbeBodyIncludes: [processSmokeToken],
+        expectedProbeBodyMatches: ["forge-process-smoke-\\d+"],
+        unexpectedOutputIncludes: ["SyntaxError", "UnhandledPromiseRejection"],
+        unexpectedOutputMatches: ["\\b(EADDRINUSE|ECONNREFUSED)\\b"],
+        unexpectedProbeBodyIncludes: ["Internal Server Error"],
+        unexpectedProbeBodyMatches: ["\\b(stack trace|fatal)\\b"]
       }]
     }, null, 2), "utf8");
     const processHealthWithRules = await requestJson(baseUrl, `/api/process-health?id=${encodeURIComponent(startedProcess.id)}`);
@@ -17385,8 +19711,14 @@ async function runApiSmokeTest() {
     assertSmoke(healthRuleRow?.probe?.bodySample?.includes(processSmokeToken), "process health probe missing response body evidence");
     assertSmoke(healthRuleRow?.rules?.status === "pass", "process health rule did not pass");
     assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.expectedOutputIncludes?.includes(processSmokeToken)), "process health rule missing output expectation");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.expectedOutputMatches?.includes("forge-process-smoke-\\d+")), "process health rule missing output regex expectation");
     assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.expectedProbeUrlIncludes?.includes("127.0.0.1")), "process health rule missing probe url expectation");
     assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.expectedProbeBodyIncludes?.includes(processSmokeToken)), "process health rule missing probe body expectation");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.expectedProbeBodyMatches?.includes("forge-process-smoke-\\d+")), "process health rule missing probe body regex expectation");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.unexpectedOutputIncludes?.includes("SyntaxError")), "process health rule missing unexpected output guard");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.unexpectedOutputMatches?.includes("\\b(EADDRINUSE|ECONNREFUSED)\\b")), "process health rule missing unexpected output regex guard");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.unexpectedProbeBodyIncludes?.includes("Internal Server Error")), "process health rule missing unexpected probe body guard");
+    assertSmoke(healthRuleRow?.rules?.results?.some((item) => item.unexpectedProbeBodyMatches?.includes("\\b(stack trace|fatal)\\b")), "process health rule missing unexpected probe body regex guard");
     cleanup.processLogPaths.push(path.join(APP_ROOT, runningProcess.logPath));
     cleanup.processLogPaths.push(path.join(APP_ROOT, runningProcess.artifactPath));
     let processSearch = null;
@@ -17548,6 +19880,7 @@ async function runApiSmokeTest() {
     assertSmoke(policyAudit.audit?.policy?.executesCommands === false, "policy audit should not execute commands");
     assertSmoke(Array.isArray(policyAudit.audit?.commandPolicies), "policy audit missing command policies");
     assertSmoke(Array.isArray(policyAudit.audit?.guardrails), "policy audit missing guardrails");
+    assertSmoke(policyAudit.audit?.commandPolicies?.some((item) => item.command === "validate.bat --no-pause" && item.policy?.allowed), "policy audit should allow noninteractive validate.bat");
     const permissionMatrix = await requestJson(baseUrl, "/api/permission-matrix", {
       method: "POST",
       body: JSON.stringify({ limit: 10 })
@@ -17555,13 +19888,21 @@ async function runApiSmokeTest() {
     assertSmoke(permissionMatrix.matrix?.policy?.executesCommands === false, "permission matrix should not execute commands");
     assertSmoke(permissionMatrix.matrix?.policy?.writesRemote === false, "permission matrix should not write remote providers");
     assertSmoke(permissionMatrix.matrix?.summary?.providers >= 3, "permission matrix missing provider summary");
-    assertSmoke(permissionMatrix.matrix?.rows?.some((row) => row.provider === "git-remote" && row.action === "publish_pr" && row.writesRemote === false), "permission matrix missing remote publish guardrail");
+    assertSmoke(permissionMatrix.matrix?.summary?.remoteProviderActions >= 5, "permission matrix missing granular remote provider actions");
+    assertSmoke(permissionMatrix.matrix?.remoteProviderPolicy?.actions?.some((row) => row.action === "push_branch" && row.requiresApproval === true && row.writesRemote === false), "permission matrix missing push_branch guardrail");
+    assertSmoke(permissionMatrix.matrix?.remoteProviderPolicy?.actions?.some((row) => row.action === "ingest_external_evidence" && row.writesRemote === false && row.evidence?.includes("/api/remote-publish-evidence")), "permission matrix missing external evidence ingestion guardrail");
+    assertSmoke(permissionMatrix.matrix?.rows?.every((row) => row.provider !== "git-remote" || row.writesRemote === false), "permission matrix should keep git-remote writes disabled locally");
+    assertSmoke(policyAudit.audit?.remoteProviderPolicy?.some((row) => row.action === "push_branch" && row.requiresExternalEvidence === true), "policy audit missing remote provider permission policy");
+    assertSmoke(!policyAudit.audit?.gaps?.some((item) => /No remote provider permission model/i.test(item)), "policy audit still reports missing remote provider permission model");
     assertSmoke(permissionMatrix.matrix?.rows?.some((row) => row.provider === "workspace" && row.action === "apply_diff" && row.supportsPartialHunks === true), "permission matrix missing partial hunk write evidence");
 
     const prReadiness = await requestJson(baseUrl, "/api/pr-readiness", {
       method: "POST",
       body: JSON.stringify({ prompt: "api smoke PR readiness" })
     });
+    const giteeProjectSmoke = parseGitRemoteProject("https://gitee.com/jsy96/coder.git");
+    assertSmoke(inferGitProvider("https://gitee.com/jsy96/coder.git") === "gitee", "Gitee remote should be detected as gitee provider");
+    assertSmoke(giteeProjectSmoke.provider === "gitee" && giteeProjectSmoke.webUrl === "https://gitee.com/jsy96/coder", "Gitee remote project parsing failed");
     assertSmoke(prReadiness.policy?.pushes === false, "PR readiness should not push to remote");
     assertSmoke(prReadiness.policy?.createsRemotePr === false, "PR readiness should not create remote PR");
     assertSmoke(prReadiness.remote && typeof prReadiness.remote === "object", "PR readiness missing remote status");
@@ -17580,6 +19921,11 @@ async function runApiSmokeTest() {
     assertSmoke(remotePublishPlan.policy?.requiresExplicitApproval === true, "remote publish plan missing approval policy");
     assertSmoke(remotePublishPlan.package?.prBodyPath?.endsWith("pr-body.md"), "remote publish plan missing PR body artifact");
     assertSmoke(remotePublishPlan.package?.reviewSummaryPath?.endsWith("review-summary.md"), "remote publish plan missing review summary artifact");
+    if (remotePublishPlan.provider === "gitee") {
+      assertSmoke(remotePublishPlan.remoteProject?.webUrl?.includes("gitee.com"), "Gitee remote publish plan missing project URL");
+      assertSmoke(remotePublishPlan.commands.some((item) => item.id === "create-gitee-pr-manual" && item.manual === true), "Gitee remote publish plan missing manual PR step");
+      assertSmoke(remotePublishPlan.notes.some((item) => /Gitee/.test(item)), "Gitee remote publish plan missing manual-provider note");
+    }
     assertSmoke(remotePublishPlan.commands.every((item) => !item.command.includes("<pr-body.md>") && !item.command.includes("<review-summary.md>")), "remote publish plan still contains placeholder artifact paths");
     assertSmoke(remotePublishPlan.approval?.id, "remote publish plan missing approval request");
     cleanup.remotePublishDir = remotePublishPlan.package?.dir || "";
@@ -17600,6 +19946,64 @@ async function runApiSmokeTest() {
     assertSmoke(remotePublishPreflight.preflight?.package?.id === remotePublishPlan.package.id, "remote publish preflight missing package id");
     assertSmoke(Array.isArray(remotePublishPreflight.preflight?.commandChecks), "remote publish preflight missing command checks");
     assertSmoke(Array.isArray(remotePublishPreflight.preflight?.blockers), "remote publish preflight missing blockers");
+    if (remotePublishPreflight.preflight?.package?.provider === "gitee") {
+      assertSmoke(remotePublishPreflight.preflight?.cli?.manualProvider === true, "Gitee remote publish preflight missing manual provider marker");
+      assertSmoke(/manual continuation/i.test(remotePublishPreflight.preflight?.cli?.reason || ""), "Gitee remote publish preflight missing manual continuation reason");
+    }
+    const remotePublishContinuation = await requestJson(baseUrl, "/api/remote-publish-continuation", {
+      method: "POST",
+      body: JSON.stringify({ id: remotePublishPlan.package.id, limit: 5 })
+    });
+    assertSmoke(remotePublishContinuation.continuation?.policy?.executesCommands === false, "remote publish continuation should not execute commands");
+    assertSmoke(remotePublishContinuation.continuation?.policy?.pushes === false, "remote publish continuation should not push");
+    assertSmoke(remotePublishContinuation.continuation?.policy?.writesRemoteComments === false, "remote publish continuation should not write comments");
+    assertSmoke(remotePublishContinuation.continuation?.packageId === remotePublishPlan.package.id, "remote publish continuation missing package id");
+    assertSmoke(remotePublishContinuation.continuation?.paths?.continuation?.endsWith("continuation.md"), "remote publish continuation missing continuation markdown");
+    assertSmoke(remotePublishContinuation.continuation?.paths?.evidenceTemplate?.endsWith("external-evidence-template.json"), "remote publish continuation missing external evidence template");
+    assertSmoke(remotePublishContinuation.continuation?.evidenceTemplate?.externalExecution, "remote publish continuation missing external execution template");
+    assertSmoke(remotePublishContinuation.continuation?.verificationCommands?.some((item) => item.command === "node server.js --api-smoke-section=publish"), "remote publish continuation missing publish smoke command");
+    const remotePublishEvidence = await requestJson(baseUrl, "/api/remote-publish-evidence", {
+      method: "POST",
+      body: JSON.stringify({
+        id: remotePublishPlan.package.id,
+        limit: 5,
+        evidence: {
+          ...remotePublishContinuation.continuation.evidenceTemplate,
+          externalExecution: {
+            ...remotePublishContinuation.continuation.evidenceTemplate.externalExecution,
+            executedBy: "api smoke",
+            executedAt: new Date().toISOString(),
+            commandsRun: (remotePublishContinuation.continuation.evidenceTemplate.externalExecution.commandsRun || []).map((item) => ({
+              ...item,
+              status: "completed",
+              outputSummary: "api smoke external evidence"
+            })),
+            remoteUrl: "https://gitee.com/jsy96/coder/pulls/1",
+            prOrMrNumber: "1",
+            ciUrl: "https://gitee.com/jsy96/coder/pipelines/1",
+            reviewCommentUrl: "https://gitee.com/jsy96/coder/pulls/1#note_1",
+            rollbackPlan: "Revert the remote PR branch or close the PR.",
+            notes: "api smoke"
+          }
+        }
+      })
+    });
+    assertSmoke(remotePublishEvidence.evidence?.policy?.writesLocalArtifacts === true, "remote publish evidence should write local artifacts only");
+    assertSmoke(remotePublishEvidence.evidence?.policy?.pushes === false, "remote publish evidence should not push");
+    assertSmoke(remotePublishEvidence.evidence?.status === "ready", "remote publish evidence should validate completed template");
+    assertSmoke(remotePublishEvidence.evidence?.paths?.evidence?.endsWith("external-evidence.json"), "remote publish evidence missing evidence artifact path");
+    assertSmoke(remotePublishEvidence.evidence?.paths?.summary?.endsWith("external-evidence-summary.md"), "remote publish evidence missing summary artifact path");
+    assertSmoke(remotePublishEvidence.evidence?.verificationCommands?.some((item) => item.command === "node server.js --api-smoke-section=publish"), "remote publish evidence missing publish smoke command");
+    const remotePublishPackagesWithEvidence = await requestJson(baseUrl, "/api/remote-publish-packages?limit=5");
+    const evidencePackage = remotePublishPackagesWithEvidence.packages.find((item) => item.id === remotePublishPlan.package.id);
+    assertSmoke(evidencePackage?.externalEvidence?.status === "ready", "remote publish package index missing external evidence summary");
+    assertSmoke(remotePublishPackagesWithEvidence.summary?.withExternalEvidence >= 1, "remote publish package index missing external evidence count");
+    const mergeGateWithExternalEvidence = await requestJson(baseUrl, "/api/merge-gate", {
+      method: "POST",
+      body: JSON.stringify({ prompt: "api smoke merge gate with external evidence", limit: 10 })
+    });
+    assertSmoke(mergeGateWithExternalEvidence.gate?.gates?.some((item) => item.id === "remote-publish-external-evidence"), "merge gate missing remote publish external evidence gate");
+    assertSmoke(mergeGateWithExternalEvidence.gate?.externalEvidence?.status === "ready", "merge gate missing ready external evidence summary");
     const approvedRemotePlan = await requestJson(baseUrl, "/api/approval", {
       method: "PATCH",
       body: JSON.stringify({ id: remotePublishPlan.approval.id, decision: "approved", note: "api smoke remote plan approval" })
@@ -17615,7 +20019,7 @@ async function runApiSmokeTest() {
     console.log(JSON.stringify({
       ok: true,
       apiSmoke: true,
-    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "debug-diagnostics", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-symbol-impact", "semantic-rename-preview", "semantic-rename-draft", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-startup-commands", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight"],
+    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "debug-diagnostics", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-symbol-impact", "semantic-rename-preview", "semantic-rename-draft", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-startup-commands", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight", "remote-publish-continuation", "remote-publish-evidence"],
       queueId: queued.id,
       handoffId: handoff.id
     }));
@@ -17644,6 +20048,10 @@ async function runApiSmokeTest() {
     if (cleanup.browserBaselinePath) await fs.rm(cleanup.browserBaselinePath, { force: true }).catch(() => {});
     if (cleanup.browserScreenshotPath) await fs.rm(cleanup.browserScreenshotPath, { force: true }).catch(() => {});
     if (cleanup.browserTracePath) await fs.rm(cleanup.browserTracePath, { force: true }).catch(() => {});
+    if (cleanup.browserSourceTracePagePath) await fs.rm(cleanup.browserSourceTracePagePath, { force: true }).catch(() => {});
+    if (cleanup.browserSourceTraceScriptPath) await fs.rm(cleanup.browserSourceTraceScriptPath, { force: true }).catch(() => {});
+    if (cleanup.browserSourceTracePath) await fs.rm(cleanup.browserSourceTracePath, { force: true }).catch(() => {});
+    if (cleanup.browserSourceDebugTracePath) await fs.rm(cleanup.browserSourceDebugTracePath, { force: true }).catch(() => {});
     if (cleanup.browserSessionPath) await fs.rm(cleanup.browserSessionPath, { force: true }).catch(() => {});
     if (cleanup.browserVisualBaselinePath) await fs.rm(cleanup.browserVisualBaselinePath, { force: true }).catch(() => {});
     if (cleanup.browserVisualMetaPath) await fs.rm(cleanup.browserVisualMetaPath, { force: true }).catch(() => {});
@@ -17669,6 +20077,7 @@ async function runApiSmokeTest() {
     if (cleanup.escalationPath) await fs.rm(cleanup.escalationPath, { force: true }).catch(() => {});
     if (cleanup.explicitEscalationPath) await fs.rm(cleanup.explicitEscalationPath, { force: true }).catch(() => {});
     if (cleanup.processEscalationPath) await fs.rm(cleanup.processEscalationPath, { force: true }).catch(() => {});
+    if (cleanup.semanticApiContractFixturePath) await fs.rm(cleanup.semanticApiContractFixturePath, { force: true }).catch(() => {});
     if (cleanup.commandFailureFixturePath) await fs.rm(cleanup.commandFailureFixturePath, { force: true }).catch(() => {});
     for (const fixturePath of cleanup.commandFailureFixturePaths || []) {
       await fs.rm(fixturePath, { force: true }).catch(() => {});
@@ -17712,16 +20121,32 @@ async function runApiSmokeTest() {
       await fs.mkdir(STATE_DIR, { recursive: true });
       await fs.writeFile(SEMANTIC_INDEX_PATH, originalSemanticIndex, "utf8");
     }
+    if (originalRuntimeUrl === null) {
+      await fs.rm(RUNTIME_URL_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(RUNTIME_URL_PATH, originalRuntimeUrl, "utf8");
+    }
     currentWorkspace = originalWorkspace;
     await closeSmokeServer(server);
   }
 }
 
 function runCliTask(task) {
-  task().catch((error) => {
-    console.error(error);
-    process.exitCode = 1;
-  });
+  let fallbackExitTimer = null;
+  Promise.resolve()
+    .then(() => task())
+    .then(() => {
+      process.exitCode = process.exitCode || 0;
+      fallbackExitTimer = setTimeout(() => process.exit(process.exitCode || 0), 1000);
+      fallbackExitTimer.unref?.();
+    })
+    .catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+      fallbackExitTimer = setTimeout(() => process.exit(1), 1000);
+      fallbackExitTimer.unref?.();
+    });
 }
 
 if (process.argv.includes("--mcp-smoke-server")) {
@@ -17732,38 +20157,34 @@ if (process.argv.includes("--mcp-smoke-server")) {
   runCliTask(() => runApiSmokeSectionTest(getCliOption("--api-smoke-section")));
 } else if (process.argv.includes("--ui-smoke-test")) {
   runCliTask(runUiSmokeTest);
+} else if (process.argv.includes("--port-conflict-smoke-test")) {
+  runCliTask(runPortConflictSmokeTest);
 } else if (process.argv.includes("--smoke-test")) {
   runCliTask(runSmokeTest);
 } else {
-  const listenWithRetry = (activePort) => {
-    const runtimeServer = createAppServer();
-    runtimeServer.once("error", (error) => {
-      const retryableListenError = error && (error.code === "EADDRINUSE" || error.code === "EACCES");
-      if (retryableListenError) {
-        const reason = error.code === "EACCES" ? "not allowed" : "already in use";
-        const maxRetryPort = Math.min(65535, PORT + PORT_RETRY_LIMIT);
-        if (PORT_AUTO_RETRY && activePort < maxRetryPort) {
-          const nextPort = activePort + 1;
-          console.warn(`Port ${activePort} is ${reason}. Trying ${nextPort}...`);
-          setImmediate(() => listenWithRetry(nextPort));
-          return;
-        }
-        console.error(`Port ${activePort} is ${reason}.`);
-        console.error(`Close the existing process or start Forge Code with another port, for example:`);
-        console.error(`  set PORT=${activePort + 1}`);
-        console.error(`  node server.js`);
-        process.exit(1);
-      }
-      throw error;
-    });
-    runtimeServer.listen(activePort, "127.0.0.1", () => {
+  listenAppServerWithRetry({
+    onRetry({ activePort, nextPort, reason }) {
+      console.warn(`Port ${activePort} is ${reason}. Trying ${nextPort}...`);
+    },
+    onError({ activePort, reason }) {
+      console.error(`Port ${activePort} is ${reason}.`);
+      console.error(`Close the existing process or start Forge Code with another port, for example:`);
+      console.error(`  set PORT=${activePort + 1}`);
+      console.error(`  node server.js`);
+    },
+    onListening({ activePort }) {
       process.env.FORGE_PORT = String(activePort);
       process.env.PORT = String(activePort);
+      persistRuntimeUrlState({ port: activePort, source: "server-listen" }).catch((error) => {
+        console.warn(`Could not persist runtime URL state: ${error.message}`);
+      });
       console.log(`Forge Code running at http://127.0.0.1:${activePort}`);
       console.log(`FORGE_URL=http://127.0.0.1:${activePort}`);
       console.log(`Workspace: ${currentWorkspace}`);
       console.log(`DeepSeek key: ${process.env.DEEPSEEK_API_KEY ? "configured" : "missing"}`);
-    });
-  };
-  listenWithRetry(PORT);
+    }
+  }).catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }
