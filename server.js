@@ -6185,6 +6185,87 @@ async function buildManagedProcessHealth({ id = "", limit = 50 } = {}) {
   };
 }
 
+function selectDebugTargetProcess(rows = []) {
+  const candidates = Array.isArray(rows) ? rows : [];
+  return candidates.find((row) => row.active && row.probe?.url && row.probe?.ok)
+    || candidates.find((row) => row.active && row.probe?.url)
+    || candidates.find((row) => row.active)
+    || candidates.find((row) => row.probe?.url)
+    || candidates[0]
+    || null;
+}
+
+function buildDebugTargetSummary({ runtimeUrl, processHealth, diagnostics, selectedProcess, targetUrl }) {
+  const findings = diagnostics?.findings || [];
+  const browserTriage = diagnostics?.browserTriage || null;
+  const processSummary = processHealth?.summary || {};
+  const errors = findings.filter((item) => item.severity === "error").length;
+  const warnings = findings.filter((item) => item.severity === "warn").length;
+  return {
+    status: errors ? "failing" : warnings || processSummary.unhealthy || processSummary.ruleFailed ? "needs_attention" : "ready",
+    targetUrl: targetUrl || "",
+    source: selectedProcess?.probe?.url ? "managed-process-probe" : runtimeUrl?.browserCheckUrl ? "runtime-url" : "none",
+    processId: selectedProcess?.id || "",
+    command: selectedProcess?.command || "",
+    processHealth: selectedProcess?.health || "",
+    browserTriageStatus: browserTriage?.status || "not_captured",
+    findings: findings.length,
+    errors,
+    warnings,
+    safeCommands: diagnostics?.verificationPlan?.commands?.length || 0
+  };
+}
+
+async function buildDebugTarget({ url = "", commands = [], includeTrace = false, runChecks = false, waitMs = 1500, limit = 20 } = {}) {
+  const max = Math.min(60, Math.max(1, Number(limit) || 20));
+  const [runtimeUrl, processHealth] = await Promise.all([
+    readRuntimeUrlState(),
+    buildManagedProcessHealth({ limit: max })
+  ]);
+  const selectedProcess = selectDebugTargetProcess(processHealth.rows || []);
+  const targetUrl = String(url || selectedProcess?.probe?.url || runtimeUrl?.browserCheckUrl || runtimeUrl?.url || "").trim();
+  const diagnostics = await buildDebugDiagnostics({
+    url: targetUrl,
+    commands: Array.isArray(commands) ? commands : [],
+    includeTrace: Boolean(includeTrace && targetUrl),
+    runChecks: Boolean(runChecks),
+    waitMs,
+    limit: max
+  });
+  const summary = buildDebugTargetSummary({ runtimeUrl, processHealth, diagnostics, selectedProcess, targetUrl });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary,
+    target: {
+      url: targetUrl,
+      runtimeUrl,
+      process: selectedProcess ? {
+        id: selectedProcess.id,
+        command: selectedProcess.command,
+        status: selectedProcess.status,
+        health: selectedProcess.health,
+        active: Boolean(selectedProcess.active),
+        probe: selectedProcess.probe || null,
+        logPath: selectedProcess.logPath || "",
+        artifactPath: selectedProcess.artifactPath || ""
+      } : null
+    },
+    diagnostics,
+    verificationCommands: (diagnostics.verificationPlan?.commands || []).slice(0, 8),
+    nextActions: (diagnostics.nextActions || []).slice(0, 8),
+    policy: {
+      access: "local-debug-target-read-mostly",
+      scope: "currentWorkspace",
+      executesCommands: Boolean(runChecks),
+      capturesBrowserTrace: Boolean(includeTrace && targetUrl),
+      startsProcesses: false,
+      writesFiles: false,
+      writesRemote: false
+    }
+  };
+}
+
 function waitForProcessExit(entry, timeoutMs = 5000) {
   if (!entry.child || entry.status === "exited" || entry.status === "error") return Promise.resolve();
   return new Promise((resolve) => {
@@ -12076,8 +12157,8 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "验证与修复闭环",
       status: "implemented",
-      evidence: ["discoverCheckCommands", "discoverTypecheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status", "stageRepairVerificationCommands", "reviewArtifactVerificationCommands", "reviewCommentsVerificationCommands", "gateEvidenceVerificationCommands", "审查失败证据自动排队验证", "门禁失败证据自动排队验证"],
-      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、TypeScript 类型检查发现、CI 配置、最近验证证据、审查/PR 评论复查命令、门禁失败复查命令、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
+      evidence: ["discoverCheckCommands", "discoverTypecheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status", "stageRepairVerificationCommands", "reviewArtifactVerificationCommands", "reviewCommentsVerificationCommands", "gateEvidenceVerificationCommands", "写入失败关联 @file 引用", "写入失败关联调试目标", "动作失败关联 @file 引用", "动作失败关联调试目标", "审查失败证据自动排队验证", "门禁失败证据自动排队验证"],
+      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、TypeScript 类型检查发现、CI 配置、最近验证证据、写入失败与通用动作失败关联 @file/调试目标/浏览器分诊、审查/PR 评论复查命令、门禁失败复查命令、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
     },
     {
       area: "代码审查证据",
@@ -12088,8 +12169,8 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "Git 隔离",
       status: git.available ? "implemented" : "partial",
-      evidence: ["/api/worktree", git.available ? git.branch || "git repo" : "当前工作区未检测到 Git"],
-      next: "可继续接入远端 PR 创建和 CI 检查。"
+      evidence: ["/api/worktree", git.available ? git.branch || "git repo" : "当前工作区未检测到 Git", "工作区安全失败关联 @file 引用", "工作区安全失败关联调试目标"],
+      next: "已补 worktree/checkpoint/工作区切换失败后的 @file、当前调试目标和浏览器分诊延续；可继续接入远端 PR 创建和 CI 检查。"
     },
     {
       area: "会话线程管理",
@@ -12106,38 +12187,38 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "可恢复状态",
       status: "implemented",
-      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", "/api/health recoverySummary", "lastFailedCommand", "verificationCommands", "contextEvidenceVerificationCommands", "上下文失败自动排队验证", goal.phase || "idle"],
-      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact、语义索引持久化、刷新后的 recoverySummary 下一步线索、最近失败命令、变更文件、选中 hunk、上下文证据排队验证和失败后的本地复查命令自动恢复；可继续增加更细粒度的摘要裁剪策略。"
+      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", "/api/health recoverySummary", "lastFailedCommand", "verificationCommands", "contextEvidenceVerificationCommands", "当前调试目标继续上下文", "会话/冲突/任务/队列/交付调试目标延续", "会话/目标/任务/队列/冲突/审查/交付 @file 引用延续", "上下文失败自动排队验证", goal.phase || "idle"],
+      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact、语义索引持久化、刷新后的 recoverySummary 下一步线索、最近失败命令、变更文件、选中 hunk、当前调试目标、@file 命中/缺失边界、浏览器异常分诊、上下文证据排队验证和失败后的本地复查命令自动恢复；可继续增加更细粒度的摘要裁剪策略。"
     },
     {
       area: "长任务管理",
       status: "implemented",
-      evidence: ["/api/processes", "/api/process-health", "/api/process-search", ".forge/process-logs", ".forge/process-health-rules.json", `${managedProcessCount} 个受管进程`, "独立健康探针汇总", "可配置健康规则匹配", "健康规则正则匹配", "负向错误信号守卫"],
-      next: "已补启动命令发现/脚本展开/发现并启动、启动后自动识别页面 URL、受管进程输出搜索、独立健康探针、日志 artifact 持久化和历史回放；健康规则支持状态码、输出/响应包含匹配、输出/响应正则匹配和负向错误信号守卫。"
+      evidence: ["/api/processes", "/api/process-health", "/api/process-search", "/api/runtime-url", "/api/debug-target", "debug_target", ".forge/process-logs", ".forge/process-health-rules.json", ".forge/state/runtime-url.json", `${managedProcessCount} 个受管进程`, "独立健康探针汇总", "运行 URL 状态持久化", "当前调试目标聚合", "可配置健康规则匹配", "健康规则正则匹配", "负向错误信号守卫"],
+      next: "已补启动命令发现/脚本展开/发现并启动、启动后自动识别页面 URL、真实运行 URL 持久化与调试输入自动填充、当前调试目标聚合、受管进程输出搜索、独立健康探针、日志 artifact 持久化和历史回放；健康规则支持状态码、输出/响应包含匹配、输出/响应正则匹配和负向错误信号守卫。"
     },
     {
       area: "交付草稿",
       status: "implemented",
-      evidence: ["/api/handoff", ".forge/handoffs"],
-      next: "可继续接入真实 PR 创建、推送和评论同步。"
+      evidence: ["/api/handoff", ".forge/handoffs", "交付关联调试目标", "交付关联浏览器异常分诊", "交付前调试验证命令"],
+      next: "已补交付草稿生成、交付验证提示、当前调试目标/页面分诊延续和交付前验证命令合并；可继续接入真实 PR 创建、推送和评论同步。"
     },
     {
       area: "远端 PR 与 CI 集成",
       status: "partial",
-      evidence: ["/api/pr-readiness", "/api/remote-pr-status", "/api/ci-status", "/api/remote-publish-plan", "/api/remote-publish-preflight", ".forge/remote-ci", "GitHub gh / GitLab glab 只读探测", "Git remote/provider 发现", "本地 CI 配置发现", "PR 草稿元数据", "远端写入审批计划", "发布前 CLI/认证/审批/命令风险预检", "不执行 git push/真实 PR 创建"],
-      next: "已补远端 PR/CI 只读状态探测、CI 状态 artifact、发布审批计划和发布包预检；继续接入真实 PR 创建、评论回写和更多 provider。"
+      evidence: ["/api/pr-readiness", "/api/remote-pr-status", "/api/ci-status", "/api/remote-publish-plan", "/api/remote-publish-preflight", "/api/permission-matrix", ".forge/remote-ci", "GitHub gh / GitLab glab 只读探测", "Gitee manualProvider 识别", "Git remote/provider 发现", "本地 CI 配置发现", "PR 草稿元数据", "远端写入审批计划", "provider/action 权限矩阵", "发布前 CLI/认证/审批/命令风险预检", "不执行 git push/真实 PR 创建"],
+      next: "已补远端 PR/CI 只读状态探测、CI 状态 artifact、发布审批计划、发布包预检和 provider/action 权限模型；继续接入真实 PR 创建、评论回写和需要授权的远端执行。"
     },
     {
       area: "真实远端发布与平台同步",
       status: "partial",
-      evidence: ["/api/remote-publish-plan", "/api/remote-publish-packages", "/api/remote-publish-package", "/api/remote-publish-preflight", ".forge/remote-publish", ".forge/approvals", "远端 push/PR/comment 候选命令审批记录", "发布包 PR body/review summary/plan 索引", "发布前 CLI/认证/审批/命令风险预检", "未执行 git push", "未创建真实远端 PR", "未同步代码托管平台评论"],
-      next: "已补远端发布审批计划、发布包只读索引和发布前预检；需要平台凭据和明确授权后接入实际 PR 发布、push、CI 必过门禁和 review 评论同步。"
+      evidence: ["/api/remote-publish-plan", "/api/remote-publish-packages", "/api/remote-publish-package", "/api/remote-publish-preflight", "/api/remote-publish-continuation", "/api/remote-publish-evidence", ".forge/remote-publish", ".forge/approvals", "远端 push/PR/comment 候选命令审批记录", "发布包 PR body/review summary/plan 索引", "external-evidence.json 回填证据", "Gitee manual:gitee-pr/manual:gitee-comment 继续包", "发布前 CLI/认证/审批/命令风险预检", "未执行 git push", "未创建真实远端 PR", "未同步代码托管平台评论"],
+      next: "已补远端发布审批计划、发布包只读索引、发布前预检、继续包和外部证据回填；需要平台凭据和明确授权后接入实际 PR 发布、push、CI 必过门禁和 review 评论同步。"
     },
     {
       area: "权限与命令策略",
-      status: approvals.length ? "partial" : "implemented",
-      evidence: ["evaluateCommandPolicy", "evaluateProcessPolicy", "/api/policy-audit", "/api/permission-matrix", "/api/approval decision", "/api/approval-execute", "/api/mcp-tool-call", "/api/extension-tool-call", ".forge/approvals", ".forge/escalations", `${approvals.length} 个近期审批请求`],
-      next: "已补审批请求的批准/拒绝状态流转、受控执行尝试、拒绝命令升级 artifact、MCP tools/call、本地扩展工具审批执行、只读权限审计和 provider/action 权限矩阵；仍缺完整系统级沙箱升级执行。"
+      status: "partial",
+      evidence: ["evaluateCommandPolicy", "evaluateProcessPolicy", "/api/policy-audit", "/api/permission-matrix", "/api/approval decision", "/api/approval-execute", "/api/mcp-tool-call", "/api/extension-tool-call", "/api/remote-publish-evidence", ".forge/approvals", ".forge/escalations", "审批关联 @file 引用", "审批关联调试目标", "push_branch/create_pr/comment_pr/ingest_external_evidence 动作拆分", `${approvals.length} 个近期审批请求`],
+      next: "已补审批请求的批准/拒绝状态流转、受控执行尝试、拒绝命令升级 artifact、MCP tools/call、本地扩展工具审批执行、只读权限审计、审批上下文里的 @file/调试目标/浏览器分诊延续、provider/action 权限矩阵和远端证据回填边界；仍缺完整系统级沙箱升级执行。"
     },
     {
       area: "工具生态",
@@ -12148,8 +12229,8 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "外部工具与浏览器自动化",
       status: "partial",
-      evidence: ["/api/extensions", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "/api/browser-check", "/api/browser-audit", "/api/browser-trace", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", "本地扩展只读工具桥接", "本地 MCP 只读握手与目录枚举", "审批后 MCP tools/call", "受控浏览器截图/DOM/trace/交互/会话/视觉回归", "静态可访问性审计", "keyDown/keyUp/wheel/scroll 复杂交互序列"],
-      next: "已补本地扩展工具桥接、MCP 本地探测、审批后工具调用、受控浏览器自动化、多步骤会话 artifact、静态可访问性审计和复杂鼠标键盘序列；继续接入远端 MCP 和 provider 级权限模型。"
+      evidence: ["/api/extensions", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "/api/browser-check", "/api/browser-audit", "/api/browser-trace", "/api/debug-target", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", "/api/permission-matrix", "本地扩展只读工具桥接", "本地 MCP 只读握手与目录枚举", "审批后 MCP tools/call", "受控浏览器截图/DOM/trace/交互/会话/视觉回归", "当前调试目标聚合", "provider/action 权限模型", "静态可访问性审计", "keyDown/keyUp/wheel/scroll 复杂交互序列"],
+      next: "已补本地扩展工具桥接、MCP 本地探测、审批后工具调用、受控浏览器自动化、多步骤会话 artifact、当前调试目标聚合、静态可访问性审计、复杂鼠标键盘序列和 provider/action 权限模型；继续接入远端 MCP 和跨站点远端浏览器会话。"
     },
     {
       area: "多模态与浏览器执行",
@@ -12160,8 +12241,8 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "浏览器自动化与视觉回归",
       status: "partial",
-      evidence: ["/api/browser-check", "/api/browser-audit", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-trace", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", ".forge/browser-traces", "本地 URL 状态/标题/结构检查", "静态 title/lang/H1/alt/可访问名称审计", "页面结构基线对比", "真实浏览器截图产物", "选择器裁剪截图", "console/exception/network trace artifact", "hover/dblclick/clear/check/waitValue/navigate/waitUrl/waitNetwork/upload/keyDown/keyUp/wheel/scroll/坐标鼠标 受控 DOM 交互", "多步骤持久 profile 会话 artifact", "像素级视觉回归断言"],
-      next: "已补页面结构基线、静态可访问性审计、真实浏览器截图、选择器裁剪、浏览器 trace、扩展 DOM 交互、复杂键鼠序列、跨页面导航、网络静默等待、文件上传、坐标级鼠标动作、多步骤持久会话 artifact 和像素级视觉断言；继续补跨站点远端浏览器会话。"
+      evidence: ["/api/browser-check", "/api/browser-audit", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-trace", "/api/debug-target", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", ".forge/browser-traces", "本地 URL 状态/标题/结构检查", "静态 title/lang/H1/alt/可访问名称审计", "页面结构基线对比", "真实浏览器截图产物", "选择器裁剪截图", "console/exception/network trace artifact", "当前调试目标卡片", "hover/dblclick/clear/check/waitValue/navigate/waitUrl/waitNetwork/upload/keyDown/keyUp/wheel/scroll/坐标鼠标 受控 DOM 交互", "多步骤持久 profile 会话 artifact", "像素级视觉回归断言"],
+      next: "已补页面结构基线、静态可访问性审计、真实浏览器截图、选择器裁剪、浏览器 trace、当前调试目标卡片、扩展 DOM 交互、复杂键鼠序列、跨页面导航、网络静默等待、文件上传、坐标级鼠标动作、多步骤持久会话 artifact 和像素级视觉断言；继续补跨站点远端浏览器会话。"
     },
     {
       area: "真实浏览器交互与截图",
@@ -12202,6 +12283,8 @@ async function buildCapabilityAudit({ light = false } = {}) {
         "modelEvidenceVerificationCommands",
         "stageModelEvidenceVerificationCommands",
         "agentFailureVerificationCommands",
+        "代理失败关联 @file 引用",
+        "代理失败关联调试目标",
         "代理失败验证命令排队",
         `候选模型：${modelRuntime.candidates.join(", ")}`,
         modelRuntime.lastModel ? `最近使用：${modelRuntime.lastModel}` : "尚未发起模型请求",
@@ -12210,8 +12293,8 @@ async function buildCapabilityAudit({ light = false } = {}) {
         modelRuntime.lastFallbacks.length ? `最近 fallback：${modelRuntime.lastFallbacks.length} 次` : "最近无 fallback"
       ],
       next: modelRuntime.candidates.length > 1
-        ? "已补运行时遥测、只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、fallback 视图、provider token SSE 流式输出、模型证据验证命令排队和代理失败后的本地复查命令自动恢复；可继续增加 provider API 账单直连和真实成本扣减。"
-        : "已补只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、provider token SSE 流式输出、模型证据验证命令排队和代理失败后的本地复查命令自动恢复；可通过 FORGE_MODELS 配置多模型 fallback，后续再增加 provider API 账单直连和真实成本扣减。"
+        ? "已补运行时遥测、只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、fallback 视图、provider token SSE 流式输出、模型证据验证命令排队、代理失败关联 @file/调试目标/浏览器分诊延续和本地复查命令自动恢复；可继续增加 provider API 账单直连和真实成本扣减。"
+        : "已补只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、provider token SSE 流式输出、模型证据验证命令排队、代理失败关联 @file/调试目标/浏览器分诊延续和本地复查命令自动恢复；可通过 FORGE_MODELS 配置多模型 fallback，后续再增加 provider API 账单直连和真实成本扣减。"
     }
   ];
   const enrichedCapabilities = capabilities.map(enrichCapabilityForAudit);
@@ -12620,6 +12703,24 @@ function getAgentTools() {
       function: {
         name: "debug_diagnostics",
         description: "聚合当前工作区调试诊断：验证门禁、CI 线索、受管进程健康、语义诊断和可选本地页面 Trace；默认不执行检查命令。",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+            commands: { type: "array", items: { type: "string" } },
+            includeTrace: { type: "boolean" },
+            runChecks: { type: "boolean" },
+            waitMs: { type: "number" },
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "debug_target",
+        description: "聚合当前调试目标：运行 URL、受管进程探针、诊断摘要、建议动作和验证命令；默认不执行检查命令。",
         parameters: {
           type: "object",
           properties: {
@@ -14242,6 +14343,16 @@ async function runReadTool(name, args) {
       limit: Number(args.limit || 20)
     }));
   }
+  if (name === "debug_target") {
+    return JSON.stringify(await buildDebugTarget({
+      url: String(args.url || ""),
+      commands: Array.isArray(args.commands) ? args.commands : [],
+      includeTrace: Boolean(args.includeTrace),
+      runChecks: Boolean(args.runChecks),
+      waitMs: Number(args.waitMs || 1500),
+      limit: Number(args.limit || 20)
+    }));
+  }
   if (name === "merge_gate") {
     return JSON.stringify(await buildMergeGateStatus({
       prompt: String(args.prompt || ""),
@@ -15331,6 +15442,27 @@ async function handleApi(req, res) {
             commands: []
           };
       return send(res, 200, { diagnostics: await buildDebugDiagnostics({
+        url: String(payload.url || ""),
+        commands: Array.isArray(payload.commands) ? payload.commands : [],
+        includeTrace: Boolean(payload.includeTrace),
+        runChecks: Boolean(payload.runChecks),
+        waitMs: Number(payload.waitMs || 1500),
+        limit: Number(payload.limit || 20)
+      }) });
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/debug-target") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            url: url.searchParams.get("url") || "",
+            includeTrace: url.searchParams.get("includeTrace") === "1",
+            runChecks: url.searchParams.get("runChecks") === "1",
+            waitMs: Number(url.searchParams.get("waitMs") || 1500),
+            limit: Number(url.searchParams.get("limit") || 20),
+            commands: []
+          };
+      return send(res, 200, { debugTarget: await buildDebugTarget({
         url: String(payload.url || ""),
         commands: Array.isArray(payload.commands) ? payload.commands : [],
         includeTrace: Boolean(payload.includeTrace),
@@ -16849,8 +16981,22 @@ async function runApiSmokeSectionTest(sectionValue = "") {
         timeoutMs: 120000,
         body: JSON.stringify({ url: `${baseUrl}/`, includeTrace: false, runChecks: false, limit: 8 })
       });
+      const debugTarget = await requestJson(baseUrl, "/api/debug-target", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({
+          url: `${baseUrl}/`,
+          commands: ["node --check app.js"],
+          includeTrace: false,
+          runChecks: false,
+          limit: 8
+        })
+      });
       assertSmoke(Array.isArray(debugDiagnostics.diagnostics?.findings), "debug diagnostics missing findings");
       assertSmoke(debugDiagnostics.diagnostics?.browserTriage?.status === "not_captured", "debug diagnostics missing not_captured browser triage");
+      assertSmoke(debugTarget.debugTarget?.summary?.targetUrl === `${baseUrl}/`, "debug target missing selected URL");
+      assertSmoke(debugTarget.debugTarget?.policy?.executesCommands === false, "debug target should be read-mostly by default");
+      assertSmoke(debugTarget.debugTarget?.verificationCommands?.some((item) => item.command === "node --check app.js"), "debug target did not preserve custom verification command");
       assertSmoke(
         debugDiagnostics.diagnostics?.verificationPlan?.commands?.some((item) => String(item.command || "").includes("--api-smoke-section=debug")),
         "debug diagnostics verification plan missing debug smoke command"
@@ -17366,6 +17512,8 @@ async function runUiSmokeTest() {
     "function renderThreads",
     "function renderMessages",
     "function buildThreadPromptContext",
+    "会话关联 @file 引用",
+    "会话关联调试目标",
     "会话关联浏览器异常分诊",
     "function appendThreadContextToPrompt",
     "function runThreadContinuation",
@@ -17377,9 +17525,14 @@ async function runUiSmokeTest() {
     "function renderGoal",
     "function recommendedCapabilityFromState",
     "function formatBrowserTriageContinuation",
+    "function formatDebugTargetContinuation",
     "function buildGoalContinuationPrompt",
+    "目标继续关联 @file 引用",
     "lastRecoverySummary",
     "恢复摘要",
+    "调试目标",
+    "任务关联调试目标",
+    "队列关联调试目标",
     "页面调试线索",
     "goal-recovery-summary",
     "function appendGoalContinuationToPrompt",
@@ -17393,6 +17546,7 @@ async function runUiSmokeTest() {
     "继续目标",
     "function restorePendingProposal",
     "function buildQueuePromptContext",
+    "队列关联 @file 引用",
     "队列关联浏览器异常分诊",
     "function appendQueueContextToPrompt",
     "function runQueueContinuation",
@@ -17409,6 +17563,7 @@ async function runUiSmokeTest() {
     "function appendFileReadFailureEvidence",
     "function renderReferencePreview",
     "function localPromptReferencePreview",
+    "function formatPromptReferenceContinuation",
     "function suggestReferencePaths",
     "apply-reference-suggestion",
     "function scheduleReferencePreview",
@@ -17457,6 +17612,7 @@ async function runUiSmokeTest() {
     "停止进程失败",
     "读取进程输出失败",
     "function buildTaskPromptContext",
+    "任务关联 @file 引用",
     "function appendTaskContextToPrompt",
     "function runTaskContinuation",
     "任务关联浏览器异常分诊",
@@ -17477,6 +17633,9 @@ async function runUiSmokeTest() {
     "已启动任务证据继续",
     "已引用任务文件",
     "function buildApprovalPromptContext",
+    "审批关联 @file 引用",
+    "审批关联调试目标",
+    "审批关联浏览器异常分诊",
     "function appendApprovalContextToPrompt",
     "function runApprovalSafeAlternative",
     "function approvalVerificationCommands",
@@ -17494,6 +17653,9 @@ async function runUiSmokeTest() {
     "升级证据",
     "审批升级证据包",
     "function buildActionFailureContext",
+    "动作失败关联 @file 引用",
+    "动作失败关联调试目标",
+    "动作失败关联浏览器异常分诊",
     "function actionFailureVerificationCommands",
     "function stageActionFailureVerificationCommands",
     "function appendActionFailureEvidence",
@@ -17526,6 +17688,9 @@ async function runUiSmokeTest() {
     "function buildModelFailureEvidence",
     "function appendModelFailureEvidence",
     "function buildAgentFailureContext",
+    "代理失败关联 @file 引用",
+    "代理失败关联调试目标",
+    "代理失败关联浏览器异常分诊",
     "function appendAgentFailureEvidence",
     "模型证据已加入提示词",
     "验证命令已放入面板",
@@ -17540,6 +17705,9 @@ async function runUiSmokeTest() {
     "调试诊断相关文件",
     "已启动代理失败诊断修复",
     "function buildApplyFailureContext",
+    "写入失败关联 @file 引用",
+    "写入失败关联调试目标",
+    "写入失败关联浏览器异常分诊",
     "function appendApplyFailureEvidence",
     "function buildApplyVerificationRecoveryContext",
     "function appendApplyVerificationRecovery",
@@ -17549,6 +17717,9 @@ async function runUiSmokeTest() {
     "写入失败证据已加入提示词",
     "已启动写入失败诊断修复",
     "function buildWorkspaceSafetyFailureContext",
+    "工作区安全失败关联 @file 引用",
+    "工作区安全失败关联调试目标",
+    "工作区安全失败关联浏览器异常分诊",
     "function workspaceSafetyVerificationCommands",
     "function stageWorkspaceSafetyVerificationCommands",
     "function appendWorkspaceSafetyFailureEvidence",
@@ -17755,6 +17926,8 @@ async function runUiSmokeTest() {
     "debugContext.browserTriage",
     "function buildReviewFixPrompt",
     "function buildReviewArtifactPromptContext",
+    "审查关联 @file 引用",
+    "审查关联调试目标",
     "function appendReviewArtifactContextToPrompt",
     "function runReviewArtifactRepair",
     "function buildReviewArtifactVerificationPrompt",
@@ -17767,6 +17940,8 @@ async function runUiSmokeTest() {
     "审查验证命令已放入面板",
     "审查失败证据",
     "function buildReviewCommentsContext",
+    "PR 评论关联 @file 引用",
+    "PR 评论关联调试目标",
     "function appendReviewCommentsToPrompt",
     "function runReviewCommentsRepair",
     "function buildReviewCommentsVerificationPrompt",
@@ -17907,6 +18082,12 @@ async function runUiSmokeTest() {
     "kind",
     "target",
     "debug-action-meta",
+    "data-debug-action=\"target-detail\"",
+    "data-debug-action=\"target-prompt\"",
+    "data-debug-action=\"target-check\"",
+    "data-debug-action=\"target-trace\"",
+    "data-debug-action=\"target-debug\"",
+    "当前调试目标",
     "fix-last-failed",
     "修复失败命令",
     "暂无失败命令可修复",
@@ -17981,6 +18162,9 @@ async function runUiSmokeTest() {
     "引用文件：",
     "function collectConflictResolutionsFromPanel",
     "function buildConflictResolutionContext",
+    "冲突修复关联 @file 引用",
+    "冲突关联调试目标",
+    "冲突关联浏览器异常分诊",
     "function appendConflictResolutionToPrompt",
     "function runConflictResolutionRepair",
     "冲突证据已加入提示词",
@@ -17988,6 +18172,9 @@ async function runUiSmokeTest() {
     "function renderConflictResolution",
     "function createConflictResolutionDraftFromPanel",
     "function buildHandoffPromptContext",
+    "交付关联 @file 引用",
+    "交付关联调试目标",
+    "交付关联浏览器异常分诊",
     "function handoffVerificationCommands",
     "function stageHandoffVerificationCommands",
     "function buildHandoffVerificationPrompt",
@@ -18033,8 +18220,10 @@ async function runUiSmokeTest() {
     "/api/process-health",
     "/api/process-search",
     "/api/process-history",
+    "/api/debug-target",
     "/api/runtime-url",
-    "runtime_url"
+    "runtime_url",
+    "debug_target"
   ];
   for (const hook of appHooks) {
     assertIncludes(app, hook, `app.js missing ${hook}`);
@@ -18061,6 +18250,7 @@ async function runUiSmokeTest() {
     ".diff-file.collapsed",
     ".debug-diagnostics",
     ".debug-diagnostics-controls",
+    ".debug-target-card",
     ".debug-last-failed-command",
     ".debug-last-failed-analysis",
     ".debug-last-failed-actions",
@@ -18544,11 +18734,19 @@ async function runApiSmokeTest() {
       timeoutMs: 120000,
       body: JSON.stringify({ url: `${baseUrl}/`, includeTrace: true, runChecks: false, limit: 8 })
     });
+    const debugTarget = await requestJson(baseUrl, "/api/debug-target", {
+      method: "POST",
+      timeoutMs: 120000,
+      body: JSON.stringify({ url: `${baseUrl}/`, includeTrace: true, runChecks: false, limit: 8 })
+    });
     assertSmoke(debugDiagnostics.diagnostics?.policy?.executesCommands === false, "debug diagnostics should be read-only by default");
     assertSmoke(debugDiagnostics.diagnostics?.summary?.traceCaptured === true, "debug diagnostics missing browser trace");
     assertSmoke(debugDiagnostics.diagnostics?.browserTriage?.status, "debug diagnostics missing browser triage");
     assertSmoke(Array.isArray(debugDiagnostics.diagnostics?.browserTriage?.findings), "debug diagnostics browser triage missing findings");
     assertSmoke(Array.isArray(debugDiagnostics.diagnostics?.findings), "debug diagnostics missing findings array");
+    assertSmoke(debugTarget.debugTarget?.summary?.targetUrl === `${baseUrl}/`, "debug target missing traced target URL");
+    assertSmoke(debugTarget.debugTarget?.diagnostics?.summary?.traceCaptured === true, "debug target missing embedded diagnostics trace");
+    assertSmoke(debugTarget.debugTarget?.verificationCommands?.some((item) => String(item.command || "").includes("--api-smoke-section=debug")), "debug target missing verification commands");
     assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item) => Number.isFinite(Number(item.priority))), "debug diagnostics actions missing priorities");
     assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item) => item.kind), "debug diagnostics actions missing kind");
     assertSmoke(debugDiagnostics.diagnostics?.nextActions?.every((item, index, list) => index === 0 || Number(list[index - 1].priority) >= Number(item.priority)), "debug diagnostics actions are not priority sorted");
@@ -19093,6 +19291,7 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "verification_plan"), "tools endpoint missing verification_plan");
     assertSmoke(tools.tools.some((item) => item.name === "ci_status"), "tools endpoint missing ci_status");
     assertSmoke(tools.tools.some((item) => item.name === "debug_diagnostics"), "tools endpoint missing debug_diagnostics");
+    assertSmoke(tools.tools.some((item) => item.name === "debug_target"), "tools endpoint missing debug_target");
     assertSmoke(tools.tools.some((item) => item.name === "merge_gate"), "tools endpoint missing merge_gate");
     assertSmoke(tools.tools.some((item) => item.name === "mcp_resource"), "tools endpoint missing mcp_resource");
     assertSmoke(tools.tools.some((item) => item.name === "remote_publish_packages"), "tools endpoint missing remote_publish_packages");

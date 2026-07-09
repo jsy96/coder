@@ -1705,6 +1705,48 @@ textarea:focus {
   gap: 7px;
 }
 
+.debug-target-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(5, auto);
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(131, 227, 228, 0.24);
+  border-radius: var(--radius);
+  background: rgba(131, 227, 228, 0.055);
+}
+
+.debug-target-card[hidden] {
+  display: none;
+}
+
+.debug-target-card strong,
+.debug-target-card small,
+.debug-target-card span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-target-card strong {
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.debug-target-card small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-family: var(--font-code);
+  font-size: 11px;
+}
+
+.debug-target-card span {
+  margin-top: 3px;
+  color: var(--muted-strong);
+  font-size: var(--text-xs);
+}
+
 .debug-diagnostics-head {
   justify-content: space-between;
 }
@@ -1730,6 +1772,7 @@ textarea:focus {
 
 .debug-diagnostics-controls button,
 .debug-evidence-list button,
+.debug-target-card button,
 .debug-action-row button,
 .debug-last-failed-actions button {
   min-height: 26px;
@@ -1743,6 +1786,7 @@ textarea:focus {
 
 .debug-diagnostics-controls button:hover,
 .debug-evidence-list button:hover,
+.debug-target-card button:hover,
 .debug-action-row button:hover,
 .debug-last-failed-actions button:hover {
   border-color: rgba(131, 227, 228, 0.4);

@@ -196,6 +196,12 @@ function pruneDebugDiagnosticsForStorage(result) {
     workspace: result.workspace || "",
     status: result.status || "",
     summary: result.summary || null,
+    debugTarget: result.debugTarget ? {
+      summary: result.debugTarget.summary || null,
+      target: result.debugTarget.target || null,
+      verificationCommands: (result.debugTarget.verificationCommands || []).slice(0, 8).map(compactCommand),
+      policy: result.debugTarget.policy || null
+    } : null,
     findings: (result.findings || []).slice(0, 10).map(compactFinding),
     nextActions: (result.nextActions || []).slice(0, 10).map(compactCommand),
     browserSourceLocations: (result.browserSourceLocations || []).slice(0, 16).map(compactSourceLocation),
@@ -827,6 +833,31 @@ function renderReferencePreview(preview = null) {
   });
 }
 
+function formatPromptReferenceContinuation(prompt = input?.value || "", { title = "当前 @file 引用状态" } = {}) {
+  const preview = localPromptReferencePreview(prompt);
+  if (!preview.tokens.length) return "";
+  const references = (preview.references || [])
+    .slice(0, 8)
+    .map((item) => `- @${item.path} (${formatBytes(item.size || 0)})`)
+    .join("\n");
+  const missing = (preview.missing || [])
+    .slice(0, 8)
+    .map((item) => {
+      const suggestions = (item.suggestions || [])
+        .slice(0, 3)
+        .map((suggestion) => `@${suggestion.path || suggestion}`)
+        .join(" ");
+      return `- @${item.path}: ${item.reason || "未命中"}${suggestions ? `；候选：${suggestions}` : ""}`;
+    })
+    .join("\n");
+  return [
+    `${title}：${preview.references.length}/${preview.tokens.length} 命中 · ${formatBytes(preview.bytes || 0)}`,
+    references ? `已命中文件：\n${references}` : "已命中文件：(无)",
+    missing ? `未命中文件：\n${missing}` : "",
+    missing ? "约束：不要假装已经读取未命中的 @file；请先修正路径或说明缺失文件。" : ""
+  ].filter(Boolean).join("\n");
+}
+
 function localPromptReferencePreview(prompt = "") {
   const text = String(prompt || "");
   if (!text.includes("@")) return { tokens: [], references: [], missing: [], bytes: 0 };
@@ -1001,6 +1032,8 @@ function buildThreadPromptContext(detail = {}) {
   const messages = Array.isArray(detail.messages) ? detail.messages : [];
   if (!detail.id && !messages.length) return "";
   const summary = detail.summary || {};
+  const threadPromptReferenceContext = formatPromptReferenceContinuation(input?.value || detail.prompt || "", { title: "会话关联 @file 引用" });
+  const threadDebugTargetContext = formatDebugTargetContinuation(state.lastDebugDiagnostics?.debugTarget || null, { title: "会话关联调试目标" });
   const threadBrowserTriageContext = formatBrowserTriageContinuation(state.lastDebugDiagnostics?.browserTriage || null, { title: "会话关联浏览器异常分诊" });
   return [
     "请基于这段历史会话上下文继续当前编码/调试任务。",
@@ -1015,6 +1048,10 @@ function buildThreadPromptContext(detail = {}) {
     "",
     "最近会话消息：",
     compactThreadMessages(messages),
+    threadPromptReferenceContext ? "\n文件引用边界：" : "",
+    threadPromptReferenceContext,
+    threadDebugTargetContext ? "\n当前调试目标：" : "",
+    threadDebugTargetContext,
     threadBrowserTriageContext ? "\n页面调试线索：" : "",
     threadBrowserTriageContext,
     "",
@@ -1739,6 +1776,9 @@ function buildAgentFailureContext(error, {
   const referencedFiles = Array.isArray(debugContext?.referencedFiles)
     ? debugContext.referencedFiles.map((file) => String(file || "").trim()).filter(Boolean).slice(0, 16)
     : [];
+  const agentPromptReferenceContext = formatPromptReferenceContinuation(prompt || input?.value || "", { title: "代理失败关联 @file 引用" });
+  const agentDebugTargetContext = formatDebugTargetContinuation(debugContext?.debugTarget || state.lastDebugDiagnostics?.debugTarget || null, { title: "代理失败关联调试目标" });
+  const agentBrowserTriageContext = formatBrowserTriageContinuation(debugContext?.browserTriage || state.lastDebugDiagnostics?.browserTriage || null, { title: "代理失败关联浏览器异常分诊" });
   return [
     "请基于这次代理/模型请求失败证据继续修复当前项目的写代码与调试体验。",
     "",
@@ -1748,6 +1788,13 @@ function buildAgentFailureContext(error, {
     `附加调试上下文：${debugContext ? "是" : "否"}`,
     referencedFiles.length ? `调试诊断相关文件：\n${referencedFiles.map((file) => `@${file}`).join("\n")}` : "",
     `流式事件数：${events.length}`,
+    "",
+    agentPromptReferenceContext ? "文件引用边界：" : "",
+    agentPromptReferenceContext,
+    agentDebugTargetContext ? "当前调试目标：" : "",
+    agentDebugTargetContext,
+    agentBrowserTriageContext ? "页面调试线索：" : "",
+    agentBrowserTriageContext,
     "",
     "原始用户需求：",
     String(prompt || "").slice(0, 8000),
@@ -2015,6 +2062,7 @@ function buildDebugBundle(result) {
     workspace: result.workspace,
     status: result.status,
     summary: result.summary,
+    debugTarget: result.debugTarget || null,
     findings: result.findings || [],
     nextActions: result.nextActions || [],
     verificationPlan: result.verificationPlan || null,
@@ -2106,6 +2154,8 @@ function appendDebugEvidence(title, stateLabel, value) {
 function buildDebugPromptContext(result, { title = "请基于这份调试诊断继续排查并修复问题。" } = {}) {
   if (!result) return "";
   const referencedFiles = debugEvidenceReferencedFiles(result);
+  const targetSummary = result.debugTarget?.summary || null;
+  const target = result.debugTarget?.target || null;
   const findings = (result.findings || [])
     .slice(0, 10)
     .map((item, index) => `${index + 1}. [${item.severity || "info"}] ${item.area || "debug"}：${item.message || ""}${item.evidence?.length ? `\n   证据：${item.evidence.slice(0, 5).join(" / ")}` : ""}`)
@@ -2148,6 +2198,9 @@ function buildDebugPromptContext(result, { title = "请基于这份调试诊断�
     `诊断状态：${result.status || "unknown"}`,
     `工作区：${result.workspace || ""}`,
     result.summary ? `摘要：${JSON.stringify(result.summary)}` : "",
+    targetSummary ? `当前调试目标：${JSON.stringify(targetSummary)}` : "",
+    target?.url ? `页面 URL：${target.url}` : "",
+    target?.process?.id ? `目标进程：${target.process.id} · ${target.process.command || ""} · ${target.process.health || target.process.status || ""}` : "",
     referencedFiles.length ? `优先读取相关文件：\n${referencedFiles.map((file) => `@${file}`).join("\n")}` : "",
     browserSourceText ? `浏览器异常源码位置：\n${browserSourceText}` : "",
     "",
@@ -2201,6 +2254,31 @@ function formatBrowserTriageContinuation(triage = null, { title = "浏览器异�
     `${title}：${triage.status || "unknown"} · ${JSON.stringify(triage.counts || {})}`,
     findings ? `分诊发现：\n${findings}` : "",
     actions ? `分诊下一步：\n${actions}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function formatDebugTargetContinuation(debugTarget = state.lastDebugDiagnostics?.debugTarget || null, { title = "当前调试目标" } = {}) {
+  if (!debugTarget || typeof debugTarget !== "object") return "";
+  const summary = debugTarget.summary || {};
+  const target = debugTarget.target || {};
+  const process = target.process || {};
+  const commands = normalizeCommandItems(debugTarget.verificationCommands || [])
+    .slice(0, 6)
+    .map((item) => `- ${item.command}${item.reason ? `：${item.reason}` : ""}`)
+    .join("\n");
+  const actions = (debugTarget.nextActions || [])
+    .slice(0, 5)
+    .map((item) => `- ${item.label || item.id || item.description || "下一步"}${item.command ? `：${item.command}` : ""}`)
+    .join("\n");
+  return [
+    `${title}：${summary.status || "unknown"}${summary.source ? ` · source=${summary.source}` : ""}`,
+    summary.targetUrl || target.url ? `页面 URL：${summary.targetUrl || target.url}` : "",
+    process.id || summary.processId ? `目标进程：${process.id || summary.processId} · ${process.command || summary.command || ""} · ${process.health || process.status || summary.processHealth || ""}` : "",
+    Number.isFinite(Number(summary.errors)) || Number.isFinite(Number(summary.warnings))
+      ? `诊断摘要：errors=${summary.errors || 0} warnings=${summary.warnings || 0} checks=${summary.safeCommands || 0}`
+      : "",
+    commands ? `验证命令：\n${commands}` : "",
+    actions ? `建议动作：\n${actions}` : ""
   ].filter(Boolean).join("\n");
 }
 
@@ -4949,6 +5027,9 @@ function buildConflictResolutionContext(preview = state.conflictPreview) {
   const conflicts = preview?.conflictPreviews || [];
   if (!conflicts.length) return "";
   const resolutions = collectConflictResolutionsFromPanel();
+  const promptReferenceContext = formatPromptReferenceContinuation(input?.value || "", { title: "冲突修复关联 @file 引用" });
+  const conflictDebugTargetContext = formatDebugTargetContinuation(state.lastDebugDiagnostics?.debugTarget || null, { title: "冲突关联调试目标" });
+  const conflictBrowserTriageContext = formatBrowserTriageContinuation(state.lastDebugDiagnostics?.browserTriage || null, { title: "冲突关联浏览器异常分诊" });
   const rows = conflicts.map((conflict, index) => {
     const resolution = resolutions[index] || {};
     return [
@@ -4971,6 +5052,12 @@ function buildConflictResolutionContext(preview = state.conflictPreview) {
     "",
     "冲突证据：",
     rows,
+    promptReferenceContext ? "\n引用上下文：" : "",
+    promptReferenceContext,
+    conflictDebugTargetContext ? "\n调试目标：" : "",
+    conflictDebugTargetContext,
+    conflictBrowserTriageContext ? "\n页面调试线索：" : "",
+    conflictBrowserTriageContext,
     "",
     "要求：先读取涉及文件的当前内容；不要直接覆盖用户改动；综合 CURRENT、PROPOSED 和 resolved 草稿，优先保留两边正确意图；生成新的待审批 diff，并给出安全验证命令。"
   ].filter(Boolean).join("\n");
@@ -5081,6 +5168,9 @@ function buildApplyFailureContext(errorOrResult, {
     }))
     .slice(0, 5);
   const patchFiles = patches.map((patch) => patch.path).filter(Boolean).slice(0, 20);
+  const promptReferenceContext = formatPromptReferenceContinuation(prompt || input?.value || "", { title: "写入失败关联 @file 引用" });
+  const applyDebugTargetContext = formatDebugTargetContinuation(errorOrResult?.debugTarget || errorOrResult?.diagnostics?.debugTarget || state.lastDebugDiagnostics?.debugTarget || null, { title: "写入失败关联调试目标" });
+  const applyBrowserTriageContext = formatBrowserTriageContinuation(errorOrResult?.browserTriage || errorOrResult?.diagnostics?.browserTriage || state.lastDebugDiagnostics?.browserTriage || null, { title: "写入失败关联浏览器异常分诊" });
   return [
     "请基于这次 diff 写入 / 验证失败证据继续修复当前项目。",
     "",
@@ -5093,6 +5183,13 @@ function buildApplyFailureContext(errorOrResult, {
     "",
     "原始需求：",
     String(prompt || "").slice(0, 6000),
+    "",
+    promptReferenceContext ? "文件引用边界：" : "",
+    promptReferenceContext,
+    applyDebugTargetContext ? "当前调试目标：" : "",
+    applyDebugTargetContext,
+    applyBrowserTriageContext ? "页面调试线索：" : "",
+    applyBrowserTriageContext,
     "",
     "待写入文件：",
     patchFiles.length ? patchFiles.map((file) => `- ${file}`).join("\n") : "- 无",
@@ -5310,9 +5407,14 @@ function buildWorkspaceSafetyFailureContext(error, {
   checkpoints = state.checkpoints || [],
   pendingDiff = state.pendingDiff || "",
   pendingPatches = state.pendingPatches || [],
-  lastPrompt = state.lastPrompt || ""
+  lastPrompt = state.lastPrompt || "",
+  debugTarget = state.lastDebugDiagnostics?.debugTarget || null,
+  browserTriage = state.lastDebugDiagnostics?.browserTriage || null
 } = {}) {
   const message = error?.message || String(error || "unknown error");
+  const safetyPromptReferenceContext = formatPromptReferenceContinuation(lastPrompt || input?.value || "", { title: "工作区安全失败关联 @file 引用" });
+  const safetyDebugTargetContext = formatDebugTargetContinuation(debugTarget, { title: "工作区安全失败关联调试目标" });
+  const safetyBrowserTriageContext = formatBrowserTriageContinuation(browserTriage, { title: "工作区安全失败关联浏览器异常分诊" });
   return [
     "请基于这次工作区安全操作失败证据继续修复当前项目。",
     "",
@@ -5327,6 +5429,13 @@ function buildWorkspaceSafetyFailureContext(error, {
     "",
     "上一轮需求：",
     String(lastPrompt || "").slice(0, 6000),
+    "",
+    safetyPromptReferenceContext ? "文件引用边界：" : "",
+    safetyPromptReferenceContext,
+    safetyDebugTargetContext ? "当前调试目标：" : "",
+    safetyDebugTargetContext,
+    safetyBrowserTriageContext ? "页面调试线索：" : "",
+    safetyBrowserTriageContext,
     "",
     "待审批文件：",
     pendingPatches.length ? pendingPatches.map((patch) => `- ${patch.path || ""}`).join("\n") : "- 无",
@@ -5622,6 +5731,9 @@ function reviewArtifactFiles(artifact = {}) {
 function buildReviewArtifactPromptContext(artifact = {}) {
   if (!artifact?.id) return "";
   const files = reviewArtifactFiles(artifact);
+  const promptReferenceContext = formatPromptReferenceContinuation(input?.value || artifact.prompt || "", { title: "审查关联 @file 引用" });
+  const reviewDebugTargetContext = formatDebugTargetContinuation(artifact.debugTarget || artifact.diagnostics?.debugTarget || state.lastDebugDiagnostics?.debugTarget || null, { title: "审查关联调试目标" });
+  const reviewBrowserTriageContext = formatBrowserTriageContinuation(artifact.browserTriage || artifact.diagnostics?.browserTriage || state.lastDebugDiagnostics?.browserTriage || null, { title: "审查关联浏览器异常分诊" });
   const findings = (artifact.review || [])
     .slice(0, 12)
     .map((item, index) => {
@@ -5640,8 +5752,11 @@ function buildReviewArtifactPromptContext(artifact = {}) {
     artifact.prompt ? `原始需求：${artifact.prompt}` : "",
     artifact.reply ? `审查摘要：${artifact.reply}` : artifact.summary ? `审查摘要：${artifact.summary}` : "",
     files.length ? `优先读取相关文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
+    promptReferenceContext ? `引用上下文：\n${promptReferenceContext}` : "",
     findings ? `审查发现：\n${findings}` : "",
     commands ? `建议验证命令：\n${commands}` : "",
+    reviewDebugTargetContext ? `调试目标：\n${reviewDebugTargetContext}` : "",
+    reviewBrowserTriageContext ? `页面调试线索：\n${reviewBrowserTriageContext}` : "",
     artifact.git?.status?.length ? `Git 状态：${artifact.git.status.length} 个改动` : "",
     "",
     "要求：先读取相关文件；逐条处理审查发现；生成最小 diff；给出下一轮安全验证命令。"
@@ -5832,6 +5947,9 @@ function buildReviewCommentsContext(draft = {}) {
   if (!draft?.id && !draft?.comments?.length && !draft?.body) return "";
   const ready = (draft.comments || []).filter((item) => item.ready);
   const needsMapping = (draft.comments || []).filter((item) => !item.ready);
+  const promptReferenceContext = formatPromptReferenceContinuation(input?.value || draft.artifact?.prompt || "", { title: "PR 评论关联 @file 引用" });
+  const reviewCommentsDebugTargetContext = formatDebugTargetContinuation(draft.debugTarget || draft.artifact?.debugTarget || draft.artifact?.diagnostics?.debugTarget || state.lastDebugDiagnostics?.debugTarget || null, { title: "PR 评论关联调试目标" });
+  const reviewCommentsBrowserTriageContext = formatBrowserTriageContinuation(draft.browserTriage || draft.artifact?.browserTriage || draft.artifact?.diagnostics?.browserTriage || state.lastDebugDiagnostics?.browserTriage || null, { title: "PR 评论关联浏览器异常分诊" });
   const readyLines = ready
     .slice(0, 12)
     .map((item, index) => `${index + 1}. [${item.severity || "info"}] ${item.path}:${item.line} ${item.body || ""}`)
@@ -5851,6 +5969,9 @@ function buildReviewCommentsContext(draft = {}) {
     "",
     readyLines ? `可映射行级评论：\n${readyLines}` : "可映射行级评论：(无)",
     mappingLines ? `需要补映射的评论：\n${mappingLines}` : "",
+    promptReferenceContext ? `引用上下文：\n${promptReferenceContext}` : "",
+    reviewCommentsDebugTargetContext ? `调试目标：\n${reviewCommentsDebugTargetContext}` : "",
+    reviewCommentsBrowserTriageContext ? `页面调试线索：\n${reviewCommentsBrowserTriageContext}` : "",
     "",
     draft.body ? `评论草稿正文：\n${String(draft.body).slice(0, 8000)}` : "",
     "",
@@ -6330,6 +6451,9 @@ function buildTaskPromptContext(task = {}) {
   const files = taskEvidenceFiles(task);
   const recommendedCapability = recommendedCapabilityFromState();
   const recommendedCapabilityContext = recommendedCapability ? buildCapabilityGapContext(recommendedCapability) : "";
+  const promptReferenceContext = formatPromptReferenceContinuation(input?.value || task.prompt || "", { title: "任务关联 @file 引用" });
+  const taskDebugTarget = task.repairContext?.diagnostics?.debugTarget || task.diagnostics?.debugTarget || state.lastDebugDiagnostics?.debugTarget || null;
+  const taskDebugTargetContext = formatDebugTargetContinuation(taskDebugTarget, { title: "任务关联调试目标" });
   const taskBrowserTriage = task.repairContext?.diagnostics?.browserTriage || task.diagnostics?.browserTriage || state.lastDebugDiagnostics?.browserTriage || null;
   const taskBrowserTriageContext = formatBrowserTriageContinuation(taskBrowserTriage, { title: "任务关联浏览器异常分诊" });
   const checks = (task.checks || [])
@@ -6372,11 +6496,13 @@ function buildTaskPromptContext(task = {}) {
     task.prompt ? `原始需求：${task.prompt}` : "",
     task.checkpointId ? `Checkpoint：${task.checkpointId}` : "",
     files.length ? `相关文件：\n${files.map((file) => `@${file}`).join("\n")}` : "",
+    promptReferenceContext ? `引用上下文：\n${promptReferenceContext}` : "",
     selectedHunks ? `部分应用 hunk：\n${selectedHunks}` : "",
     checks ? `检查记录：\n${checks}` : "",
     failedCommands ? `失败命令：\n${failedCommands}` : "",
     verificationCommands ? `可重跑验证命令：\n${verificationCommands}` : "",
     repair ? `修复证据：\n${repair}` : "",
+    taskDebugTargetContext ? `调试目标：\n${taskDebugTargetContext}` : "",
     taskBrowserTriageContext ? `页面调试线索：\n${taskBrowserTriageContext}` : "",
     recommendedCapabilityContext ? `推荐能力缺口：\n${recommendedCapabilityContext}` : "",
     task.git?.status?.length ? `Git 状态：${task.git.status.length} 个改动` : "",
@@ -6667,6 +6793,9 @@ function approvalTargetSummary(approval = {}) {
 function buildApprovalPromptContext(approval = {}) {
   if (!approval?.id) return "";
   const target = approvalTargetSummary(approval);
+  const approvalPromptReferenceContext = formatPromptReferenceContinuation(input?.value || approval.prompt || approval.command || "", { title: "审批关联 @file 引用" });
+  const approvalDebugTargetContext = formatDebugTargetContinuation(approval.debugTarget || approval.diagnostics?.debugTarget || state.lastDebugDiagnostics?.debugTarget || null, { title: "审批关联调试目标" });
+  const approvalBrowserTriageContext = formatBrowserTriageContinuation(approval.browserTriage || approval.diagnostics?.browserTriage || state.lastDebugDiagnostics?.browserTriage || null, { title: "审批关联浏览器异常分诊" });
   const policy = approval.policy || approval.risk || approval.reason
     ? compactApprovalJson({
       risk: approval.risk || approval.policy?.risk || "unknown",
@@ -6693,6 +6822,9 @@ function buildApprovalPromptContext(approval = {}) {
     policy ? `策略证据：\n${policy}` : "",
     argumentsContext ? `调用参数：\n${argumentsContext}` : "",
     execution ? `执行/升级记录：\n${execution}` : "",
+    approvalPromptReferenceContext ? `文件引用边界：\n${approvalPromptReferenceContext}` : "",
+    approvalDebugTargetContext ? `当前调试目标：\n${approvalDebugTargetContext}` : "",
+    approvalBrowserTriageContext ? `页面调试线索：\n${approvalBrowserTriageContext}` : "",
     `审批原始记录（截断）：\n${compactApprovalJson(approval, 8000)}`,
     "",
     "要求：",
@@ -7064,6 +7196,10 @@ function buildActionFailureContext(evidence = {}) {
   const kind = evidence.kind || "action";
   const targetName = evidence.targetName || evidence.approval?.id || evidence.item?.name || "unknown";
   const errorMessage = evidence.error?.message || evidence.error || "unknown error";
+  const promptSource = evidence.prompt || evidence.request?.prompt || evidence.item?.prompt || state.lastPrompt || input?.value || "";
+  const actionPromptReferenceContext = formatPromptReferenceContinuation(promptSource, { title: "动作失败关联 @file 引用" });
+  const actionDebugTargetContext = formatDebugTargetContinuation(evidence.debugTarget || evidence.diagnostics?.debugTarget || state.lastDebugDiagnostics?.debugTarget || null, { title: "动作失败关联调试目标" });
+  const actionBrowserTriageContext = formatBrowserTriageContinuation(evidence.browserTriage || evidence.diagnostics?.browserTriage || state.lastDebugDiagnostics?.browserTriage || null, { title: "动作失败关联浏览器异常分诊" });
   const requestContext = evidence.request || evidence.endpoint
     ? compactJson({
       endpoint: evidence.endpoint || evidence.request?.endpoint || "",
@@ -7084,6 +7220,9 @@ function buildActionFailureContext(evidence = {}) {
     evidence.endpoint ? `接口：${evidence.endpoint}` : "",
     `失败原因：${errorMessage}`,
     requestContext ? `请求上下文：\n${requestContext}` : "",
+    actionPromptReferenceContext ? `文件引用边界：\n${actionPromptReferenceContext}` : "",
+    actionDebugTargetContext ? `当前调试目标：\n${actionDebugTargetContext}` : "",
+    actionBrowserTriageContext ? `页面调试线索：\n${actionBrowserTriageContext}` : "",
     relatedContext ? `相关目录/审批上下文：\n${relatedContext.slice(0, 8000)}` : "",
     "",
     "失败证据 JSON：",
@@ -7985,6 +8124,8 @@ function buildGoalContinuationPrompt(goal = {}, capability = recommendedCapabili
     recovery.failedCommands?.length ? `失败命令：\n${recovery.failedCommands.map((command) => `- ${command}`).join("\n")}` : "",
     recovery.verificationCommands?.length ? `可重跑验证命令：\n${recovery.verificationCommands.map((command) => `- ${command}`).join("\n")}` : ""
   ].filter(Boolean);
+  const promptReferenceContext = formatPromptReferenceContinuation(input?.value || goal?.objective || state.lastPrompt || "", { title: "目标继续关联 @file 引用" });
+  const goalDebugTargetContext = formatDebugTargetContinuation(state.lastDebugDiagnostics?.debugTarget || recovery.debugTarget || null, { title: "当前调试目标" });
   const goalBrowserTriage = state.lastDebugDiagnostics?.browserTriage || recovery.browserTriage || null;
   const goalBrowserTriageContext = formatBrowserTriageContinuation(goalBrowserTriage, { title: "最近浏览器异常分诊" });
   return [
@@ -8000,8 +8141,12 @@ function buildGoalContinuationPrompt(goal = {}, capability = recommendedCapabili
     recoveryLines.join("\n"),
     recoveryDetails.length ? "\n恢复明细：" : "",
     recoveryDetails.join("\n\n"),
+    promptReferenceContext ? "\n引用上下文：" : "",
+    promptReferenceContext,
     gapSummaryContext ? "\n能力差距摘要：" : "",
     gapSummaryContext,
+    goalDebugTargetContext ? "\n调试目标：" : "",
+    goalDebugTargetContext,
     goalBrowserTriageContext ? "\n页面调试线索：" : "",
     goalBrowserTriageContext,
     "",
@@ -9193,6 +9338,8 @@ function buildQueuePromptContext(item = {}) {
   if (!item?.id && !item?.prompt) return "";
   const recommendedCapability = recommendedCapabilityFromState();
   const recommendedCapabilityContext = recommendedCapability ? buildCapabilityGapContext(recommendedCapability) : "";
+  const promptReferenceContext = formatPromptReferenceContinuation(input?.value || item.prompt || "", { title: "队列关联 @file 引用" });
+  const queueDebugTargetContext = formatDebugTargetContinuation(item.debugTarget || state.lastDebugDiagnostics?.debugTarget || null, { title: "队列关联调试目标" });
   const queueBrowserTriageContext = formatBrowserTriageContinuation(item.browserTriage || state.lastDebugDiagnostics?.browserTriage || null, { title: "队列关联浏览器异常分诊" });
   return [
     "请基于这条队列任务继续当前编码/调试工作。",
@@ -9206,6 +9353,8 @@ function buildQueuePromptContext(item = {}) {
     "",
     "队列任务提示词：",
     item.prompt || "(无提示词)",
+    promptReferenceContext ? `引用上下文：\n${promptReferenceContext}` : "",
+    queueDebugTargetContext ? `调试目标：\n${queueDebugTargetContext}` : "",
     queueBrowserTriageContext ? `页面调试线索：\n${queueBrowserTriageContext}` : "",
     recommendedCapabilityContext ? `推荐能力缺口：\n${recommendedCapabilityContext}` : "",
     "",
@@ -9582,6 +9731,21 @@ function appendProcessFailureEvidence(error, {
 
 function processProbeUrl(item = {}) {
   return item.probe?.url || item.url || item.finalUrl || "";
+}
+
+function debugTargetProcessItem(debugTarget = {}) {
+  const target = debugTarget?.target || {};
+  const process = target.process || {};
+  const url = target.url || process.probe?.url || debugTarget?.summary?.targetUrl || "";
+  return {
+    ...process,
+    id: process.id || debugTarget?.summary?.processId || "debug-target",
+    processId: process.id || debugTarget?.summary?.processId || "debug-target",
+    command: process.command || debugTarget?.summary?.command || "debug_target",
+    status: process.status || debugTarget?.summary?.status || "target",
+    probe: process.probe || (url ? { url, status: debugTarget?.summary?.processHealth || "selected", ok: false } : null),
+    url
+  };
 }
 
 async function runProcessBrowserEvidence(item = {}, { mode = "check", title = "受管进程" } = {}) {
@@ -12380,6 +12544,9 @@ function renderDebugDiagnostics(result, { persist = true } = {}) {
   const statusLabel = result.status === "failing" ? "失败" : result.status === "needs_attention" ? "需关注" : "就绪";
   const findings = result.findings || [];
   const actions = result.nextActions || [];
+  const debugTarget = result.debugTarget || null;
+  const debugTargetSummary = debugTarget?.summary || null;
+  const debugTargetProcess = debugTarget?.target?.process || null;
   const hasRunnableAction = actions.some((action) => String(action.command || "").trim());
   const hasLastFailedCommand = Boolean(state.lastFailedCommand?.command);
   const hasBrowserSourceLocations = Boolean(browserSourceLocations(result).length);
@@ -12413,12 +12580,49 @@ function renderDebugDiagnostics(result, { persist = true } = {}) {
       <span>${result.browserTriage?.status ? `triage: ${result.browserTriage.status}` : "no triage"}</span>
       <span>${result.browserSourceLocations?.length ? `source: ${result.browserSourceLocations.length}` : "no source"}</span>
     </div>
+    <div class="debug-target-card" ${debugTarget ? "" : "hidden"}>
+      <div>
+        <strong>当前调试目标</strong>
+        <small>${debugTargetSummary?.targetUrl || debugTarget?.target?.url || "未识别 URL"}</small>
+        <span>${[
+          debugTargetSummary?.source ? `source: ${debugTargetSummary.source}` : "",
+          debugTargetSummary?.processHealth ? `process: ${debugTargetSummary.processHealth}` : "",
+          debugTargetProcess?.id ? `id: ${debugTargetProcess.id}` : "",
+          debugTargetSummary?.safeCommands ? `${debugTargetSummary.safeCommands} checks` : ""
+        ].filter(Boolean).join(" · ") || "等待启动或页面检查证据"}</span>
+      </div>
+      <button type="button" data-debug-action="target-detail">详情</button>
+      <button type="button" data-debug-action="target-prompt">加入提示词</button>
+      <button type="button" data-debug-action="target-check">检查</button>
+      <button type="button" data-debug-action="target-trace">Trace</button>
+      <button type="button" data-debug-action="target-debug">复查</button>
+    </div>
     <div class="debug-last-failed-command" hidden></div>
     <div class="debug-finding-list"></div>
     <div class="debug-evidence-list"></div>
     <div class="debug-action-list"></div>
   `;
   renderLastFailedCommandCard(result);
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='target-detail']")?.addEventListener("click", () => {
+    appendDebugEvidence("当前调试目标", debugTargetSummary?.status || "target", debugTarget || {});
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='target-prompt']")?.addEventListener("click", () => {
+    appendDebugContextToPrompt(result);
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='target-check']")?.addEventListener("click", () => {
+    runProcessBrowserEvidence(debugTargetProcessItem(debugTarget), { mode: "check", title: "当前调试目标" });
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='target-trace']")?.addEventListener("click", () => {
+    runProcessBrowserEvidence(debugTargetProcessItem(debugTarget), { mode: "trace", title: "当前调试目标" });
+  });
+
+  debugDiagnosticsPanel.querySelector("[data-debug-action='target-debug']")?.addEventListener("click", () => {
+    runProcessBrowserEvidence(debugTargetProcessItem(debugTarget), { mode: "debug", title: "当前调试目标" });
+  });
 
   debugDiagnosticsPanel.querySelector("[data-debug-action='copy-bundle']")?.addEventListener("click", async () => {
     const bundle = buildDebugBundle(result);
@@ -12535,6 +12739,12 @@ function renderDebugDiagnostics(result, { persist = true } = {}) {
 
   const evidenceList = debugDiagnosticsPanel.querySelector(".debug-evidence-list");
   const evidenceButtons = [
+    {
+      label: "调试目标",
+      state: debugTargetSummary?.targetUrl || debugTargetSummary?.source || "none",
+      enabled: Boolean(debugTarget),
+      value: debugTarget
+    },
     {
       label: "检查计划",
       state: `${result.verificationPlan?.commands?.length || 0} checks`,
@@ -12965,6 +13175,15 @@ async function refreshHealth() {
   state.contextSnapshot = data.contextSnapshot || null;
   state.contextRollup = data.contextRollup || null;
   restoreCommandDebugState();
+}
+
+async function refreshRuntimeUrl() {
+  const data = await api("/api/runtime-url");
+  state.runtimeUrl = data.runtimeUrl || null;
+  if (browserCheckUrlInput && data.runtimeUrl?.browserCheckUrl && !browserCheckUrlInput.value.trim()) {
+    browserCheckUrlInput.value = data.runtimeUrl.browserCheckUrl;
+  }
+  return data.runtimeUrl || null;
 }
 
 async function refreshToolCatalog() {
@@ -14507,7 +14726,7 @@ debugDiagnosticsBtn?.addEventListener("click", async () => {
   const runChecks = Boolean(debugDiagnosticsPanel?.querySelector("#debugRunChecks")?.checked || debugRunChecks?.checked);
   setBusy(true, "调试诊断");
   try {
-    const diagnosticsResponse = await api("/api/debug-diagnostics", {
+    const debugTargetResponse = await api("/api/debug-target", {
       method: "POST",
       body: JSON.stringify({
         url: targetUrl,
@@ -14517,36 +14736,50 @@ debugDiagnosticsBtn?.addEventListener("click", async () => {
         commands: state.pendingCommands.map((item) => item.command || item)
       })
     });
-    renderDebugDiagnostics(diagnosticsResponse.diagnostics);
-    renderVerificationPlan(diagnosticsResponse.diagnostics?.verificationPlan);
-    if (diagnosticsResponse.diagnostics?.verificationPlan?.commands?.length) {
-      renderCommands(diagnosticsResponse.diagnostics.verificationPlan.commands);
+    const debugTarget = debugTargetResponse.debugTarget || null;
+    const diagnostics = debugTarget?.diagnostics || {};
+    diagnostics.debugTarget = debugTarget ? {
+      generatedAt: debugTarget.generatedAt,
+      workspace: debugTarget.workspace,
+      summary: debugTarget.summary,
+      target: debugTarget.target,
+      verificationCommands: debugTarget.verificationCommands || [],
+      nextActions: debugTarget.nextActions || [],
+      policy: debugTarget.policy
+    } : null;
+    renderDebugDiagnostics(diagnostics);
+    renderVerificationPlan(diagnostics?.verificationPlan);
+    if (diagnostics?.verificationPlan?.commands?.length) {
+      renderCommands(diagnostics.verificationPlan.commands);
     }
-    if (diagnosticsResponse.diagnostics?.browserTrace) {
-      renderBrowserTrace(diagnosticsResponse.diagnostics.browserTrace);
+    if (diagnostics?.browserTrace) {
+      renderBrowserTrace(diagnostics.browserTrace);
     }
     appendToolCall({
-      title: "一键调试诊断完成",
+      title: "一键调试目标完成",
       label: "debug",
-      state: diagnosticsResponse.diagnostics?.status || "unknown",
+      state: diagnostics?.status || debugTarget?.summary?.status || "unknown",
       body: JSON.stringify({
-        generatedAt: diagnosticsResponse.diagnostics?.generatedAt,
-        status: diagnosticsResponse.diagnostics?.status,
-        summary: diagnosticsResponse.diagnostics?.summary,
-        findings: diagnosticsResponse.diagnostics?.findings,
-        browserTriage: diagnosticsResponse.diagnostics?.browserTriage,
-        browserSourceLocations: diagnosticsResponse.diagnostics?.browserSourceLocations,
-        nextActions: diagnosticsResponse.diagnostics?.nextActions,
-        policy: diagnosticsResponse.diagnostics?.policy
+        tool: "debug_target",
+        generatedAt: debugTarget?.generatedAt || diagnostics?.generatedAt,
+        target: debugTarget?.target,
+        targetSummary: debugTarget?.summary,
+        status: diagnostics?.status,
+        summary: diagnostics?.summary,
+        findings: diagnostics?.findings,
+        browserTriage: diagnostics?.browserTriage,
+        browserSourceLocations: diagnostics?.browserSourceLocations,
+        nextActions: diagnostics?.nextActions,
+        policy: debugTarget?.policy || diagnostics?.policy
       }, null, 2).slice(0, 12000)
     });
-    setBusy(false, diagnosticsResponse.diagnostics?.status === "ready" ? "诊断通过" : "诊断完成");
+    setBusy(false, diagnostics?.status === "ready" ? "诊断通过" : "诊断完成");
   } catch (error) {
     showToast(error.message);
     appendGateFailureEvidence(error, {
       title: "一键调试诊断失败",
       kind: "debug",
-      endpoint: "/api/debug-diagnostics",
+      endpoint: "/api/debug-target",
       request: {
         url: targetUrl,
         includeTrace: Boolean(targetUrl),
@@ -14865,6 +15098,9 @@ remotePublishPreflightBtn?.addEventListener("click", async () => {
 function buildHandoffPromptContext(handoff = {}) {
   if (!handoff?.id && !handoff?.body) return "";
   const taskLines = (handoff.tasks || []).slice(0, 8).map((task) => `- ${task.status || "unknown"} · ${task.id || ""} · ${task.prompt || ""}`);
+  const promptReferenceContext = formatPromptReferenceContinuation(input?.value || handoff.title || "", { title: "交付关联 @file 引用" });
+  const handoffDebugTargetContext = formatDebugTargetContinuation(state.lastDebugDiagnostics?.debugTarget || null, { title: "交付关联调试目标" });
+  const handoffBrowserTriageContext = formatBrowserTriageContinuation(state.lastDebugDiagnostics?.browserTriage || null, { title: "交付关联浏览器异常分诊" });
   return [
     "请基于这份 PR/交付草稿继续当前编码、调试或交付准备工作。",
     "",
@@ -14876,6 +15112,12 @@ function buildHandoffPromptContext(handoff = {}) {
     "",
     "近期任务：",
     taskLines.length ? taskLines.join("\n") : "- 无",
+    promptReferenceContext ? "\n引用上下文：" : "",
+    promptReferenceContext,
+    handoffDebugTargetContext ? "\n调试目标：" : "",
+    handoffDebugTargetContext,
+    handoffBrowserTriageContext ? "\n页面调试线索：" : "",
+    handoffBrowserTriageContext,
     "",
     "交付草稿 Markdown：",
     String(handoff.body || "").slice(0, 12000),
@@ -14900,6 +15142,8 @@ function handoffVerificationCommands(handoff = {}) {
     (task.failedCommands || []).forEach((command) => add(command, `交付前优先重跑失败命令：${task.id || "task"}`));
     (task.checks || []).forEach((check) => add(check.command, check.reason || `交付草稿历史检查：${task.id || "task"}`));
   });
+  (state.lastDebugDiagnostics?.debugTarget?.verificationCommands || []).forEach((command) => add(command, "交付前复查当前调试目标。"));
+  (state.lastDebugDiagnostics?.verificationPlan?.commands || []).forEach((command) => add(command, "交付前复用最近调试诊断验证计划。"));
   (state.pendingCommands || []).forEach((item) => add(item, item.reason || "当前命令面板里的待复查命令。"));
   [
     { command: "node --check app.js", reason: "交付前复查前端脚本语法。" },
@@ -15121,6 +15365,7 @@ async function waitForManagedProcessProbe(process = {}, { attempts = 12, delayMs
 async function discoverStartupCommand({ start = false, debug = false } = {}) {
   setBusy(true, debug ? "发现并调试" : start ? "发现并启动" : "发现启动命令");
   try {
+    const runtimeUrl = await refreshRuntimeUrl().catch(() => null);
     const result = await api("/api/process-startup-commands?limit=8");
     const first = result.commands?.[0] || null;
     if (first?.command && processCommandInput) {
@@ -15132,7 +15377,8 @@ async function discoverStartupCommand({ start = false, debug = false } = {}) {
       label: "proc",
       state: `${result.commands?.length || 0} commands`,
       body: JSON.stringify({
-        runtimeUrl: result.runtimeUrl || null,
+        tool: "runtime_url",
+        runtimeUrl: result.runtimeUrl || runtimeUrl,
         packageManager: result.packageManager,
         scripts: result.scripts,
         commands: result.commands,
