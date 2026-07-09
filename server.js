@@ -25,12 +25,16 @@ const PORT = parsePositivePort(getCliOption("--port") || process.env.FORGE_PORT 
 const PORT_AUTO_RETRY = process.env.FORGE_PORT_AUTO_RETRY !== "0";
 const PORT_RETRY_LIMIT = parseNonNegativeInteger(process.env.FORGE_PORT_RETRY_LIMIT, 50);
 let activeRuntimeServer = null;
-const DEFAULT_MODEL = "deepseek-v4-pro";
+const DEFAULT_MODEL_CANDIDATES = ["deepseek-v4-pro", "deepseek-chat"];
+const DEFAULT_MODEL = DEFAULT_MODEL_CANDIDATES[0];
 const MODEL_API_URL = process.env.FORGE_MODEL_API_URL || "https://api.deepseek.com/chat/completions";
-const MODEL_CANDIDATES = (process.env.FORGE_MODELS || process.env.DEEPSEEK_MODEL || DEFAULT_MODEL)
+const MODEL_CANDIDATES = uniqueLimited(
+  (process.env.FORGE_MODELS || process.env.DEEPSEEK_MODEL || DEFAULT_MODEL_CANDIDATES.join(","))
   .split(",")
   .map((item) => item.trim())
-  .filter(Boolean);
+    .filter(Boolean),
+  12
+);
 let modelRuntime = {
   provider: "deepseek-compatible",
   endpoint: MODEL_API_URL,
@@ -755,6 +759,56 @@ function buildModelPolicy({ includeRecent = true, usageLedger = null } = {}) {
     ]
   };
 }
+
+function buildModelRuntimeCapabilityReadiness() {
+  const policy = buildModelPolicy({ includeRecent: false });
+  const guardrailStatuses = new Map((policy.guardrails || []).map((item) => [item.name, item.status]));
+  const requiredGuardrails = new Map([
+    ["api-key-redaction", new Set(["enforced"])],
+    ["provider-config-read-only", new Set(["enforced"])],
+    ["fallback-order-auditable", new Set(["configured", "single-model"])],
+    ["recent-call-redaction", new Set(["enforced"])],
+    ["sse-agent-stream", new Set(["implemented"])],
+    ["provider-token-streaming", new Set(["implemented"])],
+    ["token-usage-ledger", new Set(["implemented"])],
+    ["model-budget-preflight", new Set(["implemented"])],
+    ["provider-cost-accounting", new Set(["usage-only", "priced", "partial"])],
+    ["user-supplied-billing-reconciliation", new Set(["implemented"])]
+  ]);
+  const missingGuardrails = [...requiredGuardrails.entries()]
+    .filter(([name, allowed]) => !allowed.has(guardrailStatuses.get(name)))
+    .map(([name]) => name);
+  const localControlsReady = missingGuardrails.length === 0;
+  const fallbackConfigured = Number(policy.runtime?.candidateCount || 0) > 1;
+  const hasRecentCalls = Number(policy.runtime?.requestCount || 0) > 0;
+  const evidence = [
+    `模型运行就绪：${localControlsReady ? "implemented" : "partial"}`,
+    `API Key：${policy.hasApiKey ? "configured" : "missing"}`,
+    `候选模型：${(policy.runtime?.candidates || []).join(", ")}`,
+    fallbackConfigured ? "默认 fallback 已配置" : "单模型运行（可通过 FORGE_MODELS 配置 fallback）",
+    hasRecentCalls
+      ? `最近模型调用：${policy.runtime.requestCount} 次`
+      : "尚未发起模型请求（不影响本地能力审计）",
+    missingGuardrails.length ? `缺失 guardrail：${missingGuardrails.join(", ")}` : "模型 guardrails 已覆盖"
+  ];
+  const next = !localControlsReady
+    ? `继续补齐模型运行 guardrail：${missingGuardrails.join(", ")}。`
+    : !policy.hasApiKey
+      ? "本地模型运行治理能力已就绪；启动时设置 DEEPSEEK_API_KEY 后即可真实请求，provider API 账单直连仍需外部授权。"
+      : fallbackConfigured
+        ? "本地模型运行治理能力已就绪；可继续增加 provider API 账单直连和真实成本扣减。"
+        : "本地模型运行治理能力已就绪；建议通过 FORGE_MODELS 配置多模型 fallback，provider API 账单直连仍需外部授权。";
+  return {
+    status: localControlsReady ? "implemented" : "partial",
+    policy,
+    localControlsReady,
+    fallbackConfigured,
+    hasRecentCalls,
+    missingGuardrails,
+    evidence,
+    next
+  };
+}
 const CONTEXT_LIMIT_BYTES = 220 * 1024;
 const MAX_FILE_BYTES = 120 * 1024;
 const MAX_PROMPT_REFERENCE_FILE_BYTES = 2 * 1024 * 1024;
@@ -771,6 +825,7 @@ const REVIEW_DIR = path.join(APP_ROOT, ".forge", "reviews");
 const PROCESS_LOG_DIR = path.join(APP_ROOT, ".forge", "process-logs");
 const REMOTE_PUBLISH_DIR = path.join(APP_ROOT, ".forge", "remote-publish");
 const REMOTE_CI_DIR = path.join(APP_ROOT, ".forge", "remote-ci");
+const EXTERNAL_READINESS_DIR = path.join(APP_ROOT, ".forge", "external-readiness");
 const STATE_DIR = path.join(APP_ROOT, ".forge", "state");
 const GOAL_STATE_PATH = path.join(STATE_DIR, "goal.json");
 const CONTEXT_SNAPSHOT_PATH = path.join(STATE_DIR, "context-snapshot.json");
@@ -10888,6 +10943,9 @@ function buildGoalRecoverySummary({ goal = null, tasks = [], capabilities = null
   const recommended = capabilities?.recommendedNext || null;
   const capabilityGapSummary = capabilities?.gapSummary || null;
   const pendingProposal = currentGoal.pendingProposal || null;
+  const pendingSourceDebugContext = pendingProposal?.sourceDebugContext || null;
+  const pendingDebugTarget = pendingProposal?.debugTarget || pendingSourceDebugContext?.debugTarget || null;
+  const pendingBrowserTriage = pendingProposal?.browserTriage || pendingSourceDebugContext?.browserTriage || null;
   const verification = currentGoal.lastVerification || null;
   const changedFiles = Array.isArray(recentTask?.changedFiles) ? recentTask.changedFiles.slice(0, 12) : [];
   const selectedHunks = Array.isArray(recentTask?.selectedHunks) ? recentTask.selectedHunks.slice(0, 8) : [];
@@ -10928,6 +10986,8 @@ function buildGoalRecoverySummary({ goal = null, tasks = [], capabilities = null
     objective: currentGoal.objective || "",
     updatedAt: currentGoal.updatedAt || "",
     pendingProposalId: pendingProposal?.id || "",
+    debugTarget: pendingDebugTarget,
+    browserTriage: pendingBrowserTriage,
     lastTaskId: currentGoal.lastTaskId || recentTask?.id || "",
     recommendedGap: recommended?.capability ? {
       area: recommended.capability.area || "",
@@ -12141,6 +12201,7 @@ async function buildCapabilityAudit({ light = false } = {}) {
     : await buildAssetCatalog();
   const goal = await readGoalState();
   const managedProcessCount = light ? 0 : (await listManagedProcesses()).length;
+  const modelReadiness = buildModelRuntimeCapabilityReadiness();
   const capabilities = [
     {
       area: "上下文索引",
@@ -12157,8 +12218,8 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "验证与修复闭环",
       status: "implemented",
-      evidence: ["discoverCheckCommands", "discoverTypecheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status", "stageRepairVerificationCommands", "reviewArtifactVerificationCommands", "reviewCommentsVerificationCommands", "gateEvidenceVerificationCommands", "写入失败关联 @file 引用", "写入失败关联调试目标", "动作失败关联 @file 引用", "动作失败关联调试目标", "审查失败证据自动排队验证", "门禁失败证据自动排队验证"],
-      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、TypeScript 类型检查发现、CI 配置、最近验证证据、写入失败与通用动作失败关联 @file/调试目标/浏览器分诊、审查/PR 评论复查命令、门禁失败复查命令、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
+      evidence: ["discoverCheckCommands", "discoverTypecheckCommands", "runCheckCommands", "generateRepairDiff", "/api/verification-plan", "/api/ci-status", "stageRepairVerificationCommands", "reviewArtifactVerificationCommands", "reviewCommentsVerificationCommands", "gateEvidenceVerificationCommands", "写入失败关联 @file 引用", "写入失败关联调试目标", "失败命令关联 @file 引用", "命令源码关联调试目标", "批量命令关联浏览器异常分诊", "动作失败关联 @file 引用", "动作失败关联调试目标", "审查失败证据自动排队验证", "门禁失败证据自动排队验证"],
+      next: "已补只读验证门禁计划和 CI 状态汇总，将本地安全检查、TypeScript 类型检查发现、CI 配置、最近验证证据、写入失败/失败命令/命令源码/批量命令与通用动作失败关联 @file/调试目标/浏览器分诊、审查/PR 评论复查命令、门禁失败复查命令、远端 PR/CI 只读状态和变更范围纳入 PR readiness；可继续接入真实远端 CI 必过门禁。"
     },
     {
       area: "代码审查证据",
@@ -12187,14 +12248,14 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "可恢复状态",
       status: "implemented",
-      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", "/api/health recoverySummary", "lastFailedCommand", "verificationCommands", "contextEvidenceVerificationCommands", "当前调试目标继续上下文", "会话/冲突/任务/队列/交付调试目标延续", "会话/目标/任务/队列/冲突/审查/交付 @file 引用延续", "上下文失败自动排队验证", goal.phase || "idle"],
-      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact、语义索引持久化、刷新后的 recoverySummary 下一步线索、最近失败命令、变更文件、选中 hunk、当前调试目标、@file 命中/缺失边界、浏览器异常分诊、上下文证据排队验证和失败后的本地复查命令自动恢复；可继续增加更细粒度的摘要裁剪策略。"
+      evidence: [".forge/state/goal.json", ".forge/state/context-snapshot.json", ".forge/state/context-compact.json", ".forge/state/context-rollup.json", "/api/context-snapshot", "/api/context-compact", "/api/context-rollup", "/api/health recoverySummary", "lastFailedCommand", "verificationCommands", "contextEvidenceVerificationCommands", "当前调试目标继续上下文", "会话/冲突/任务/队列/交付调试目标延续", "会话/目标/任务/队列/冲突/审查/交付 @file 引用延续", "上下文证据关联 @file 引用", "上下文证据关联调试目标", "上下文证据关联浏览器异常分诊", "上下文失败自动排队验证", goal.phase || "idle"],
+      next: "已补可恢复目标状态、跨会话上下文摘要、手动/自动上下文压缩、滚动摘要检索 artifact、语义索引持久化、刷新后的 recoverySummary 下一步线索、最近失败命令、变更文件、选中 hunk、当前调试目标、@file 命中/缺失边界、浏览器异常分诊、上下文证据排队验证、上下文证据里的 @file/调试目标/浏览器分诊延续和失败后的本地复查命令自动恢复；可继续增加更细粒度的摘要裁剪策略。"
     },
     {
       area: "长任务管理",
       status: "implemented",
-      evidence: ["/api/processes", "/api/process-health", "/api/process-search", "/api/runtime-url", "/api/debug-target", "debug_target", ".forge/process-logs", ".forge/process-health-rules.json", ".forge/state/runtime-url.json", `${managedProcessCount} 个受管进程`, "独立健康探针汇总", "运行 URL 状态持久化", "当前调试目标聚合", "可配置健康规则匹配", "健康规则正则匹配", "负向错误信号守卫"],
-      next: "已补启动命令发现/脚本展开/发现并启动、启动后自动识别页面 URL、真实运行 URL 持久化与调试输入自动填充、当前调试目标聚合、受管进程输出搜索、独立健康探针、日志 artifact 持久化和历史回放；健康规则支持状态码、输出/响应包含匹配、输出/响应正则匹配和负向错误信号守卫。"
+      evidence: ["/api/processes", "/api/process-health", "/api/process-search", "/api/runtime-url", "/api/debug-target", "debug_target", ".forge/process-logs", ".forge/process-health-rules.json", ".forge/state/runtime-url.json", `${managedProcessCount} 个受管进程`, "独立健康探针汇总", "运行 URL 状态持久化", "当前调试目标聚合", "进程证据关联 @file 引用", "进程证据关联调试目标", "进程证据关联浏览器异常分诊", "可配置健康规则匹配", "健康规则正则匹配", "负向错误信号守卫"],
+      next: "已补启动命令发现/脚本展开/发现并启动、启动后自动识别页面 URL、真实运行 URL 持久化与调试输入自动填充、当前调试目标聚合、受管进程输出搜索、进程证据里的 @file/调试目标/浏览器分诊延续、独立健康探针、日志 artifact 持久化和历史回放；健康规则支持状态码、输出/响应包含匹配、输出/响应正则匹配和负向错误信号守卫。"
     },
     {
       area: "交付草稿",
@@ -12223,26 +12284,26 @@ async function buildCapabilityAudit({ light = false } = {}) {
     {
       area: "工具生态",
       status: "partial",
-      evidence: [`内置工具 ${getAgentTools().length} 个`, `本地扩展 ${extensions.summary.total} 个`, `MCP server ${mcp.summary.total} 个`, "/api/tools", "/api/extensions", "/api/extension-trust", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "本地 manifest SHA-256", "本地公钥签名校验"],
-      next: "已暴露本地工具目录、扩展注册表、扩展 manifest checksum/trust 审计、本地公钥签名校验、本地扩展工具审批执行、MCP server 发现、本地 MCP 握手/目录枚举和审批后的 tools/call；继续补远端扩展市场和远端签名链校验。"
+      evidence: [`内置工具 ${getAgentTools().length} 个`, `本地扩展 ${extensions.summary.total} 个`, `MCP server ${mcp.summary.total} 个`, "/api/tools", "/api/extensions", "/api/extension-trust", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "目录证据关联 @file 引用", "目录证据关联调试目标", "目录证据关联浏览器异常分诊", "MCP 资源证据关联 @file 引用", "MCP 资源证据关联调试目标", "MCP 资源证据关联浏览器异常分诊", "本地 manifest SHA-256", "本地公钥签名校验"],
+      next: "已暴露本地工具目录、扩展注册表、扩展 manifest checksum/trust 审计、本地公钥签名校验、本地扩展工具审批执行、MCP server 发现、本地 MCP 握手/目录枚举、审批后的 tools/call，以及目录/MCP resource 证据里的 @file/调试目标/浏览器分诊延续；继续补远端扩展市场和远端签名链校验。"
     },
     {
       area: "外部工具与浏览器自动化",
       status: "partial",
-      evidence: ["/api/extensions", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "/api/browser-check", "/api/browser-audit", "/api/browser-trace", "/api/debug-target", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", "/api/permission-matrix", "本地扩展只读工具桥接", "本地 MCP 只读握手与目录枚举", "审批后 MCP tools/call", "受控浏览器截图/DOM/trace/交互/会话/视觉回归", "当前调试目标聚合", "provider/action 权限模型", "静态可访问性审计", "keyDown/keyUp/wheel/scroll 复杂交互序列"],
-      next: "已补本地扩展工具桥接、MCP 本地探测、审批后工具调用、受控浏览器自动化、多步骤会话 artifact、当前调试目标聚合、静态可访问性审计、复杂鼠标键盘序列和 provider/action 权限模型；继续接入远端 MCP 和跨站点远端浏览器会话。"
+      evidence: ["/api/extensions", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "/api/browser-check", "/api/browser-audit", "/api/browser-trace", "/api/debug-target", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", "/api/permission-matrix", "本地扩展只读工具桥接", "本地 MCP 只读握手与目录枚举", "审批后 MCP tools/call", "受控浏览器截图/DOM/trace/交互/会话/视觉回归", "当前调试目标聚合", "浏览器证据关联 @file 引用", "浏览器证据关联调试目标", "浏览器证据关联浏览器异常分诊", "provider/action 权限模型", "静态可访问性审计", "keyDown/keyUp/wheel/scroll 复杂交互序列"],
+      next: "已补本地扩展工具桥接、MCP 本地探测、审批后工具调用、受控浏览器自动化、多步骤会话 artifact、当前调试目标聚合、浏览器证据里的 @file/调试目标/浏览器分诊延续、静态可访问性审计、复杂鼠标键盘序列和 provider/action 权限模型；继续接入远端 MCP 和跨站点远端浏览器会话。"
     },
     {
       area: "多模态与浏览器执行",
       status: "partial",
-      evidence: [`资产 ${assets.summary.total} 个`, "/api/assets", "/api/asset-inspect", "/api/browser-interact", "/api/browser-visual", "CSV/TSV/JSONL 抽样", "Parquet footer metadata 探测", "图片尺寸检查", "PNG 像素视觉摘要", "SVG 文本/可访问标签提取", "Tesseract OCR 执行开关/缓存 artifact", "媒体元数据解析", "Whisper 转写执行开关/缓存 artifact", "OOXML 文本抽取", "旧版 Office CFBF 文本探测", "PDF 页框/文本块 layout 抽取"],
-      next: "已补工作区资产索引、内容抽样、图片视觉摘要、SVG 本地文本提取、媒体元数据、PDF layout、本地 Whisper 转写执行开关和缓存 artifact；继续补云端多模态、说话人分离和更完整 OCR。"
+      evidence: [`资产 ${assets.summary.total} 个`, "/api/assets", "/api/asset-inspect", "/api/browser-interact", "/api/browser-visual", "资产证据关联 @file 引用", "资产证据关联调试目标", "资产证据关联浏览器异常分诊", "CSV/TSV/JSONL 抽样", "Parquet footer metadata 探测", "图片尺寸检查", "PNG 像素视觉摘要", "SVG 文本/可访问标签提取", "Tesseract OCR 执行开关/缓存 artifact", "媒体元数据解析", "Whisper 转写执行开关/缓存 artifact", "OOXML 文本抽取", "旧版 Office CFBF 文本探测", "PDF 页框/文本块 layout 抽取"],
+      next: "已补工作区资产索引、内容抽样、图片视觉摘要、SVG 本地文本提取、媒体元数据、PDF layout、本地 Whisper 转写执行开关、缓存 artifact，以及资产证据里的 @file/调试目标/浏览器分诊延续；继续补云端多模态、说话人分离和更完整 OCR。"
     },
     {
       area: "浏览器自动化与视觉回归",
       status: "partial",
-      evidence: ["/api/browser-check", "/api/browser-audit", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-trace", "/api/debug-target", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", ".forge/browser-traces", "本地 URL 状态/标题/结构检查", "静态 title/lang/H1/alt/可访问名称审计", "页面结构基线对比", "真实浏览器截图产物", "选择器裁剪截图", "console/exception/network trace artifact", "当前调试目标卡片", "hover/dblclick/clear/check/waitValue/navigate/waitUrl/waitNetwork/upload/keyDown/keyUp/wheel/scroll/坐标鼠标 受控 DOM 交互", "多步骤持久 profile 会话 artifact", "像素级视觉回归断言"],
-      next: "已补页面结构基线、静态可访问性审计、真实浏览器截图、选择器裁剪、浏览器 trace、当前调试目标卡片、扩展 DOM 交互、复杂键鼠序列、跨页面导航、网络静默等待、文件上传、坐标级鼠标动作、多步骤持久会话 artifact 和像素级视觉断言；继续补跨站点远端浏览器会话。"
+      evidence: ["/api/browser-check", "/api/browser-audit", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-trace", "/api/debug-target", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", ".forge/browser-traces", "本地 URL 状态/标题/结构检查", "静态 title/lang/H1/alt/可访问名称审计", "页面结构基线对比", "真实浏览器截图产物", "选择器裁剪截图", "console/exception/network trace artifact", "当前调试目标卡片", "浏览器证据关联 @file 引用", "浏览器证据关联调试目标", "浏览器证据关联浏览器异常分诊", "hover/dblclick/clear/check/waitValue/navigate/waitUrl/waitNetwork/upload/keyDown/keyUp/wheel/scroll/坐标鼠标 受控 DOM 交互", "多步骤持久 profile 会话 artifact", "像素级视觉回归断言"],
+      next: "已补页面结构基线、静态可访问性审计、真实浏览器截图、选择器裁剪、浏览器 trace、当前调试目标卡片、浏览器证据里的 @file/调试目标/浏览器分诊延续、扩展 DOM 交互、复杂键鼠序列、跨页面导航、网络静默等待、文件上传、坐标级鼠标动作、多步骤持久会话 artifact 和像素级视觉断言；继续补跨站点远端浏览器会话。"
     },
     {
       area: "真实浏览器交互与截图",
@@ -12264,8 +12325,9 @@ async function buildCapabilityAudit({ light = false } = {}) {
     },
     {
       area: "模型运行层",
-      status: modelRuntime.candidates.length > 1 && modelRuntime.recentCalls.length ? "implemented" : "partial",
+      status: modelReadiness.status,
       evidence: [
+        ...modelReadiness.evidence,
         "/api/model-policy",
         "/api/model-usage",
         "/api/model-budget",
@@ -12282,6 +12344,8 @@ async function buildCapabilityAudit({ light = false } = {}) {
         ".forge/state/model-usage.json",
         "modelEvidenceVerificationCommands",
         "stageModelEvidenceVerificationCommands",
+        "模型证据关联 @file 引用",
+        "模型证据关联调试目标",
         "agentFailureVerificationCommands",
         "代理失败关联 @file 引用",
         "代理失败关联调试目标",
@@ -12292,9 +12356,7 @@ async function buildCapabilityAudit({ light = false } = {}) {
         modelRuntime.averageLatencyMs ? `平均延迟：${modelRuntime.averageLatencyMs}ms` : "尚无延迟样本",
         modelRuntime.lastFallbacks.length ? `最近 fallback：${modelRuntime.lastFallbacks.length} 次` : "最近无 fallback"
       ],
-      next: modelRuntime.candidates.length > 1
-        ? "已补运行时遥测、只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、fallback 视图、provider token SSE 流式输出、模型证据验证命令排队、代理失败关联 @file/调试目标/浏览器分诊延续和本地复查命令自动恢复；可继续增加 provider API 账单直连和真实成本扣减。"
-        : "已补只读模型策略、token usage 持久化账本、预算预检、用户配置价格 schema/估算、用户提供账单核对、provider token SSE 流式输出、模型证据验证命令排队、代理失败关联 @file/调试目标/浏览器分诊延续和本地复查命令自动恢复；可通过 FORGE_MODELS 配置多模型 fallback，后续再增加 provider API 账单直连和真实成本扣减。"
+      next: modelReadiness.next
     }
   ];
   const enrichedCapabilities = capabilities.map(enrichCapabilityForAudit);
@@ -12315,6 +12377,195 @@ async function buildCapabilityAudit({ light = false } = {}) {
     capabilities: enrichedCapabilities,
     recentEvidence: { tasks, threads, reviews, approvals, extensions: extensions.summary, mcp: mcp.summary, assets: assets.summary, goal }
   };
+}
+
+function formatCapabilityAuditCliSummary(audit = {}) {
+  const summary = audit.summary || {};
+  const gapSummary = audit.gapSummary || {};
+  const comparison = audit.comparison || {};
+  const recommended = audit.recommendedNext?.capability || null;
+  const formatGap = (gap = {}) => {
+    const marker = gap.externalDependency ? "external" : "local";
+    const next = gap.next ? ` - ${gap.next}` : "";
+    return `  - [${marker}] ${gap.area || "unknown"} (${gap.status || "partial"})${next}`;
+  };
+  return [
+    "Forge Code - Codex Capability Audit",
+    "====================================",
+    `Workspace: ${audit.workspace || currentWorkspace}`,
+    `Generated: ${audit.generatedAt || new Date().toISOString()}`,
+    "",
+    `Status: ${gapSummary.status || comparison.status || "unknown"}`,
+    `Implemented: ${summary.implemented || 0}`,
+    `Partial: ${summary.partial || 0}`,
+    `Missing: ${summary.missing || 0}`,
+    `Outstanding: ${gapSummary.totalOutstanding || 0}`,
+    `Local actionable: ${gapSummary.localActionableCount || 0}`,
+    `External blocked: ${gapSummary.externalBlockedCount || 0}`,
+    "",
+    recommended ? "Recommended next:" : "Recommended next: none",
+    recommended ? `  - ${recommended.area || "unknown"} (${recommended.status || "partial"})` : "",
+    audit.recommendedNext?.reason ? `  - Reason: ${audit.recommendedNext.reason}` : "",
+    recommended?.taskPlan?.verificationCommands?.length
+      ? `  - Verify: ${recommended.taskPlan.verificationCommands.map((item) => item.command || item).filter(Boolean).join(" | ")}`
+      : "",
+    "",
+    gapSummary.topLocalGaps?.length ? "Top local gaps:" : "Top local gaps: none",
+    ...(gapSummary.topLocalGaps || []).slice(0, 5).map(formatGap),
+    "",
+    gapSummary.topExternalGaps?.length ? "Top external gaps:" : "Top external gaps: none",
+    ...(gapSummary.topExternalGaps || []).slice(0, 5).map(formatGap),
+    "",
+    gapSummary.externalPreparation?.authorizationItems?.length ? "External authorization checklist:" : "",
+    ...(gapSummary.externalPreparation?.authorizationItems || []).slice(0, 8).map((item) => `  - ${item}`),
+    gapSummary.guidance ? "" : "",
+    gapSummary.guidance ? `Guidance: ${gapSummary.guidance}` : ""
+  ].filter((line) => line !== "").join("\n");
+}
+
+async function runCapabilityAuditCli() {
+  const json = process.argv.includes("--json") || process.argv.includes("--capability-audit-json");
+  const deep = process.argv.includes("--deep") || process.argv.includes("--capability-audit-deep");
+  const audit = await buildCapabilityAudit({ light: !deep });
+  if (json) {
+    console.log(JSON.stringify(audit, null, 2));
+    return;
+  }
+  console.log(formatCapabilityAuditCliSummary(audit));
+}
+
+function buildExternalReadinessMarkdown(packageData = {}) {
+  const summary = packageData.summary || {};
+  const recommended = packageData.recommendedNext || null;
+  const lines = [
+    "# Forge Code External Readiness",
+    "",
+    `Generated: ${packageData.generatedAt || ""}`,
+    `Workspace: ${packageData.workspace || currentWorkspace}`,
+    "",
+    "## Summary",
+    "",
+    `- Status: ${summary.status || "partial"}`,
+    `- External blocked gaps: ${summary.externalBlockedCount || 0}`,
+    `- Local actionable gaps: ${summary.localActionableCount || 0}`,
+    recommended?.area ? `- Recommended next: ${recommended.area} (${recommended.status || "partial"})` : "- Recommended next: none",
+    "",
+    "## Authorization Checklist",
+    "",
+    ...(packageData.authorizationItems || []).map((item) => `- ${item}`),
+    packageData.authorizationItems?.length ? "" : "- No authorization items detected.",
+    "",
+    "## Local Readiness Commands",
+    "",
+    ...(packageData.localReadinessCommands || []).map((command) => `- \`${command.command || command}\`${command.reason ? ` - ${command.reason}` : ""}`),
+    packageData.localReadinessCommands?.length ? "" : "- No local readiness commands detected.",
+    "",
+    "## External Gaps",
+    "",
+    ...(packageData.externalGaps || []).flatMap((gap) => [
+      `### ${gap.area || "Unknown"} (${gap.status || "partial"})`,
+      "",
+      gap.next ? gap.next : "No next action recorded.",
+      "",
+      gap.authorizationItems?.length ? "Authorization:" : "",
+      ...(gap.authorizationItems || []).map((item) => `- ${item}`),
+      gap.localReadinessCommands?.length ? "Local readiness:" : "",
+      ...(gap.localReadinessCommands || []).map((command) => `- \`${command.command || command}\``),
+      ""
+    ])
+  ];
+  return lines.filter((line, index, array) => !(line === "" && array[index - 1] === "")).join("\n") + "\n";
+}
+
+async function buildExternalReadinessPackage({ deep = false, write = true } = {}) {
+  const audit = await buildCapabilityAudit({ light: !deep });
+  const gapSummary = audit.gapSummary || {};
+  const externalGaps = (gapSummary.topExternalGaps || []).map((gap) => ({
+    area: gap.area || "",
+    status: gap.status || "partial",
+    next: gap.next || "",
+    externalDependency: true,
+    focusFiles: gap.focusFiles || [],
+    evidence: gap.evidence || [],
+    authorizationItems: gap.externalPreparation?.authorizationItems || [],
+    localReadinessCommands: (gap.externalPreparation?.localReadinessCommands || []).map((command) => (
+      typeof command === "string" ? { command, reason: "本地只读预检。" } : command
+    ))
+  }));
+  const authorizationItems = uniqueLimited([
+    ...(gapSummary.externalPreparation?.authorizationItems || []),
+    ...externalGaps.flatMap((gap) => gap.authorizationItems || [])
+  ], 20);
+  const localReadinessCommands = uniqueLimited([
+    ...(gapSummary.externalPreparation?.localReadinessCommands || []).map((command) => (
+      typeof command === "string" ? { command, reason: "外部缺口本地预检。" } : command
+    )),
+    ...externalGaps.flatMap((gap) => gap.localReadinessCommands || [])
+  ], 20, (item) => item.command || item);
+  const packageId = `external-readiness-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const packageData = {
+    id: packageId,
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      status: gapSummary.status || "partial",
+      totalOutstanding: gapSummary.totalOutstanding || 0,
+      localActionableCount: gapSummary.localActionableCount || 0,
+      externalBlockedCount: gapSummary.externalBlockedCount || 0,
+      guidance: gapSummary.guidance || ""
+    },
+    recommendedNext: audit.recommendedNext?.capability ? {
+      area: audit.recommendedNext.capability.area || "",
+      status: audit.recommendedNext.capability.status || "",
+      reason: audit.recommendedNext.reason || ""
+    } : null,
+    authorizationItems,
+    localReadinessCommands,
+    externalGaps,
+    policy: {
+      source: "external-readiness",
+      writesRemote: false,
+      executesRemote: false,
+      writesWorkspaceFiles: false,
+      artifactOnly: true
+    }
+  };
+  const markdown = buildExternalReadinessMarkdown(packageData);
+  if (!write) {
+    return { package: packageData, markdown, paths: null };
+  }
+  const packageDir = path.join(EXTERNAL_READINESS_DIR, packageId);
+  await fs.mkdir(packageDir, { recursive: true });
+  const jsonPath = path.join(packageDir, "readiness.json");
+  const markdownPath = path.join(packageDir, "readiness.md");
+  await fs.writeFile(jsonPath, JSON.stringify(packageData, null, 2), "utf8");
+  await fs.writeFile(markdownPath, markdown, "utf8");
+  return {
+    package: packageData,
+    markdown,
+    paths: {
+      dir: toPosix(path.relative(APP_ROOT, packageDir)),
+      json: toPosix(path.relative(APP_ROOT, jsonPath)),
+      markdown: toPosix(path.relative(APP_ROOT, markdownPath))
+    }
+  };
+}
+
+async function runExternalReadinessCli() {
+  const json = process.argv.includes("--json") || process.argv.includes("--external-readiness-json");
+  const deep = process.argv.includes("--deep") || process.argv.includes("--external-readiness-deep");
+  const dryRun = process.argv.includes("--dry-run");
+  const result = await buildExternalReadinessPackage({ deep, write: !dryRun });
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(result.markdown.trimEnd());
+  if (result.paths) {
+    console.log("");
+    console.log(`Saved: ${result.paths.markdown}`);
+    console.log(`JSON: ${result.paths.json}`);
+  }
 }
 
 function selectCapabilityRecommendation(capabilities = []) {
@@ -14817,11 +15068,63 @@ async function buildSourceContextRepairDraft({
   command = "",
   result = null,
   diagnostics = null,
+  lastPrompt = "",
+  debugTarget = null,
+  browserTriage = null,
   locations = [],
   contextLines = 6,
   limit = 8,
   dryRun = false
 } = {}) {
+  const compactDebugTarget = debugTarget && typeof debugTarget === "object"
+    ? {
+        generatedAt: String(debugTarget.generatedAt || "").slice(0, 80),
+        workspace: String(debugTarget.workspace || "").slice(0, 500),
+        summary: debugTarget.summary || null,
+        target: debugTarget.target ? {
+          url: String(debugTarget.target.url || "").slice(0, 500),
+          source: String(debugTarget.target.source || "").slice(0, 80),
+          process: debugTarget.target.process ? {
+            id: String(debugTarget.target.process.id || "").slice(0, 120),
+            status: String(debugTarget.target.process.status || "").slice(0, 80),
+            command: String(debugTarget.target.process.command || "").slice(0, 400),
+            probe: debugTarget.target.process.probe || null
+          } : null
+        } : null,
+        verificationCommands: Array.isArray(debugTarget.verificationCommands)
+          ? debugTarget.verificationCommands.slice(0, 8).map((item) => ({
+              command: String(item?.command || item || "").slice(0, 400),
+              reason: String(item?.reason || "").slice(0, 400)
+            })).filter((item) => item.command)
+          : [],
+        policy: debugTarget.policy || null
+      }
+    : null;
+  const compactBrowserTriage = browserTriage && typeof browserTriage === "object"
+    ? {
+        status: String(browserTriage.status || "").slice(0, 80),
+        counts: browserTriage.counts || {},
+        findings: Array.isArray(browserTriage.findings)
+          ? browserTriage.findings.slice(0, 10).map((item) => ({
+              severity: String(item?.severity || "info").slice(0, 24),
+              area: String(item?.area || "browser").slice(0, 80),
+              message: String(item?.message || "").slice(0, 800),
+              evidence: Array.isArray(item?.evidence)
+                ? item.evidence.slice(0, 6).map((entry) => String(entry).slice(0, 500))
+                : String(item?.evidence || "").slice(0, 800)
+            }))
+          : [],
+        nextActions: Array.isArray(browserTriage.nextActions)
+          ? browserTriage.nextActions.slice(0, 6).map((item) => String(item || "").slice(0, 500))
+          : []
+      }
+    : null;
+  const sourceDebugContext = {
+    lastPrompt: String(lastPrompt || "").slice(0, 6000),
+    debugTarget: compactDebugTarget,
+    browserTriage: compactBrowserTriage
+  };
+  const hasSourceDebugContext = Boolean(sourceDebugContext.lastPrompt || compactDebugTarget || compactBrowserTriage);
   const contexts = await readWorkspaceSourceLocationContexts(locations, contextLines, limit);
   const sourceContextBlock = contexts.length
     ? contexts.map((item) => [
@@ -14839,6 +15142,11 @@ async function buildSourceContextRepairDraft({
     "",
     "源码定位上下文：",
     sourceContextBlock,
+    hasSourceDebugContext ? "" : "",
+    hasSourceDebugContext ? "当前调试现场：" : "",
+    sourceDebugContext.lastPrompt ? `上一轮需求：${sourceDebugContext.lastPrompt}` : "",
+    compactDebugTarget ? `当前调试目标：${JSON.stringify(compactDebugTarget.summary || compactDebugTarget.target || {}, null, 2).slice(0, 3000)}` : "",
+    compactBrowserTriage ? `浏览器异常分诊：${JSON.stringify(compactBrowserTriage, null, 2).slice(0, 5000)}` : "",
     "",
     "要求：只修改与源码定位上下文或失败命令直接相关的文件；生成 diff 后必须给出可安全运行的验证命令。"
   ].filter(Boolean).join("\n");
@@ -14874,6 +15182,10 @@ async function buildSourceContextRepairDraft({
       type: "source_context_repair",
       prompt: sourcePrompt,
       sourceContexts: contexts,
+      sourceDebugContext,
+      lastPrompt: sourceDebugContext.lastPrompt,
+      debugTarget: compactDebugTarget,
+      browserTriage: compactBrowserTriage,
       sourceContextSummary: {
         requested: Array.isArray(locations) ? locations.length : 0,
         returned: contexts.length,
@@ -14892,7 +15204,8 @@ async function buildSourceContextRepairDraft({
     goal = {
       phase: updatedGoal.phase,
       status: updatedGoal.status,
-      pendingProposalId: updatedGoal.pendingProposal?.id || ""
+      pendingProposalId: updatedGoal.pendingProposal?.id || "",
+      debugContextAttached: hasSourceDebugContext
     };
   }
   return {
@@ -14900,6 +15213,9 @@ async function buildSourceContextRepairDraft({
     proposal,
     goal,
     contexts,
+    sourceDebugContext,
+    debugTarget: compactDebugTarget,
+    browserTriage: compactBrowserTriage,
     sourceContextSummary: {
       requested: Array.isArray(locations) ? locations.length : 0,
       returned: contexts.length,
@@ -14911,7 +15227,8 @@ async function buildSourceContextRepairDraft({
       updatesPendingProposal: Boolean(proposal),
       requiresApplyApproval: Boolean(proposal),
       source: "source-context-repair",
-      dryRun: Boolean(dryRun)
+      dryRun: Boolean(dryRun),
+      debugContextAttached: hasSourceDebugContext
     }
   };
 }
@@ -16000,6 +16317,9 @@ async function handleApi(req, res) {
         command = "",
         result = null,
         diagnostics = null,
+        lastPrompt = "",
+        debugTarget = null,
+        browserTriage = null,
         locations = [],
         contextLines = 6,
         limit = 8,
@@ -16011,6 +16331,9 @@ async function handleApi(req, res) {
         command,
         result,
         diagnostics,
+        lastPrompt,
+        debugTarget,
+        browserTriage,
         locations,
         contextLines,
         limit,
@@ -17021,6 +17344,9 @@ async function runApiSmokeSectionTest(sectionValue = "") {
             failureAnalysis: { category: "syntax", summary: "api smoke source context fixture" }
           },
           diagnostics: debugDiagnostics.diagnostics,
+          lastPrompt: "api smoke previous prompt @server.js",
+          debugTarget: debugTarget.debugTarget,
+          browserTriage: debugDiagnostics.diagnostics?.browserTriage,
           locations: [{ path: "server.js", line: 1, column: 1 }],
           contextLines: 2,
           limit: 1,
@@ -17030,9 +17356,13 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(sourceContextDraft.policy?.source === "source-context-repair", "source context repair missing policy source");
       assertSmoke(sourceContextDraft.policy?.dryRun === true, "source context repair smoke should run in dry-run mode");
       assertSmoke(sourceContextDraft.policy?.writesFiles === false, "source context repair should not write files directly");
+      assertSmoke(sourceContextDraft.policy?.debugContextAttached === true, "source context repair missing debug context policy marker");
       assertSmoke(sourceContextDraft.sourceContextSummary?.requested === 1, "source context repair missing requested source location count");
       assertSmoke(sourceContextDraft.sourceContextSummary?.returned >= 1, "source context repair did not return source context");
       assertSmoke(Array.isArray(sourceContextDraft.contexts), "source context repair missing contexts");
+      assertSmoke(sourceContextDraft.sourceDebugContext?.lastPrompt?.includes("@server.js"), "source context repair missing previous prompt context");
+      assertSmoke(sourceContextDraft.sourceDebugContext?.debugTarget?.summary?.targetUrl === `${baseUrl}/`, "source context repair missing debug target context");
+      assertSmoke(sourceContextDraft.sourceDebugContext?.browserTriage?.status === "not_captured", "source context repair missing browser triage context");
       assertSmoke(
         sourceContextDraft.reply || sourceContextDraft.diff || sourceContextDraft.proposal || sourceContextDraft.policy,
         "source context repair did not return a usable draft payload"
@@ -17493,12 +17823,18 @@ async function runUiSmokeTest() {
     "安全边界",
     "目录修复",
     "审批示例",
+    "目录证据关联 @file 引用",
+    "目录证据关联调试目标",
+    "目录证据关联浏览器异常分诊",
     "function buildMcpResourceEvidenceContext",
     "function appendMcpResourceEvidenceToPrompt",
     "function runMcpResourceEvidenceRepair",
     "function appendMcpResourceEvidenceCard",
     "MCP 资源证据已加入提示词",
     "已启动 MCP 资源处理",
+    "MCP 资源证据关联 @file 引用",
+    "MCP 资源证据关联调试目标",
+    "MCP 资源证据关联浏览器异常分诊",
     "目录证据已加入提示词",
     "已启动目录证据修复",
     "function renderAssetCatalog",
@@ -17508,6 +17844,9 @@ async function runUiSmokeTest() {
     "function appendAssetFailureEvidence",
     "资产证据已加入提示词",
     "已启动资产证据处理",
+    "资产证据关联 @file 引用",
+    "资产证据关联调试目标",
+    "资产证据关联浏览器异常分诊",
     "已引用资产文件",
     "function renderThreads",
     "function renderMessages",
@@ -17545,6 +17884,9 @@ async function runUiSmokeTest() {
     "已启动可恢复状态继续",
     "继续目标",
     "function restorePendingProposal",
+    "已恢复待审批调试现场",
+    "待审批提案关联调试目标",
+    "待审批提案关联浏览器异常分诊",
     "function buildQueuePromptContext",
     "队列关联 @file 引用",
     "队列关联浏览器异常分诊",
@@ -17609,6 +17951,9 @@ async function runUiSmokeTest() {
     "进程页面 Trace",
     "进程证据已加入提示词",
     "已启动进程证据修复",
+    "进程证据关联 @file 引用",
+    "进程证据关联调试目标",
+    "进程证据关联浏览器异常分诊",
     "停止进程失败",
     "读取进程输出失败",
     "function buildTaskPromptContext",
@@ -17686,6 +18031,9 @@ async function runUiSmokeTest() {
     "function appendModelVerificationPromptToPrompt",
     "function runModelVerificationFix",
     "function buildModelFailureEvidence",
+    "模型证据关联 @file 引用",
+    "模型证据关联调试目标",
+    "模型证据关联浏览器异常分诊",
     "function appendModelFailureEvidence",
     "function buildAgentFailureContext",
     "代理失败关联 @file 引用",
@@ -17734,6 +18082,9 @@ async function runUiSmokeTest() {
     "function stageContextEvidenceVerificationCommands",
     "function appendContextEvidenceCard",
     "function appendContextFailureEvidence",
+    "上下文证据关联 @file 引用",
+    "上下文证据关联调试目标",
+    "上下文证据关联浏览器异常分诊",
     "上下文摘要已加入提示词",
     "上下文压缩已加入提示词",
     "上下文滚动摘要已加入提示词",
@@ -17789,6 +18140,9 @@ async function runUiSmokeTest() {
     "function appendBrowserFailureEvidence",
     "浏览器证据已加入提示词",
     "已启动浏览器证据修复",
+    "浏览器证据关联 @file 引用",
+    "浏览器证据关联调试目标",
+    "浏览器证据关联浏览器异常分诊",
     "浏览器源码修复提示已加入",
     "浏览器源码修复草稿已生成",
     "浏览器源码修复验证命令已放入命令面板",
@@ -17824,6 +18178,8 @@ async function runUiSmokeTest() {
     "function runSemanticRenamePreviewFix",
     "async function createSemanticRenameDraft",
     "function buildSemanticVerificationPrompt",
+    "语义证据关联 @file 引用",
+    "语义证据关联调试目标",
     "语义证据关联浏览器异常分诊",
     "function appendSemanticVerificationPromptToPrompt",
     "function runSemanticVerificationFix",
@@ -17850,6 +18206,8 @@ async function runUiSmokeTest() {
     "function gateEvidenceBlockerSummary",
     "function buildGateBlockerPrompt",
     "function appendGateBlockerPromptToPrompt",
+    "门禁关联 @file 引用",
+    "门禁关联调试目标",
     "门禁关联浏览器异常分诊",
     "function gateEvidenceVerificationCommands",
     "function stageGateEvidenceVerificationCommands",
@@ -17982,6 +18340,9 @@ async function runUiSmokeTest() {
     "function buildCommandSourceContextPrompt",
     "function commandSourceVerificationCommands",
     "function runCommandSourceContextFix",
+    "命令源码关联 @file 引用",
+    "命令源码关联调试目标",
+    "命令源码关联浏览器异常分诊",
     "data-action=\"source-context\"",
     "data-action=\"source-context-prompt\"",
     "data-action=\"source-context-fix\"",
@@ -17999,6 +18360,12 @@ async function runUiSmokeTest() {
     "function appendCommandVerificationPromptToPrompt",
     "function runCommandVerificationFix",
     "function runLastFailedCommandVerificationFix",
+    "命令记录关联 @file 引用",
+    "命令记录关联调试目标",
+    "命令记录关联浏览器异常分诊",
+    "失败命令关联 @file 引用",
+    "失败命令关联调试目标",
+    "失败命令关联浏览器异常分诊",
     "失败命令修复草稿已生成",
     "failed_command_repair",
     "proposalId",
@@ -18049,6 +18416,12 @@ async function runUiSmokeTest() {
     "function appendCommandBatchEvidenceToPrompt",
     "function buildCommandBatchVerificationPrompt",
     "function appendCommandBatchVerificationPromptToPrompt",
+    "批量命令关联 @file 引用",
+    "批量命令关联调试目标",
+    "批量命令关联浏览器异常分诊",
+    "失败源码关联 @file 引用",
+    "失败源码关联调试目标",
+    "失败源码关联浏览器异常分诊",
     "function commandBatchReferencedFiles",
     "function recordRepairVerificationFromBatch",
     "function referenceCommandBatchFilesInPrompt",
@@ -18286,6 +18659,8 @@ async function runUiSmokeTest() {
     "上一轮调试诊断上下文",
     "missingReferences",
     "debugContextAttached",
+    "sourceDebugContext",
+    "policy.debugContextAttached",
     "/api/prompt-references",
     "if (req.method === \"POST\" && url.pathname === \"/api/source-context-repair-draft\")",
     "function buildSourceContextRepairDraft",
@@ -19287,6 +19662,9 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "model_billing"), "tools endpoint missing model_billing");
     assertSmoke(tools.tools.some((item) => item.name === "context_rollup"), "tools endpoint missing context_rollup");
     const modelCapability = capabilities.capabilities.find((item) => item.area === "模型运行层");
+    assertSmoke(modelCapability?.status === "implemented", "model runtime layer should not depend on recent live calls for local readiness");
+    assertSmoke(modelCapability?.evidence?.some((item) => String(item).includes("模型运行就绪：implemented")), "capabilities endpoint missing model runtime readiness evidence");
+    assertSmoke(modelCapability?.evidence?.some((item) => String(item).includes("默认 fallback 已配置")), "capabilities endpoint missing default fallback readiness evidence");
     assertSmoke(modelCapability?.evidence?.some((item) => String(item).includes("agentFailureVerificationCommands")), "capabilities endpoint missing agent failure verification command evidence");
     assertSmoke(tools.tools.some((item) => item.name === "verification_plan"), "tools endpoint missing verification_plan");
     assertSmoke(tools.tools.some((item) => item.name === "ci_status"), "tools endpoint missing ci_status");
@@ -20350,6 +20728,10 @@ function runCliTask(task) {
 
 if (process.argv.includes("--mcp-smoke-server")) {
   runMcpSmokeServer();
+} else if (process.argv.includes("--capability-audit") || process.argv.includes("--capabilities") || process.argv.includes("--capability-audit-json")) {
+  runCliTask(runCapabilityAuditCli);
+} else if (process.argv.includes("--external-readiness") || process.argv.includes("--external-readiness-json")) {
+  runCliTask(runExternalReadinessCli);
 } else if (process.argv.includes("--api-smoke-test")) {
   runCliTask(runApiSmokeTest);
 } else if (process.argv.includes("--api-smoke-section") || process.argv.some((item) => item.startsWith("--api-smoke-section="))) {

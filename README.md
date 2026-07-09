@@ -10,13 +10,13 @@ Forge Code 是一个本地运行的真实编码代理工作台。前端负责会
 D:\cc-picture\aaa\coder\start.bat
 ```
 
-启动脚本会自动检查 Node.js、提示输入 `DEEPSEEK_API_KEY`、默认把当前项目目录作为工作区，并从 `4173` 开始寻找可用端口。如果 `4173` 已被占用，会自动切到后续可用端口；请以终端里最终输出的 `FORGE_URL=...` 或 `Forge Code running at ...` 为准打开页面，避免误进旧服务。
+启动脚本会自动检查 Node.js、提示输入 `DEEPSEEK_API_KEY`、默认把当前项目目录作为工作区，并从 `4173` 开始寻找可用端口。如果 `4173` 已被占用，或端口在启动瞬间被其他进程抢占，会自动切到后续可用端口；请以终端里最终输出的 `FORGE_URL=...` 或 `Forge Code running at ...` 为准打开页面，避免误进旧服务。
 
 PowerShell:
 
 ```powershell
 $env:DEEPSEEK_API_KEY="你的 DeepSeek API Key"
-# 可选：按顺序配置模型 fallback
+# 可选：按顺序配置模型 fallback；未设置时也会默认使用 deepseek-v4-pro,deepseek-chat
 $env:FORGE_MODELS="deepseek-v4-pro,deepseek-chat"
 # 可选：指向 DeepSeek-compatible Chat Completions endpoint
 $env:FORGE_MODEL_API_URL="https://api.deepseek.com/chat/completions"
@@ -35,7 +35,7 @@ D:\cc-picture\aaa\coder
 http://127.0.0.1:4173
 ```
 
-如果默认端口已被占用，启动脚本或服务端会自动尝试后续端口，例如 `http://127.0.0.1:4174`。也可以先运行下面的检查确认端口冲突自动切换逻辑：
+如果默认端口已被占用，启动脚本或服务端会自动尝试后续端口，例如 `http://127.0.0.1:4174`；不要固定打开旧的 `4173`，以终端最终输出地址为准。也可以先运行下面的检查确认端口冲突自动切换逻辑：
 
 ```powershell
 node server.js --port-conflict-smoke-test
@@ -50,6 +50,33 @@ node server.js
 ```
 
 也可以在界面左侧“仓库”卡片中直接输入本地目录路径并点击“切换”。切换后，文件列表、上下文、checkpoint 和后续命令都会基于新的工作目录。
+
+查看当前项目与 Codex 对标的能力差距，不需要启动网页：
+
+```powershell
+node server.js --capability-audit
+# 或输出 JSON 供脚本读取
+node server.js --capability-audit --json
+```
+
+也可以用 npm 脚本：
+
+```powershell
+npm run capabilities
+npm run capabilities:json
+```
+
+这个命令会输出已实现/部分实现/缺失统计、推荐下一步、本地可补齐缺口、外部授权阻塞项和本地预检命令，方便持续判断“还差什么”。
+
+当审计显示剩余差距都依赖外部授权时，可以生成本地准备包：
+
+```powershell
+node server.js --external-readiness
+# 只预览，不写入 .forge artifact
+node server.js --external-readiness --dry-run
+```
+
+准备包会写入 `.forge/external-readiness/<id>/readiness.md` 和 `readiness.json`，整理授权清单、本地只读预检命令和每个外部阻塞缺口的下一步，方便后续接入远端 PR/CI、MCP、跨站点浏览器或系统级沙箱时逐项推进。
 
 ## 推荐调试流程
 
@@ -92,9 +119,9 @@ node server.js
 - **写入冲突保护**：`/api/apply` 先做 diff 冲突预检，默认冲突时零写入；需要时可显式“部分应用”无冲突文件或同文件内无冲突 hunk，并保留文件/hunk 冲突清单；前端 diff 预览会把每个 hunk 拆成可勾选项，支持按文件全选/取消，部分应用时只提交选中的 hunk 并在写入证据里记录 selectedHunks。`/api/diff-conflicts` 和 `diff_conflicts` 只读工具可输出 CURRENT/PROPOSED 冲突预览；冲突面板可把冲突证据加入提示词或直接启动冲突修复，并会带入当前调试目标与最近浏览器异常分诊，避免处理过期 diff / hunk 冲突时丢失正在排查的页面 URL、目标进程和复查命令；`/api/conflict-resolution-draft` 可把 resolved 文本转换成新的待审批 diff，不直接修改文件；冲突解决草稿生成失败时会保留 resolved 摘要、冲突预览和请求上下文，支持加入提示词、重试或回到冲突修复。
 - **命令自修复**：建议命令手动运行失败后，可基于失败输出继续生成修复 diff。
 - **修复证据链**：手动命令失败、诊断包、修复候选 diff、批准写入和后续验证会串成同一条 repair chain，并随 `/api/apply` 写入任务日志；修复候选返回的验证命令会自动进入命令面板和最近命令历史，便于回看并继续执行“失败 -> 修复 -> 验证”的完整链路。
-- **命令面板反馈**：建议命令和写入后的自动检查结果都支持单条运行/重跑、手动输入安全验证命令、输入框上下键翻最近命令、最近命令填入/加入/重跑、固定常用命令、清空未固定命令、复制命令、复制输出、把单条或整组命令证据加入提示词、把整组命令状态生成“验证提示”、基于整组命令证据直接启动修复、从命令输出识别并引用相关文件、失败命令结束后自动提示已识别的相关 `@file`、从整组命令输出一键引用相关 `@file`、在批量证据中自动汇总相关 `@file`，并把失败分类、源码位置、恢复链和最近浏览器异常分诊放入批量修复上下文；复制全部命令、只重跑失败命令和批量运行摘要，行内展示 running/pass/fail、exit code 和输出摘要，并提供“详情”回看完整输出；复制命令、输出、diff 或诊断包会先用 Clipboard API，失败后自动回退到 textarea 复制，并在 toast 和日志里记录最近复制方式或失败原因；命令执行、诊断或修复请求失败时会保留命令、最近运行状态、prompt 和诊断请求参数，生成可加入提示词、重试或生成验证修复提示的失败证据卡；通用动作失败卡还会带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊，并可一键把语法、UI、debug 以及按类型补充的 integrations/fast smoke 排入命令面板，避免失败入口只剩错误文本。
+- **命令面板反馈**：建议命令和写入后的自动检查结果都支持单条运行/重跑、手动输入安全验证命令、输入框上下键翻最近命令、最近命令填入/加入/重跑、固定常用命令、清空未固定命令、复制命令、复制输出、把单条或整组命令证据加入提示词、把整组命令状态生成“验证提示”、基于整组命令证据直接启动修复、从命令输出识别并引用相关文件、失败命令结束后自动提示已识别的相关 `@file`、从整组命令输出一键引用相关 `@file`、在批量证据中自动汇总相关 `@file`，并把失败分类、源码位置、恢复链和最近浏览器异常分诊放入批量修复上下文；命令记录、失败命令验证提示、源码定位提示、批量命令证据和失败源码汇总都会继续带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊；复制全部命令、只重跑失败命令和批量运行摘要，行内展示 running/pass/fail、exit code 和输出摘要，并提供“详情”回看完整输出；复制命令、输出、diff 或诊断包会先用 Clipboard API，失败后自动回退到 textarea 复制，并在 toast 和日志里记录最近复制方式或失败原因；命令执行、诊断或修复请求失败时会保留命令、最近运行状态、prompt 和诊断请求参数，生成可加入提示词、重试或生成验证修复提示的失败证据卡；通用动作失败卡还会带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊，并可一键把语法、UI、debug 以及按类型补充的 integrations/fast smoke 排入命令面板，避免失败入口只剩错误文本。
 - **Diff 审阅动作**：Diff 预览区展示待审批总文件数和增删行统计，单文件也显示 +/− 行数；支持引用 diff 文件到提示词、读取原文件、全部折叠/展开、单文件折叠/展开、“复制全部”和单文件“复制”，复制结果会写入日志证据，方便外部审查和问题复现；读取原文件失败时会保留文件路径、请求参数和错误栈，生成可重试、可引用文件或直接修复的失败证据卡。
-- **失败命令诊断**：`/api/command` 在白名单命令失败时会自动附加只读调试诊断；前端会展示“失败命令诊断”证据，并把诊断包传给 `/api/repair-command`，让修复代理不仅看到 stderr/stdout，也能看到检查计划、进程健康、页面 Trace 和语义诊断；`/api/repair-command` 生成 diff 时会同步写入 `failed_command_repair` 待审批草稿，不直接改文件，前端会展示“失败命令修复草稿已生成”的 proposal id、策略、恢复链和验证命令，刷新后也可从 pending proposal 恢复审批；源码定位按钮会读取具体行号上下文并调用 `/api/source-context-repair-draft` 生成 `source_context_repair` 待审批草稿，让修复围绕失败行附近做更小的 diff；最近失败命令卡片和普通命令面板里的每条失败命令行都能直接“源码定位 / 源码提示 / 源码修复”，不用先切换到单独诊断卡；失败命令还可一键生成“验证提示”或直接启动“验证修复”，把输出、相关文件、诊断建议和可复用检查命令整理成下一轮可验证修复任务；诊断请求本身失败时会作为门禁失败证据保留下来，避免命令修复链路静默断开。
+- **失败命令诊断**：`/api/command` 在白名单命令失败时会自动附加只读调试诊断；前端会展示“失败命令诊断”证据，并把诊断包传给 `/api/repair-command`，让修复代理不仅看到 stderr/stdout，也能看到检查计划、进程健康、页面 Trace 和语义诊断；`/api/repair-command` 生成 diff 时会同步写入 `failed_command_repair` 待审批草稿，不直接改文件，前端会展示“失败命令修复草稿已生成”的 proposal id、策略、恢复链和验证命令，刷新后也可从 pending proposal 恢复审批；源码定位按钮会读取具体行号上下文并调用 `/api/source-context-repair-draft` 生成 `source_context_repair` 待审批草稿，让修复围绕失败行附近做更小的 diff，并把当前 `@file`、调试目标和页面异常分诊作为结构化上下文传入草稿请求；刷新后恢复待审批草稿时，也会把草稿保存的调试目标和页面异常分诊恢复到诊断面板与继续目标上下文；最近失败命令卡片和普通命令面板里的每条失败命令行都能直接“源码定位 / 源码提示 / 源码修复”，不用先切换到单独诊断卡；失败命令还可一键生成“验证提示”或直接启动“验证修复”，把输出、相关文件、诊断建议、当前调试目标、页面异常分诊和可复用检查命令整理成下一轮可验证修复任务；诊断请求本身失败时会作为门禁失败证据保留下来，避免命令修复链路静默断开。
 - **最近失败命令**：调试诊断面板会固定展示最近一次失败命令，支持查看详情、复制命令/输出、把失败命令 transcript 加入提示词、从 stderr/stdout 一键引用相关 `@file`、生成验证提示、重跑、从面板顶栏直接“修复失败命令”，或从卡片启动带失败输出的修复代理，并会按工作区/会话在浏览器本地恢复最近命令结果，避免刷新页面后丢失 stderr 和复现入口；最近一次“一键诊断”的压缩诊断包也会本地恢复，包含检查计划、进程健康摘要、页面 Trace 摘要、浏览器异常分诊和语义诊断摘要，刷新后仍可继续加入提示词、引用证据或启动验证修复。
 - **一键调试工作台**：新增“一键诊断”面板，可聚合验证计划、CI 状态、受管进程健康、浏览器 Trace、语义诊断和建议动作；带命令的下一步建议可批量“排队建议”、直接放入命令面板、复制、单条运行，或通过“运行推荐动作”自动执行第一条可运行建议，并把命令运行状态、exit code 和输出摘要沉淀到可恢复修复证据链；下一轮代理请求会自动附加最近诊断摘要，减少手动复制诊断包的来回；支持直接运行诊断给出的验证计划、生成带诊断上下文的修复提示或直接启动诊断修复代理、复制完整诊断包、把诊断上下文加入提示词，并可展开检查计划、进程健康、浏览器分诊、页面 Trace、浏览器异常源码定位和语义诊断等证据；当 Trace 或诊断映射出 `browserSourceLocations` 时，浏览器证据卡和诊断面板会直接提供“源码提示 / 源码修复”，先读取源码行号上下文，再调用 `/api/source-context-repair-draft` 生成 `source_context_repair` 待审批草稿，并把语法、UI、debug 和 browser smoke 验证命令放回命令面板；复制诊断包、恢复诊断包和加入提示词都会包含 `browserTriage`、`browserSourceLocations` 的状态、统计、分诊发现、源码文件行号和下一步动作，便于手动交接、刷新恢复或复现；代理/SSE 请求失败时会把调试诊断识别到的相关文件显示在失败证据里，并提供“引用文件”入口，让下一轮修复优先读取这些 `@file`；诊断请求失败或诊断面板里的验证计划运行失败时，也会保留目标 URL、检查开关、待运行命令、诊断摘要和错误栈，生成可继续修复的门禁失败证据卡。
 - **审查输出**：模型返回 `review` 数组，前端展示风险、测试缺口和关键验证点；每条审查发现可一键生成修复提示或直接启动修复代理，自动带上文件、行号和原始任务上下文；当前 diff 复核请求失败时会保留 prompt、待审批 diff 摘要和请求上下文，生成可继续修复的审查失败证据，并自动把语法检查、UI smoke、coding smoke 和 debug smoke 放回命令面板。
@@ -103,7 +130,7 @@ node server.js
 - **可恢复会话线程**：新增 `/api/threads`、`/api/thread`、`/api/thread-fork` 和侧栏“最近会话”，把本地会话消息保存到 `.forge/threads`，支持新建线程、更新消息、列表内联重命名、分叉上下文、置顶排序、归档过滤、按工作区列出和点击恢复；历史线程可一键加入提示词或直接启动继续修复，自动带最近消息、状态和待审批提案线索；恢复、置顶、重命名、分叉、归档或创建会话失败时会保留线程摘要、请求参数和错误栈，生成可重试、可加入提示词或继续修复的线程失败证据卡；线程 artifact 不写业务文件。
 - **审查闭环**：新增 `/api/review`、`/api/reviews`、`/api/review-artifact`、`/api/review-comments` 和 `/api/diff`，可基于当前 Git diff 输出审查发现、建议检查命令、PR 行级评论草稿，并持久化审查 artifact；历史审查记录可加入提示词、把审查验证命令排入命令面板、生成带验证命令和页面异常分诊的审查验证提示、直接启动审查验证修复，或直接启动基于审查证据的修复；PR 评论草稿可继续加入提示词、把评论验证命令排入命令面板、生成带页面异常分诊的 PR 评论验证提示、直接启动 PR 评论验证修复，或直接按评论启动修复；查看历史审查、读取审查证据、生成验证提示、生成评论草稿或直接修复失败时，会保留 artifact 摘要、发现/命令数量、请求参数和错误栈，生成可重试、可加入提示词或直接修复的失败证据卡，同时自动排入本地复查命令，避免审查链路中断后只剩错误日志。
 - **任务队列**：新增 `/api/queue` 和 `/api/queue-isolation`，支持本地排队、优先级、重试计数、隔离组并发保护、激活、完成和自动激活下一项任务；队列行可加入提示词、把当前验证计划命令放入命令面板，或结合当前推荐能力缺口和最近页面异常分诊直接启动继续任务，必要时先安全激活队列项；入队、激活、完成、重试、验证命令生成或继续失败时会保留队列项、请求参数和错误证据，生成可加入提示词、重试或继续修复的动作失败卡；隔离报告会作为门禁证据展示，可加入提示词或直接基于阻塞队列启动修复；隔离报告读取失败时也会生成门禁失败证据卡，保留 endpoint、limit 和错误栈，避免队列调试入口静默断开。
-- **可恢复状态**：新增 `.forge/state/goal.json`，健康接口返回当前目标、阶段、最近验证、待审批 proposal、下一步和 `recoverySummary` 结构化恢复线索；可恢复状态卡片会展示待审批提案、最近任务、验证状态、推荐缺口、最近失败命令、变更文件、选中 hunk、验证命令、能力缺口数量、外部准备项、本地预检命令和下一步摘要，并在“继续目标”提示里带入这些 cues/blockers/nextActions、恢复明细、当前调试目标和最近浏览器异常分诊；也支持把最近验证命令或外部准备清单里的本地预检命令直接放回命令面板，或从“推荐缺口 + 上次验证结果”继续任务。
+- **可恢复状态**：新增 `.forge/state/goal.json`，健康接口返回当前目标、阶段、最近验证、待审批 proposal、下一步和 `recoverySummary` 结构化恢复线索；可恢复状态卡片会展示待审批提案、最近任务、验证状态、推荐缺口、最近失败命令、变更文件、选中 hunk、验证命令、能力缺口数量、外部准备项、本地预检命令和下一步摘要，并在“继续目标”提示里带入这些 cues/blockers/nextActions、恢复明细、当前调试目标和最近浏览器异常分诊；上下文摘要、压缩、滚动摘要和失败证据加入提示词时，也会带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊，避免长会话恢复后丢掉正在调的文件或页面；也支持把最近验证命令或外部准备清单里的本地预检命令直接放回命令面板，或从“推荐缺口 + 上次验证结果”继续任务。
 - **交付草稿**：新增 `/api/handoff`，生成 `.forge/handoffs/*.md` 交付说明；草稿生成后可一键加入提示词、把历史任务检查/失败命令、当前调试目标验证命令、最近调试诊断验证计划和当前命令面板合并成交付前验证命令，或生成带调试目标、浏览器异常分诊和验证命令的交付验证提示并直接继续处理交付 blocker、失败验证和遗漏说明；草稿生成失败时会保留 prompt、当前待审批 diff、命令清单和错误栈，生成可直接修复的门禁失败证据。
 - **PR readiness**：新增 `/api/pr-readiness`、`/api/remote-pr-status`、`/api/ci-status` 和“PR 检查”“CI 状态”按钮，只读发现 Git remote/provider、本地 CI 配置、diff/review/check 证据；可通过已认证 `gh`/`glab` 读取远端 PR/CI 状态，并生成可复制 PR 草稿；Gitee remote 会被识别为 `gitee` 并走手工 continuation evidence 路径，生成仓库 URL、PR/CI/评论回填要求和本地 publish/gates 复查命令，不再落到泛化 `custom` provider；不会执行 `git push` 或创建真实远端 PR；PR readiness 证据可一键加入提示词、生成聚焦 blockers/warnings 的阻塞提示、生成带本地检查命令的门禁验证提示、把检查命令放入命令面板、直接启动门禁验证修复或直接启动门禁修复；PR/CI 请求失败时会生成带 endpoint、prompt、待审批 diff 和命令清单的失败证据卡。
 - **合并门禁**：新增 `/api/merge-gate`、`merge_gate` 只读工具和“合并门禁”按钮，聚合 PR readiness、CI 状态、审查 artifact、审批状态和远端发布预检，输出 pass/warn/block gate；不执行命令、不推送、不创建 PR；合并门禁结果可一键加入提示词、复用检查命令、生成聚焦 blockers/warnings 的阻塞提示、生成带页面异常分诊的门禁验证提示、直接启动门禁验证修复或直接启动基于 blocker 的修复代理；合并门禁请求失败时同样保留请求参数和当前工作上下文，方便直接进入可验证修复。
@@ -111,21 +138,23 @@ node server.js
 - **快捷检查命令**：“验证门禁”会把自动发现的安全检查命令直接渲染成可复制、可运行、可批量运行的命令行，并同步进入最近命令历史，减少手动拼命令。
 - **远端发布审批**：新增 `/api/remote-publish-plan`、`/api/remote-publish-packages`、`/api/remote-publish-package` 和“发布审批”“发布包”按钮，生成 `git push`、`gh/glab pr/mr create`、PR/MR 评论回写候选动作，把 PR body、review summary 和计划写入 `.forge/remote-publish` 并在 `.forge/approvals` 中登记；这些端点只生成/读取审批包，不执行远端写入；发布审批和发布包结果可作为门禁证据加入提示词、引用 `pr-body.md` / `review-summary.md` / `plan.json` 等本地文件、复用候选命令、生成继续包/发布回填提示，或直接启动发布阻塞修复。
 - **远端发布预检与继续包**：新增 `/api/remote-publish-preflight`、`/api/remote-publish-continuation`、`/api/remote-publish-evidence`、`remote_publish_preflight` 和 `remote_publish_continuation`，针对发布包汇总审批状态、Git 远端、CLI 安装/认证、命令风险和阻塞项，并生成 `continuation.md` 与 `external-evidence-template.json`，用于人工执行远端动作后回填执行人、时间、远端 URL、PR/MR 编号、CI 链接、评论链接、输出摘要、回滚方案和后续验证命令；Gitee 发布包会标记 `manualProvider`，生成 `manual:gitee-pr` / `manual:gitee-comment` 步骤和 Gitee 仓库 URL，明确要求人工在 Gitee 完成 PR 或评论后回填证据模板；回填后 `/api/remote-publish-evidence` 会校验必填证据、生成 `external-evidence.json` 与 `external-evidence-summary.md`，并把 publish/gates/core 复查命令回排到本地门禁链路；包索引会展示回填证据状态、远端 URL、PR/CI/评论链接摘要，合并门禁会新增 `remote-publish-external-evidence` gate，把回填后的远端证据纳入交付判断；这些入口不执行 push、建 PR 或远端评论；预检、继续包和回填证据结果可一键加入提示词、引用本地 artifact、排队本地复查命令、生成发布回填提示或直接基于 blockers 启动修复；发布审批、发布包读取、预检、继续包和证据回填请求失败时会保留发布包/审批上下文和请求参数，继续生成可修复证据。
+- **门禁证据连续性**：合并门禁、验证计划、CI、权限矩阵、远端发布预检和发布回填证据加入提示词、生成验证提示或请求失败时，会继续带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊，避免门禁修复时丢掉正在看的文件、运行页面或 Trace 线索。
 - **上下文摘要**：新增 `/api/context-snapshot` 和“保存上下文摘要”按钮，将仓库文件规模、扩展名分布、脚本、符号线索、Git 状态和资产摘要落盘到 `.forge/state/context-snapshot.json`，用于跨会话恢复；摘要结果可一键加入提示词、把上下文验证命令排入命令面板，或直接启动基于当前工作树复核的继续任务。
 - **上下文压缩**：新增 `/api/context-compact` 和“压缩上下文”按钮，将目标状态、仓库摘要、关键符号、Git 轻量证据、最近任务/审查/审批压缩为 `.forge/state/context-compact.json`；目标状态和任务日志变化后也会自动刷新轻量压缩 artifact，用于长会话恢复与交接；会话继续、队列继续、任务继续和目标继续都会补入最近浏览器异常分诊，避免页面调试线索在跨轮恢复时丢失；压缩结果可一键加入提示词、排队验证命令或直接继续修复。
 - **上下文滚动摘要**：新增 `/api/context-rollup`、`context_rollup` 只读工具和“滚动摘要”按钮，将目标、任务、审查、审批和 Git 变化整理为 `.forge/state/context-rollup.json` 中可检索的恢复切片；上下文摘要、压缩和滚动摘要结果可一键加入提示词、排队验证命令或直接启动上下文继续任务；这些上下文 artifact 生成失败时也会保留端点、请求参数、当前工作区、待审批 diff 和上下文状态，生成可继续处理的证据卡，并自动排入语法、UI、fast 和 debug 复查命令。
 - **语义索引**：新增 `/api/semantic-index`、`/api/semantic-search`、`/api/semantic-references`、`semantic_index` / `semantic_search` / `semantic_references` 只读工具和“生成语义索引”按钮，抽取并检索声明、导入、导出、路由、选择器、调用线索和符号引用上下文，可持久化到 `.forge/state/semantic-index.json`。
-- **代码智能概览**：新增 `/api/code-intelligence`、`code_intelligence` 只读工具和“代码智能”按钮，把语义索引、依赖图、语义诊断和 TypeScript 类型检查发现汇总为入口文件、API 面、符号热点、依赖热点、typecheck 候选命令与 readiness 风险视图；语义索引同时抽取零依赖符号大纲，记录函数/类/方法的起止行、参数、容器和签名；语义索引、代码智能、符号大纲、语义诊断、影响面和依赖图结果可一键加入提示词、引用相关文件、生成带安全检查命令和页面异常分诊的验证提示、把语义/调试复查命令放回命令面板、直接启动语义验证修复，或直接启动基于语义证据的修复代理；这些代码智能入口失败时也会生成同样的语义失败证据卡，保留接口、请求参数、当前 diff 和上下文状态，并自动排入语法检查、UI smoke、semantic smoke 和 debug smoke，避免代码智能链路失败后只剩错误日志。
+- **代码智能概览**：新增 `/api/code-intelligence`、`code_intelligence` 只读工具和“代码智能”按钮，把语义索引、依赖图、语义诊断和 TypeScript 类型检查发现汇总为入口文件、API 面、符号热点、依赖热点、typecheck 候选命令与 readiness 风险视图；语义索引同时抽取零依赖符号大纲，记录函数/类/方法的起止行、参数、容器和签名；语义索引、代码智能、符号大纲、语义诊断、影响面和依赖图结果可一键加入提示词、引用相关文件、生成带安全检查命令和页面异常分诊的验证提示、把语义/调试复查命令放回命令面板、直接启动语义验证修复，或直接启动基于语义证据的修复代理；语义证据和失败证据也会带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊；这些代码智能入口失败时也会生成同样的语义失败证据卡，保留接口、请求参数、当前 diff 和上下文状态，并自动排入语法检查、UI smoke、semantic smoke 和 debug smoke，避免代码智能链路失败后只剩错误日志。
 - **符号大纲与定义查询**：新增 `/api/symbol-outline`、`/api/semantic-definition`、`/api/semantic-symbol-impact`、`/api/semantic-rename-preview`、`/api/semantic-rename-draft`、`symbol_outline` / `semantic_definition` / `semantic_symbol_impact` / `semantic_rename_preview` / `semantic_rename_draft` 工具和“符号大纲”按钮，可按文件/关键词检索符号范围，并按符号名或文件行号返回定义位置、引用、调用点、影响文件、重命名候选替换位置、命名冲突和建议验证命令；前端语义证据卡支持把符号影响或重命名预览验证命令直接放入命令面板，也支持基于 edit targets、定义、引用、调用点、依赖文件和重命名风险生成“影响提示”“重命名提示”、生成待审批重命名 diff 草稿或直接启动对应修复，并沉淀修复证据链；重命名草稿只更新 pending proposal，不直接写入目标文件，仍需走现有 diff 审批写入流程。
 - **语义诊断**：新增 `/api/semantic-diagnostics`、`semantic_diagnostics` 只读工具和“语义诊断”按钮，基于语义索引发现重复声明、未解析本地导入、前端 API 调用缺口、前后端 API 方法不匹配（如前端 POST 调 GET-only 路由）和重复路由，并可返回附近代码上下文。
 - **语义影响面**：新增 `/api/semantic-impact`、`semantic_impact` 只读工具和“影响面”按钮，可基于当前 Git diff、显式路径或待审批 diff 找出变更文件的依赖方、调用方、路由、选择器和局部调用图；Diff 预览区新增“分析影响”和“预审查”，会在批准写入前从 pending patches 抽取目标文件、生成影响证据卡/预应用审查清单，并把语义/前端烟测命令放入验证面板；直接点“批准写入”时，如果当前 diff 还没有完成同一轮预审查，会先自动生成只读预审查证据再继续 apply，避免盲写。
 - **依赖图**：新增 `/api/dependency-graph`、`dependency_graph` 只读工具和“依赖图”按钮，基于语义索引生成本地 import 图、未解析导入、外部依赖和循环依赖组件。
+- **工具与浏览器证据连续性**：工具目录、扩展目录、MCP resource、浏览器检查、截图、DOM、Trace、交互、会话和视觉回归证据加入提示词或直接修复时，会继续携带当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊，减少从工具证据、页面异常或外部目录切回代码修复时的上下文断层。
 - **上下文索引**：新增仓库地图、符号索引、按行读取工具和 TypeScript 类型检查命令发现，减少大文件整段读取、误改和修复后漏跑类型检查的概率。
 - **文件引用入口**：左侧文件列表支持一键把 `@path/to/file` 追加到当前提示词；输入框会在提交前实时预览 `@file` 命中/未命中和引用字节数；后端会安全匹配工作区内已知文件并在代理生成 diff 前预读这些引用文件，前端会显示实际命中的引用文件证据；文件读取失败会保留路径、接口参数和错误栈，支持重试、引用文件或直接修复；路径拼错或未命中时会显示 missing reference 警告、最可能的候选文件和一键替换按钮，并可一键把未命中证据加入提示词或直接启动引用修复，避免代理假装读过不存在的文件。
 - **安全收口**：命令执行先经过可审计 policy 分类，返回允许/拒绝、风险等级和原因；没有可安全运行的检查命令时标记为 `applied_unverified`，不会误报失败。
 - **审批请求**：被 policy 拒绝的命令和进程会写入 `.forge/approvals`，并在侧栏展示为可查看、可批准、可拒绝、可执行的审计记录；每条审批可一键把策略原因、目标动作、执行/升级记录、当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊加入提示词，把语法/UI/core/publish/integrations 等审批验证命令放入命令面板，生成聚焦阻塞原因的“阻塞提示”，也可直接启动代理生成安全替代或审批阻塞修复方案；新增 `/api/approval-escalation` 和“升级证据”按钮，可为被拦截命令、进程、远端发布计划或工具调用生成 `.forge/escalations` 外部受控沙箱升级证据包，不在本地绕过策略或执行危险命令；查看、批准、拒绝、升级或执行失败时会保留请求参数、审批状态和错误栈，生成可加入提示词、重试、安全替代或直接修复的动作失败证据卡；执行已批准请求时仍会重新检查本地安全策略，执行结果卡也可继续加入提示词、排队验证命令、生成阻塞提示、安全替代或升级证据，远端发布计划不会被自动执行。
 - **权限矩阵**：新增 `/api/permission-matrix`、`permission_matrix` 只读工具和“权限矩阵”按钮，按 workspace、local-shell、model、browser、extension、MCP、git-remote 等 provider/action 汇总访问级别、审批要求、命令执行、文件写入、远端写入和关键 guardrails；远端发布权限已拆成 `read_pr_ci`、`push_branch`、`create_gitee_pr_manual` / `create_pr`、`comment_gitee_pr_manual` / `comment_pr`、`ingest_external_evidence` 等动作，Gitee 会标记为 `manualProvider`，所有 push、建 PR、评论远端写入在本地仍保持 `writesRemote=false`，只通过继续包和 `/api/remote-publish-evidence` 回填外部执行证据。
-- **长任务管理**：新增 `/api/processes`、`/api/process-startup-commands`、`/api/process-health`、`/api/process-search`、`/api/process-history`、`/api/runtime-url` 和 `/api/debug-target`，可按 policy 启动受管开发服务、从 `package.json` 和常见入口只读发现推荐启动命令、识别本地端口、把当前真实运行 URL 持久化到 `.forge/state/runtime-url.json`、独立汇总 HTTP 健康探针、持久化 `.forge/process-logs` 日志 artifact、搜索/查看输出尾部、回放历史进程并停止进程；健康接口和启动命令发现会返回 `runtimeUrl`，前端会自动把真实 URL 填入页面调试输入框，避免端口自动切换后误连旧服务；`/api/debug-target` 会把运行 URL、受管进程探针、诊断摘要、验证命令和下一步动作聚合成“当前调试目标”，前端一键诊断会优先展示这个目标并可直接加入提示词；进程区支持“发现”填入推荐命令，“发现并启动”把推荐命令直接送入受管进程启动路径，也支持“发现并调试”在启动后等待探针 URL，自动串起页面检查和浏览器 Trace；进程列表、启动命令发现、健康探针、日志搜索命中和历史 artifact 可一键加入提示词、直接启动基于进程证据的修复，或把探针 URL 直接送入页面检查 / 浏览器 Trace；受管进程行支持“一键调试”，自动串起进程健康、页面检查和浏览器 Trace，生成可加入提示词、引用 artifact、生成带安全检查和页面复查要求的验证提示、直接启动浏览器验证修复，或直接修复的页面调试证据卡；一键调试完成后还会沉淀“启动后页面调试恢复”卡，合并健康探针、页面检查、Trace 异常、浏览器异常分诊、下一步动作和复查命令，可加入提示词、放入命令面板、重跑 Trace 或启动验证修复；启动命令发现、发现并启动、发现并调试、启动/停止进程、读取进程输出、搜索日志、读取历史或健康探针失败时，会把命令、endpoint、请求参数、策略/探针上下文和错误栈转成可加入提示词、重试或直接修复的进程失败证据卡。
+- **长任务管理**：新增 `/api/processes`、`/api/process-startup-commands`、`/api/process-health`、`/api/process-search`、`/api/process-history`、`/api/runtime-url` 和 `/api/debug-target`，可按 policy 启动受管开发服务、从 `package.json` 和常见入口只读发现推荐启动命令、识别本地端口、把当前真实运行 URL 持久化到 `.forge/state/runtime-url.json`、独立汇总 HTTP 健康探针、持久化 `.forge/process-logs` 日志 artifact、搜索/查看输出尾部、回放历史进程并停止进程；健康接口和启动命令发现会返回 `runtimeUrl`，前端会自动把真实 URL 填入页面调试输入框，避免端口自动切换后误连旧服务；`/api/debug-target` 会把运行 URL、受管进程探针、诊断摘要、验证命令和下一步动作聚合成“当前调试目标”，前端一键诊断会优先展示这个目标并可直接加入提示词；进程区支持“发现”填入推荐命令，“发现并启动”把推荐命令直接送入受管进程启动路径，也支持“发现并调试”在启动后等待探针 URL，自动串起页面检查和浏览器 Trace；进程列表、启动命令发现、健康探针、日志搜索命中和历史 artifact 可一键加入提示词、直接启动基于进程证据的修复，或把探针 URL 直接送入页面检查 / 浏览器 Trace；受管进程行支持“一键调试”，自动串起进程健康、页面检查和浏览器 Trace，生成可加入提示词、引用 artifact、生成带安全检查和页面复查要求的验证提示、直接启动浏览器验证修复，或直接修复的页面调试证据卡；进程证据和失败证据会继续带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊，避免服务失败排查时丢掉正在看的源码或页面；一键调试完成后还会沉淀“启动后页面调试恢复”卡，合并健康探针、页面检查、Trace 异常、浏览器异常分诊、下一步动作和复查命令，可加入提示词、放入命令面板、重跑 Trace 或启动验证修复；启动命令发现、发现并启动、发现并调试、启动/停止进程、读取进程输出、搜索日志、读取历史或健康探针失败时，会把命令、endpoint、请求参数、策略/探针上下文和错误栈转成可加入提示词、重试或直接修复的进程失败证据卡。
 - **会话续写上下文**：历史会话的“加入提示词 / 继续会话”现在会同时带上最近消息、当前输入里的 `@file` 命中与缺失边界、当前调试目标、浏览器异常分诊和待审批提案线索；任务、队列、目标继续、冲突修复、审查、PR 评论和交付草稿也复用同一套 `@file` / 调试目标摘要，提醒代理先读取当前工作树，不把未命中的文件引用当成已读上下文，减少续写时改错文件或连错端口。
 - **长任务健康规则**：`/api/process-health` 会只读加载当前工作区 `.forge/process-health-rules.json`，按命令片段匹配受管进程，校验期望 HTTP 状态码、探针 URL、探针响应正文、输出日志证据、输出/响应正则匹配，以及不应出现的错误文本或错误正则（如 `SyntaxError`、`EADDRINUSE`、`fatal`），并把规则命中、失败原因和观察值汇总到健康报告；不启动、停止或修改进程。
 - **一键调试推荐动作**：`/api/debug-diagnostics` 的 `nextActions` 会按优先级排序，并为每条建议带上 `kind`、`target`、证据摘要和可执行命令；`/api/debug-target` 会在此基础上自动选择显式 URL、健康受管进程探针或当前 runtime URL，聚合 `target`、`summary`、`verificationCommands` 和嵌入式 diagnostics，避免端口切换或多进程场景下手动判断该调试哪个页面；当页面 Trace 可用时会生成 `browserTriage`，把 runtime exception、console error/warn 和失败网络请求转成 error/warn/pass 分诊，并把 Runtime exception / console stack URL 映射为工作区内 `browserSourceLocations`，生成“定位浏览器异常源码”高优先级建议；前端调试面板会显示“当前调试目标”卡片和这些证据，可一键检查页面、采集 Trace、执行完整复查、放入命令面板、复制、运行、加入提示词，或沉淀到修复证据链；“源码提示 / 源码修复”会把这些浏览器源码位置批量读取为源码上下文，生成可继续编辑的修复提示或待审批 diff 草稿，避免页面异常排查停留在 Trace 文本；“生成修复提示 / 直接修复”也会把当前调试目标、分诊发现、源码位置、分诊下一步、页面复查要求和推荐 smoke 命令带入提示词，并把 `browserTriage` / `browserSourceLocations` 作为结构化 `debugContext` 传给修复代理，让代理按浏览器异常优先级闭环处理。
@@ -151,7 +180,9 @@ node server.js
 - **DOM 交互**：新增 `/api/browser-interact` 和“交互”按钮，通过 Chrome DevTools Protocol 在隔离 profile 中执行 `wait`、`click`、`dblClick`、`hover`、`clear`、`type`、`press`、`keyDown`、`keyUp`、`select`、`check`、`uncheck`、`waitText`、`waitValue`、`navigate`、`waitUrl`、`waitNetwork`、`upload`、`mouseMove`、`mouseDown`、`mouseUp`、`mouseClick`、`drag`、`wheel`、`scroll`，并返回交互后的 DOM 与步骤审计。
 - **浏览器会话 artifact**：新增 `/api/browser-session`，在同一隔离 profile 内执行多步骤本地页面会话，保存 `.forge/browser-sessions` 审计 artifact。
 - **像素级视觉断言**：新增 `/api/browser-visual` 和“视觉”按钮，保存整页或选择器裁剪 PNG 视觉基线，并执行尺寸、像素 diff、阈值、mismatch sample 和可视化 diff PNG 对比。
-- **模型运行层**：支持 `FORGE_MODELS` 逗号分隔候选模型，模型请求失败时按顺序 fallback，并在健康接口和会话日志记录请求数、成功/失败数、最近模型、fallback、延迟和最近调用遥测；新增 `/api/agent-stream` SSE 阶段流和 provider token delta 转发、`/api/model-policy`、`/api/model-usage`、`/api/model-budget`、`/api/model-cost`、`/api/model-cost-policy`、`/api/model-billing`、`model_policy` / `model_usage` / `model_budget` / `model_cost` / `model_cost_policy` / `model_billing` 只读工具、“模型策略”“模型用量”“模型预算”“模型成本”“价格表”和“账单核对”按钮，展示候选模型、fallback 顺序、endpoint host、token usage 持久化账本、`FORGE_MODEL_REQUEST_LIMIT` / `FORGE_MODEL_TOKEN_LIMIT` 调用前预算预检、基于 `FORGE_MODEL_COST_POLICY` 的用户配置价格表 schema/校验/成本估算、基于 `FORGE_MODEL_BILLING_JSON` 或 `.forge/state/model-billing.json` 的用户提供账单核对、密钥脱敏和 provider 配置只读 guardrails，不发起模型请求；模型证据卡可一键加入提示词、把模型验证命令排入命令面板、生成带安全检查命令的模型验证提示、直接启动模型验证修复，或直接启动模型 fallback、预算、成本和账单核对优化任务；模型策略/用量/预算/成本/价格表/账单读取失败时会保留 endpoint、请求参数、模型运行遥测、当前 prompt 和待审批 diff，生成可加入提示词、验证修复或直接优化的失败证据卡，并自动排入语法、UI、model 和 debug 复查命令；代理/SSE 请求失败会保留原始 prompt、当前 `@file` 命中/缺失边界、当前调试目标、浏览器异常分诊、最近流式事件和调试上下文，提供加入提示词、引用相关文件、把代理失败验证命令排入命令面板、生成代理失败验证提示、直接启动代理失败验证修复、重试和诊断修复入口。
+- **模型运行层**：支持 `FORGE_MODELS` 逗号分隔候选模型，未设置时默认使用 `deepseek-v4-pro,deepseek-chat`，模型请求失败时按顺序 fallback，并在健康接口和会话日志记录请求数、成功/失败数、最近模型、fallback、延迟和最近调用遥测；能力矩阵按本地 guardrails、fallback 顺序、预算预检、用量账本、SSE 流和成本/账单只读能力判定模型运行层就绪，不再因为刚启动尚未产生真实调用记录而误报本地能力缺口，同时仍展示 API Key、fallback 和调用历史状态；新增 `/api/agent-stream` SSE 阶段流和 provider token delta 转发、`/api/model-policy`、`/api/model-usage`、`/api/model-budget`、`/api/model-cost`、`/api/model-cost-policy`、`/api/model-billing`、`model_policy` / `model_usage` / `model_budget` / `model_cost` / `model_cost_policy` / `model_billing` 只读工具、“模型策略”“模型用量”“模型预算”“模型成本”“价格表”和“账单核对”按钮，展示候选模型、fallback 顺序、endpoint host、token usage 持久化账本、`FORGE_MODEL_REQUEST_LIMIT` / `FORGE_MODEL_TOKEN_LIMIT` 调用前预算预检、基于 `FORGE_MODEL_COST_POLICY` 的用户配置价格表 schema/校验/成本估算、基于 `FORGE_MODEL_BILLING_JSON` 或 `.forge/state/model-billing.json` 的用户提供账单核对、密钥脱敏和 provider 配置只读 guardrails，不发起模型请求；模型证据卡可一键加入提示词、把模型验证命令排入命令面板、生成带安全检查命令的模型验证提示、直接启动模型验证修复，或直接启动模型 fallback、预算、成本和账单核对优化任务；模型策略/用量/预算/成本/价格表/账单读取失败时会保留 endpoint、请求参数、模型运行遥测、当前 prompt 和待审批 diff，生成可加入提示词、验证修复或直接优化的失败证据卡，并自动排入语法、UI、model 和 debug 复查命令；代理/SSE 请求失败会保留原始 prompt、当前 `@file` 命中/缺失边界、当前调试目标、浏览器异常分诊、最近流式事件和调试上下文，提供加入提示词、引用相关文件、把代理失败验证命令排入命令面板、生成代理失败验证提示、直接启动代理失败验证修复、重试和诊断修复入口。
+
+- **模型证据上下文**：模型策略、用量、预算、成本、价格表和账单核对证据加入提示词、生成验证提示或读取失败时，会带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊，避免模型运行层 blocker 只剩预算/接口错误而丢失正在调试的代码现场。
 
 ## 本地检查
 

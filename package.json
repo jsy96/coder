@@ -6,6 +6,10 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check app.js",
+    "capabilities": "node server.js --capability-audit",
+    "capabilities:json": "node server.js --capability-audit --json",
+    "external-readiness": "node server.js --external-readiness",
+    "external-readiness:json": "node server.js --external-readiness --json",
     "smoke": "node server.js --smoke-test",
     "port-smoke": "node server.js --port-conflict-smoke-test",
     "ui-smoke": "node server.js --ui-smoke-test",
