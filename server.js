@@ -8559,6 +8559,10 @@ function parseGitStatusOutput(output = "") {
     .slice(0, 80);
 }
 
+function quotePath(filePath = "") {
+  return `"${String(filePath || "").replace(/"/g, "")}"`;
+}
+
 function changedFilesFromGitStatus(status = []) {
   const files = [];
   for (const line of Array.isArray(status) ? status : []) {
@@ -8616,18 +8620,25 @@ async function getGitSummary() {
 }
 
 async function buildWorkspaceReadiness({ includeIgnored = false } = {}) {
-  const [git, scripts, startStat, validateStat, gitignoreText] = await Promise.all([
+  const integrationFiles = [
+    ".mcp.json",
+    "scripts/mcp-local-workspace.js",
+    "extensions/plugins/local-readonly-helper/manifest.json"
+  ];
+  const [git, scripts, startStat, validateStat, gitignoreText, ...integrationStats] = await Promise.all([
     getGitSummary().catch(() => ({ available: false, branch: "", status: [], changedFiles: [], remotes: [] })),
     readPackageScripts().catch(() => ({})),
     fs.stat(path.join(APP_ROOT, "start.bat")).catch(() => null),
     fs.stat(path.join(APP_ROOT, "validate.bat")).catch(() => null),
-    fs.readFile(path.join(APP_ROOT, ".gitignore"), "utf8").catch(() => "")
+    fs.readFile(path.join(APP_ROOT, ".gitignore"), "utf8").catch(() => ""),
+    ...integrationFiles.map((file) => fs.stat(path.join(APP_ROOT, file)).catch(() => null))
   ]);
+  const criticalFiles = ["start.bat", "validate.bat", ...integrationFiles];
   const trackedResult = git.available
-    ? await runLocalCommand("git ls-files -- start.bat validate.bat", { timeout: 5000 }).catch(() => ({ ok: false, output: "" }))
+    ? await runLocalCommand(`git ls-files -- ${criticalFiles.map(quotePath).join(" ")}`, { timeout: 5000 }).catch(() => ({ ok: false, output: "" }))
     : { ok: false, output: "" };
   const ignoredResult = includeIgnored && git.available
-    ? await runLocalCommand("git status --short --ignored -- start.bat validate.bat .gitignore", { timeout: 5000 }).catch(() => ({ ok: false, output: "" }))
+    ? await runLocalCommand(`git status --short --ignored -- .gitignore ${criticalFiles.map(quotePath).join(" ")}`, { timeout: 5000 }).catch(() => ({ ok: false, output: "" }))
     : { ok: false, output: "" };
   const tracked = new Set(String(trackedResult.output || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
   const ignoredStatus = parseGitStatusOutput(ignoredResult.output || "");
@@ -8639,7 +8650,16 @@ async function buildWorkspaceReadiness({ includeIgnored = false } = {}) {
     { file: "start.bat", stat: startStat, unignored: gitignoreAllowsStart },
     { file: "validate.bat", stat: validateStat, unignored: gitignoreAllowsValidate }
   ];
-  const untrackedCritical = scriptFiles
+  const integrationFileRows = integrationFiles.map((file, index) => ({
+    file,
+    stat: integrationStats[index],
+    tracked: tracked.has(file)
+  }));
+  const criticalFileRows = [
+    ...scriptFiles,
+    ...integrationFileRows
+  ];
+  const untrackedCritical = criticalFileRows
     .filter((item) => item.stat?.isFile() && !tracked.has(item.file))
     .map((item) => item.file);
   const untrackedButTrackable = scriptFiles
@@ -8690,6 +8710,16 @@ async function buildWorkspaceReadiness({ includeIgnored = false } = {}) {
       next: gitignoreIgnoresForge ? ".forge 本地证据目录保持忽略。" : "建议忽略 .forge/，避免 smoke/artifact 污染提交。"
     },
     {
+      id: "versioned-local-integrations-trackable",
+      label: "本地 MCP/扩展文件可交付",
+      status: integrationFileRows.every((item) => item.stat?.isFile() && item.tracked) ? "ready" : "warning",
+      required: true,
+      evidence: integrationFileRows.map((item) => `${item.file}:${item.stat?.isFile() ? "present" : "missing"}:${item.tracked ? "tracked" : "untracked"}`),
+      next: integrationFileRows.every((item) => item.stat?.isFile() && item.tracked)
+        ? "本地 MCP 配置、MCP server 和扩展 manifest 已可随项目交付。"
+        : `将本地集成文件加入 Git 索引：git add -- ${integrationFileRows.filter((item) => item.stat?.isFile() && !item.tracked).map((item) => quotePath(item.file)).join(" ")}`
+    },
+    {
       id: "package-scripts",
       label: "package 验证脚本",
       status: scriptNames.includes("check") && scriptNames.some((item) => item.startsWith("api-smoke")) ? "ready" : "warning",
@@ -8709,7 +8739,7 @@ async function buildWorkspaceReadiness({ includeIgnored = false } = {}) {
   const blocking = checks.filter((item) => item.required && item.status === "blocked");
   const warnings = checks.filter((item) => item.status === "warning");
   const status = blocking.length ? "blocked" : warnings.length || untrackedCritical.length ? "warning" : "ready";
-  const gitAddCommand = untrackedCritical.length ? `git add -- ${untrackedCritical.join(" ")}` : "";
+  const gitAddCommand = untrackedCritical.length ? `git add -- ${untrackedCritical.map(quotePath).join(" ")}` : "";
   return {
     generatedAt: new Date().toISOString(),
     workspace: currentWorkspace,
@@ -8734,10 +8764,12 @@ async function buildWorkspaceReadiness({ includeIgnored = false } = {}) {
     gitAddCommand,
     recommendedCommands: [
       ...(gitAddCommand ? [{ command: gitAddCommand, reason: "将关键启动/验证脚本加入 Git 索引；需在具备 .git 写权限的本地终端执行。" }] : []),
-      { command: "node --check server.js", reason: "服务端语法检查。" },
-      { command: "node --check app.js", reason: "前端脚本语法检查。" },
-      { command: "node server.js --api-smoke-section=fast", reason: "快速本地 API 回归。" },
-      { command: "validate.bat --ci", reason: "Windows 无交互完整验证。" },
+    { command: "node --check server.js", reason: "服务端语法检查。" },
+    { command: "node --check app.js", reason: "前端脚本语法检查。" },
+    { command: "node server.js --start-bat-smoke-test", reason: "验证 start.bat 启动脚本、端口避让和无交互模式。" },
+    { command: "node server.js --port-conflict-smoke-test", reason: "验证服务端端口冲突自动重试。" },
+    { command: "node server.js --api-smoke-section=fast", reason: "快速本地 API 回归。" },
+    { command: "validate.bat --ci", reason: "Windows 无交互完整验证。" },
       { command: "git diff --check -- .gitignore .mcp.json server.js app.js README.md package.json start.bat validate.bat scripts/mcp-local-workspace.js extensions/plugins/local-readonly-helper/manifest.json", reason: "提交前检查补丁空白和格式。" }
     ],
     nextActions: [
@@ -10566,6 +10598,35 @@ function remotePublishEvidenceVerificationCommands(evidence = {}) {
   return commands;
 }
 
+function summarizeRemotePublishEvidenceDraftTemplate(evidence = {}, validation = {}) {
+  const external = evidence.externalExecution || {};
+  const commandsRun = Array.isArray(external.commandsRun) ? external.commandsRun : [];
+  return {
+    packageId: evidence.packageId || "",
+    provider: evidence.provider || "",
+    missing: [
+      ...(validation.blockers || []),
+      ...(validation.warnings || [])
+    ],
+    nextRequiredFields: [
+      "externalExecution.executedBy",
+      "externalExecution.executedAt",
+      "externalExecution.commandsRun[].status",
+      "externalExecution.commandsRun[].outputSummary",
+      "externalExecution.remoteUrl 或 externalExecution.prOrMrNumber",
+      "externalExecution.ciUrl",
+      "externalExecution.reviewCommentUrl",
+      "externalExecution.rollbackPlan"
+    ],
+    commands: commandsRun.map((item) => ({
+      id: item.id || "",
+      command: item.command || "",
+      status: item.status || "",
+      outputSummary: item.outputSummary || ""
+    }))
+  };
+}
+
 function validateRemotePublishExternalEvidence(evidence = {}, detail = null) {
   const external = evidence.externalExecution || {};
   const commandsRun = Array.isArray(external.commandsRun) ? external.commandsRun : [];
@@ -10603,6 +10664,107 @@ function validateRemotePublishExternalEvidence(evidence = {}, detail = null) {
       hasRollbackPlan: Boolean(String(external.rollbackPlan || "").trim())
     }
   };
+}
+
+async function buildRemotePublishEvidenceDraft({ id = "", evidence = null, limit = 20 } = {}) {
+  const detail = await readRemotePublishPackage(id || "");
+  const packageDir = detail?.paths?.dir ? path.join(APP_ROOT, detail.paths.dir) : "";
+  const templatePath = path.join(packageDir, "external-evidence-template.json");
+  const draftPath = path.join(packageDir, "external-evidence-draft.json");
+  const draftMarkdownPath = path.join(packageDir, "external-evidence-draft.md");
+  const sourceEvidence = evidence && typeof evidence === "object"
+    ? evidence
+    : await readJsonOrNull(templatePath);
+  if (!sourceEvidence || typeof sourceEvidence !== "object") {
+    throw new Error("未找到可读取的 external-evidence-template.json，请先生成继续包或在请求中提供 evidence。");
+  }
+  const normalized = {
+    ...sourceEvidence,
+    packageId: sourceEvidence.packageId || detail.id,
+    workspace: currentWorkspace,
+    provider: sourceEvidence.provider || detail.plan?.provider || "",
+    draftGeneratedAt: new Date().toISOString(),
+    source: evidence ? "request-body" : "external-evidence-template.json"
+  };
+  const validation = validateRemotePublishExternalEvidence(normalized, detail);
+  const summary = summarizeRemotePublishEvidenceDraftTemplate(normalized, validation);
+  const verificationCommands = remotePublishEvidenceVerificationCommands(normalized).slice(0, Math.max(1, Number(limit) || 20));
+  const external = normalized.externalExecution || {};
+  const draft = {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    packageId: detail.id,
+    provider: normalized.provider || "",
+    status: validation.status === "ready" ? "ready_to_ingest" : "draft_needs_input",
+    evidenceTemplate: normalized,
+    validation,
+    summary,
+    verificationCommands,
+    paths: {
+      packageDir: detail.paths.dir,
+      template: toPosix(path.relative(APP_ROOT, templatePath)),
+      draft: toPosix(path.relative(APP_ROOT, draftPath)),
+      markdown: toPosix(path.relative(APP_ROOT, draftMarkdownPath)),
+      prBody: detail.paths.prBody,
+      reviewSummary: detail.paths.reviewSummary,
+      plan: detail.paths.plan
+    },
+    policy: {
+      access: "local-artifact-only",
+      writesLocalArtifacts: true,
+      writesFormalEvidence: false,
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      requiresManualExternalExecution: true,
+      manualProvider: Boolean((normalized.provider || detail.plan?.provider || "") === "gitee")
+    }
+  };
+  const suggestedEvidence = {
+    ...normalized,
+    externalExecution: {
+      ...external,
+      executedBy: external.executedBy || "<your name>",
+      executedAt: external.executedAt || new Date().toISOString(),
+      commandsRun: (Array.isArray(external.commandsRun) ? external.commandsRun : []).map((item) => ({
+        ...item,
+        status: item.status || "<completed|skipped|failed>",
+        outputSummary: item.outputSummary || "<short summary>"
+      })),
+      remoteUrl: external.remoteUrl || "<Gitee PR URL>",
+      prOrMrNumber: external.prOrMrNumber || "<PR number>",
+      ciUrl: external.ciUrl || "<Gitee CI URL>",
+      reviewCommentUrl: external.reviewCommentUrl || "<Gitee comment URL>",
+      rollbackPlan: external.rollbackPlan || "<rollback plan>",
+      notes: external.notes || ""
+    }
+  };
+  const markdown = [
+    `# Remote Publish Evidence Draft - ${detail.id}`,
+    "",
+    `Status: ${draft.status}`,
+    `Provider: ${draft.provider || "unknown"}`,
+    `Package: ${detail.id}`,
+    "",
+    "## Fill These Fields Before Formal Ingestion",
+    summary.missing.length ? markdownList(summary.missing) : "- No missing fields detected; this draft is ready to ingest.",
+    "",
+    "## Suggested Evidence JSON Shape",
+    "```json",
+    JSON.stringify(suggestedEvidence, null, 2),
+    "```",
+    "",
+    "## Formal Ingestion",
+    "- Paste the completed JSON into `/api/remote-publish-evidence`, or use the UI after the fields are filled.",
+    "- This draft does not mark remote publish as complete and does not write `external-evidence.json`.",
+    "",
+    "## Local Follow-Up Verification",
+    verificationCommands.map((item) => `- \`${item.command}\` - ${item.reason}`).join("\n")
+  ].join("\n");
+  await fs.writeFile(draftPath, JSON.stringify(draft, null, 2), "utf8");
+  await fs.writeFile(draftMarkdownPath, markdown, "utf8");
+  return draft;
 }
 
 async function buildRemotePublishEvidence({ id = "", evidence = null, limit = 20 } = {}) {
@@ -18419,6 +18581,20 @@ async function handleApi(req, res) {
       }) });
     }
 
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/remote-publish-evidence-draft") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            id: url.searchParams.get("id") || "",
+            limit: Number(url.searchParams.get("limit") || 20)
+          };
+      return send(res, 200, { draft: await buildRemotePublishEvidenceDraft({
+        id: String(payload.id || ""),
+        evidence: payload.evidence || null,
+        limit: Number(payload.limit || 20)
+      }) });
+    }
+
     if (req.method === "GET" && url.pathname === "/api/git") {
       return send(res, 200, await getGitSummary());
     }
@@ -18591,6 +18767,45 @@ async function runPortConflictSmokeTest() {
   } finally {
     await closeSmokeServer(runtimeServer);
   }
+}
+
+async function runStartBatSmokeTest() {
+  const startBatPath = path.join(APP_ROOT, "start.bat");
+  const startBat = await fs.readFile(startBatPath, "utf8");
+  const requiredSnippets = [
+    "FORGE_PORT_RETRY_LIMIT",
+    "FORGE_PORT_AUTO_RETRY",
+    "FORGE_START_NO_PAUSE",
+    "FORGE_URL=http://127.0.0.1:%FORGE_PORT%",
+    "Starting server on port %FORGE_PORT%",
+    "call :find_free_port",
+    "netstat -ano -p tcp",
+    "findstr /r /c:\":%%P .*LISTENING\"",
+    "node \"%CD%\\server.js\" \"--port=%FORGE_PORT%\"",
+    "if not \"%FORGE_START_NO_PAUSE%\"==\"1\" pause"
+  ];
+  const missing = requiredSnippets.filter((snippet) => !startBat.includes(snippet));
+  if (missing.length) {
+    throw new Error(`start.bat smoke failed. Missing snippet(s): ${missing.join(", ")}`);
+  }
+  const hasPortSelection = /:find_free_port[\s\S]+for \/l %%P in \(%~1,1,%~2\)/i.test(startBat);
+  const hasBusyPortMessage = /Port %FORGE_PREFERRED_PORT% is busy\. Using free port %FORGE_PORT%/i.test(startBat);
+  if (!hasPortSelection || !hasBusyPortMessage) {
+    throw new Error("start.bat smoke failed. Port fallback flow is incomplete.");
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    startBatSmoke: true,
+    file: "start.bat",
+    checks: requiredSnippets.length + 2,
+    features: [
+      "node availability guard",
+      "server.js availability guard",
+      "port scan fallback",
+      "final URL output",
+      "non-interactive no-pause mode"
+    ]
+  }));
 }
 
 const server = {
@@ -18881,6 +19096,7 @@ const KNOWN_CLI_FLAG_NAMES = new Set([
   "--project-doctor-deep",
   "--project-doctor-json",
   "--smoke-test",
+  "--start-bat-smoke-test",
   "--ui-smoke-test",
   "--workspace-readiness",
   "--workspace-readiness-include-ignored",
@@ -19033,6 +19249,7 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(workspaceReadiness.policy?.access === "local-read-only", "workspace readiness should be read-only");
       assertSmoke(workspaceReadiness.policy?.writesFiles === false, "workspace readiness should not write files");
       assertSmoke(workspaceReadiness.checks?.some((item) => item.id === "startup-scripts-trackable"), "workspace readiness missing startup script tracking check");
+      assertSmoke(workspaceReadiness.checks?.some((item) => item.id === "versioned-local-integrations-trackable"), "workspace readiness missing versioned local integration tracking check");
       assertSmoke(workspaceReadiness.checks?.some((item) => item.id === "forge-artifacts-ignored"), "workspace readiness missing artifact ignore check");
       assertSmoke(Array.isArray(workspaceReadiness.recommendedCommands), "workspace readiness missing recommended commands");
       assertSmoke(workspaceReadiness.recommendedCommands.some((item) => item.command === "validate.bat --ci"), "workspace readiness missing validate.bat recommendation");
@@ -19737,6 +19954,19 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(remotePublishContinuation.continuation?.paths?.evidenceTemplate?.endsWith("external-evidence-template.json"), "remote publish continuation missing evidence template artifact");
       assertSmoke(Array.isArray(remotePublishContinuation.continuation?.verificationCommands), "remote publish continuation missing verification commands");
       assertSmoke(remotePublishContinuation.continuation?.evidenceTemplate?.externalExecution, "remote publish continuation missing external execution template");
+      const remotePublishEvidenceDraft = await requestJson(baseUrl, "/api/remote-publish-evidence-draft", {
+        method: "POST",
+        body: JSON.stringify({
+          id: remotePublishPlan.package.id,
+          limit: 5,
+          evidence: remotePublishContinuation.continuation.evidenceTemplate
+        })
+      });
+      assertSmoke(remotePublishEvidenceDraft.draft?.status === "draft_needs_input", "remote publish evidence draft should not mark empty template ready");
+      assertSmoke(remotePublishEvidenceDraft.draft?.policy?.writesFormalEvidence === false, "remote publish evidence draft should not write formal evidence");
+      assertSmoke(remotePublishEvidenceDraft.draft?.paths?.draft?.endsWith("external-evidence-draft.json"), "remote publish evidence draft missing JSON artifact");
+      assertSmoke(remotePublishEvidenceDraft.draft?.paths?.markdown?.endsWith("external-evidence-draft.md"), "remote publish evidence draft missing markdown artifact");
+      assertSmoke(remotePublishEvidenceDraft.draft?.summary?.missing?.length >= 1, "remote publish evidence draft missing field checklist");
       const remotePublishEvidence = await requestJson(baseUrl, "/api/remote-publish-evidence", {
         method: "POST",
         body: JSON.stringify({
@@ -19775,7 +20005,7 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       });
       assertSmoke(mergeGateWithExternalEvidence.gate?.gates?.some((item) => item.id === "remote-publish-external-evidence"), "merge gate missing remote publish external evidence gate");
       assertSmoke(mergeGateWithExternalEvidence.gate?.externalEvidence?.status === "ready", "merge gate missing ready external evidence summary");
-      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight", "remote-publish-continuation", "remote-publish-evidence", "merge-gate-external-evidence");
+      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight", "remote-publish-continuation", "remote-publish-evidence-draft", "remote-publish-evidence", "merge-gate-external-evidence");
     }
 
     console.log(JSON.stringify({
@@ -20369,9 +20599,10 @@ async function runUiSmokeTest() {
     "/api/remote-pr-status",
     "/api/remote-publish-plan",
     "/api/remote-publish-packages",
-      "/api/remote-publish-package",
+    "/api/remote-publish-package",
       "/api/remote-publish-preflight",
       "/api/remote-publish-continuation",
+      "/api/remote-publish-evidence-draft",
       "/api/remote-publish-evidence",
       "function buildBrowserEvidenceContext",
     "function browserEvidenceVerificationCommands",
@@ -20489,11 +20720,14 @@ async function runUiSmokeTest() {
     "远端发布包索引已读取",
       "远端发布预检已生成",
       "远端发布继续包已生成",
-      "function appendRemotePublishContinuationCard",
-      "function appendRemotePublishEvidenceCard",
-      "外部发布证据已回填",
-      "data-action=\"release-evidence\"",
-      "发布回填提示",
+    "function appendRemotePublishContinuationCard",
+    "function appendRemotePublishEvidenceDraftCard",
+    "function appendRemotePublishEvidenceCard",
+    "外部发布证据已回填",
+    "data-action=\"release-evidence\"",
+    "data-action=\"release-draft\"",
+    "发布回填提示",
+    "发布证据草稿",
     "function renderDebugDiagnostics",
     "lastDebugDiagnostics",
     "function pruneDebugDiagnosticsForStorage",
@@ -20650,7 +20884,10 @@ async function runUiSmokeTest() {
     "function clearUnpinnedCommandHistory",
     "function stageRepairVerificationCommands",
     "function smokeSectionCommandItems",
+    "function startupSmokeCommandItems",
     "async function runSmokeSectionCommands",
+    "async function runStartupSmokeCommands",
+    "function updateStartupSmokeShortcutButton",
     "function updateSmokeShortcutButton",
     "手动验证命令已加入面板",
     "最近命令已填入",
@@ -20726,10 +20963,12 @@ async function runUiSmokeTest() {
     "批量命令验证提示已加入提示词",
     "run-batch-evidence",
     "copy-all-commands",
+    "run-startup-smoke",
     "run-fast-smoke",
     "run-debug-smoke",
     "run-browser-smoke",
     "run-assets-smoke",
+    "启动 smoke",
     "快速 smoke",
     "调试 smoke",
     "浏览器 smoke",
@@ -22809,6 +23048,19 @@ async function runApiSmokeTest() {
     assertSmoke(remotePublishContinuation.continuation?.paths?.evidenceTemplate?.endsWith("external-evidence-template.json"), "remote publish continuation missing external evidence template");
     assertSmoke(remotePublishContinuation.continuation?.evidenceTemplate?.externalExecution, "remote publish continuation missing external execution template");
     assertSmoke(remotePublishContinuation.continuation?.verificationCommands?.some((item) => item.command === "node server.js --api-smoke-section=publish"), "remote publish continuation missing publish smoke command");
+    const remotePublishEvidenceDraft = await requestJson(baseUrl, "/api/remote-publish-evidence-draft", {
+      method: "POST",
+      body: JSON.stringify({
+        id: remotePublishPlan.package.id,
+        limit: 5,
+        evidence: remotePublishContinuation.continuation.evidenceTemplate
+      })
+    });
+    assertSmoke(remotePublishEvidenceDraft.draft?.status === "draft_needs_input", "remote publish evidence draft should not mark empty template ready");
+    assertSmoke(remotePublishEvidenceDraft.draft?.policy?.writesFormalEvidence === false, "remote publish evidence draft should not write formal evidence");
+    assertSmoke(remotePublishEvidenceDraft.draft?.paths?.draft?.endsWith("external-evidence-draft.json"), "remote publish evidence draft missing JSON artifact");
+    assertSmoke(remotePublishEvidenceDraft.draft?.paths?.markdown?.endsWith("external-evidence-draft.md"), "remote publish evidence draft missing markdown artifact");
+    assertSmoke(remotePublishEvidenceDraft.draft?.summary?.missing?.length >= 1, "remote publish evidence draft missing field checklist");
     const remotePublishEvidence = await requestJson(baseUrl, "/api/remote-publish-evidence", {
       method: "POST",
       body: JSON.stringify({
@@ -22866,7 +23118,7 @@ async function runApiSmokeTest() {
     console.log(JSON.stringify({
       ok: true,
       apiSmoke: true,
-    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "debug-diagnostics", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-symbol-impact", "semantic-rename-preview", "semantic-rename-draft", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-startup-commands", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight", "remote-publish-continuation", "remote-publish-evidence"],
+    checked: ["health", "files", "capabilities", "tools", "extensions", "extension-trust", "extension-tool-call", "mcp", "mcp-probe", "mcp-resource", "mcp-tool-call", "assets", "asset-inspect", "browser-check", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "debug-diagnostics", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual", "model-runtime", "model-policy", "model-usage", "model-budget", "model-cost", "model-cost-policy", "model-billing", "agent-stream", "threads", "thread-fork", "queue", "queue-isolation", "goal-state", "context-snapshot", "context-compact", "context-rollup", "auto-context-compact", "verification-plan", "ci-status", "merge-gate", "policy-audit", "permission-matrix", "code-intelligence", "semantic-index", "symbol-outline", "semantic-definition", "semantic-symbol-impact", "semantic-rename-preview", "semantic-rename-draft", "semantic-search", "semantic-references", "semantic-diagnostics", "semantic-impact", "dependency-graph", "reviews", "approvals", "approval-decision", "approval-execute", "command-policy", "processes", "process-startup-commands", "process-lifecycle", "process-health", "process-search", "process-history", "process-log-artifacts", "diff", "diff-conflicts", "conflict-resolution-draft", "handoff", "pr-readiness", "remote-pr-status", "remote-publish-plan", "remote-publish-packages", "remote-publish-preflight", "remote-publish-continuation", "remote-publish-evidence-draft", "remote-publish-evidence"],
       queueId: queued.id,
       handoffId: handoff.id
     }));
@@ -23026,6 +23278,8 @@ if (unknownFlags.length) {
   runCliTask(runUiSmokeTest);
 } else if (process.argv.includes("--port-conflict-smoke-test")) {
   runCliTask(runPortConflictSmokeTest);
+} else if (process.argv.includes("--start-bat-smoke-test")) {
+  runCliTask(runStartBatSmokeTest);
 } else if (process.argv.includes("--smoke-test")) {
   runCliTask(runSmokeTest);
 } else if (shouldRunServerForArgs()) {

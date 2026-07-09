@@ -64,6 +64,10 @@ echo [INFO] Port conflict retry smoke...
 node server.js --port-conflict-smoke-test || goto :failed
 
 echo.
+echo [INFO] Startup script smoke...
+node server.js --start-bat-smoke-test || goto :failed
+
+echo.
 echo [INFO] External readiness dry-run...
 node server.js --external-readiness --dry-run || goto :failed
 

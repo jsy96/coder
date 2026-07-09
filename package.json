@@ -25,6 +25,7 @@
     "external-authorization-action:list": "node server.js --external-authorization-action --list",
     "smoke": "node server.js --smoke-test",
     "port-smoke": "node server.js --port-conflict-smoke-test",
+    "start-smoke": "node server.js --start-bat-smoke-test",
     "ui-smoke": "node server.js --ui-smoke-test",
     "api-smoke": "node server.js --api-smoke-test",
     "api-smoke:fast": "node server.js --api-smoke-section=fast",

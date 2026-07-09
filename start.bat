@@ -45,6 +45,7 @@ if not defined FORGE_PORT (
 if not defined FORGE_PORT_RETRY_LIMIT set "FORGE_PORT_RETRY_LIMIT=50"
 if not defined FORGE_PORT_AUTO_RETRY set "FORGE_PORT_AUTO_RETRY=1"
 if not defined FORGE_START_RETRY_ON_EADDRINUSE set "FORGE_START_RETRY_ON_EADDRINUSE=1"
+if not defined FORGE_START_NO_PAUSE set "FORGE_START_NO_PAUSE=0"
 
 set "FORGE_PREFERRED_PORT=%FORGE_PORT%"
 set /a "FORGE_PORT_SCAN_END=%FORGE_PREFERRED_PORT%+%FORGE_PORT_RETRY_LIMIT%" >nul 2>nul
@@ -77,6 +78,7 @@ set "FORGE_URL=http://127.0.0.1:%FORGE_PORT%"
 echo [INFO] URL: %FORGE_URL%
 echo [INFO] If server.js auto-retries again, open the final FORGE_URL it prints.
 echo [INFO] If this port becomes busy during startup, server.js will print and use the next free port.
+echo [INFO] Tip: set FORGE_PORT=4174 to force a specific startup port.
 echo.
 echo [INFO] Starting server on port %FORGE_PORT%...
 echo.
@@ -96,7 +98,7 @@ if "%EXIT_CODE%"=="0" (
   echo        You can also check the owner with:
   echo        netstat -ano -p tcp ^| findstr :%FORGE_PREFERRED_PORT%
 )
-pause
+if not "%FORGE_START_NO_PAUSE%"=="1" pause
 exit /b %EXIT_CODE%
 
 :find_free_port

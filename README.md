@@ -38,8 +38,11 @@ http://127.0.0.1:4173
 如果默认端口已被占用，启动脚本或服务端会自动尝试后续端口，例如 `http://127.0.0.1:4174`；不要固定打开旧的 `4173`，以终端最终输出地址为准。也可以先运行下面的检查确认端口冲突自动切换逻辑：
 
 ```powershell
+node server.js --start-bat-smoke-test
 node server.js --port-conflict-smoke-test
 ```
+
+网页里的命令面板如果出现启动相关验证命令，也会显示“启动 smoke”快捷按钮，一次运行 `start.bat` 静态检查和端口冲突重试检查。
 
 如果要让 Forge Code 启动时操作另一个代码目录：
 
@@ -177,7 +180,7 @@ node server.js --integration-readiness --list
 - **验证门禁计划**：新增 `/api/verification-plan`、`/api/ci-status`、`verification_plan` / `ci_status` 只读工具和“验证门禁”“CI 状态”按钮，将安全检查命令、CI 配置、最近验证结果、远端只读检查和变更范围汇总为 PR 前置门禁清单；该计划不执行命令；门禁/CI/权限证据可一键加入提示词、生成带安全检查命令的验证提示、复用安全检查命令、排队验证命令、直接启动门禁验证修复或直接启动修复；门禁/CI/权限矩阵/Trust 请求失败时不再只弹错误，而是生成可加入提示词、引用上下文、自动排入语法/UI/fast/debug 复查命令并直接进入验证修复的失败证据卡。
 - **快捷检查命令**：“验证门禁”会把自动发现的安全检查命令直接渲染成可复制、可运行、可批量运行的命令行，并同步进入最近命令历史，减少手动拼命令。
 - **远端发布审批**：新增 `/api/remote-publish-plan`、`/api/remote-publish-packages`、`/api/remote-publish-package` 和“发布审批”“发布包”按钮，生成 `git push`、`gh/glab pr/mr create`、PR/MR 评论回写候选动作，把 PR body、review summary 和计划写入 `.forge/remote-publish` 并在 `.forge/approvals` 中登记；这些端点只生成/读取审批包，不执行远端写入；发布审批和发布包结果可作为门禁证据加入提示词、引用 `pr-body.md` / `review-summary.md` / `plan.json` 等本地文件、复用候选命令、生成继续包/发布回填提示，或直接启动发布阻塞修复。
-- **远端发布预检与继续包**：新增 `/api/remote-publish-preflight`、`/api/remote-publish-continuation`、`/api/remote-publish-evidence`、`remote_publish_preflight` 和 `remote_publish_continuation`，针对发布包汇总审批状态、Git 远端、CLI 安装/认证、命令风险和阻塞项，并生成 `continuation.md` 与 `external-evidence-template.json`，用于人工执行远端动作后回填执行人、时间、远端 URL、PR/MR 编号、CI 链接、评论链接、输出摘要、回滚方案和后续验证命令；Gitee 发布包会标记 `manualProvider`，生成 `manual:gitee-pr` / `manual:gitee-comment` 步骤和 Gitee 仓库 URL，明确要求人工在 Gitee 完成 PR 或评论后回填证据模板；回填后 `/api/remote-publish-evidence` 会校验必填证据、生成 `external-evidence.json` 与 `external-evidence-summary.md`，并把 publish/gates/core 复查命令回排到本地门禁链路；包索引会展示回填证据状态、远端 URL、PR/CI/评论链接摘要，合并门禁会新增 `remote-publish-external-evidence` gate，把回填后的远端证据纳入交付判断；这些入口不执行 push、建 PR 或远端评论；预检、继续包和回填证据结果可一键加入提示词、引用本地 artifact、排队本地复查命令、生成发布回填提示或直接基于 blockers 启动修复；发布审批、发布包读取、预检、继续包和证据回填请求失败时会保留发布包/审批上下文和请求参数，继续生成可修复证据。
+- **远端发布预检与继续包**：新增 `/api/remote-publish-preflight`、`/api/remote-publish-continuation`、`/api/remote-publish-evidence-draft`、`/api/remote-publish-evidence`、`remote_publish_preflight` 和 `remote_publish_continuation`，针对发布包汇总审批状态、Git 远端、CLI 安装/认证、命令风险和阻塞项，并生成 `continuation.md` 与 `external-evidence-template.json`，用于人工执行远端动作后回填执行人、时间、远端 URL、PR/MR 编号、CI 链接、评论链接、输出摘要、回滚方案和后续验证命令；Gitee 发布包会标记 `manualProvider`，生成 `manual:gitee-pr` / `manual:gitee-comment` 步骤和 Gitee 仓库 URL，明确要求人工在 Gitee 完成 PR 或评论后回填证据模板；空模板会先走 `/api/remote-publish-evidence-draft` 生成 `external-evidence-draft.json` 与 `external-evidence-draft.md`，列出缺失字段和可复制 JSON，不把未完成模板标成正式证据；回填完整后 `/api/remote-publish-evidence` 会校验必填证据、生成 `external-evidence.json` 与 `external-evidence-summary.md`，并把 publish/gates/core 复查命令回排到本地门禁链路；包索引会展示回填证据状态、远端 URL、PR/CI/评论链接摘要，合并门禁会新增 `remote-publish-external-evidence` gate，把回填后的远端证据纳入交付判断；这些入口不执行 push、建 PR 或远端评论；预检、继续包、回填草稿和回填证据结果可一键加入提示词、引用本地 artifact、排队本地复查命令、生成发布回填提示或直接基于 blockers 启动修复；发布审批、发布包读取、预检、继续包和证据回填请求失败时会保留发布包/审批上下文和请求参数，继续生成可修复证据。
 - **门禁证据连续性**：合并门禁、验证计划、CI、权限矩阵、远端发布预检和发布回填证据加入提示词、生成验证提示或请求失败时，会继续带上当前 `@file` 命中/缺失边界、当前调试目标和浏览器异常分诊，避免门禁修复时丢掉正在看的文件、运行页面或 Trace 线索。
 - **上下文摘要**：新增 `/api/context-snapshot` 和“保存上下文摘要”按钮，将仓库文件规模、扩展名分布、脚本、符号线索、Git 状态和资产摘要落盘到 `.forge/state/context-snapshot.json`，用于跨会话恢复；摘要结果可一键加入提示词、把上下文验证命令排入命令面板，或直接启动基于当前工作树复核的继续任务。
 - **上下文压缩**：新增 `/api/context-compact` 和“压缩上下文”按钮，将目标状态、仓库摘要、关键符号、Git 轻量证据、最近任务/审查/审批压缩为 `.forge/state/context-compact.json`；目标状态和任务日志变化后也会自动刷新轻量压缩 artifact，用于长会话恢复与交接；会话继续、队列继续、任务继续和目标继续都会补入最近浏览器异常分诊，避免页面调试线索在跨轮恢复时丢失；压缩结果可一键加入提示词、排队验证命令或直接继续修复。

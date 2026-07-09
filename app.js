@@ -3892,6 +3892,13 @@ function smokeSectionCommandItems(commands = [], section = "") {
   return normalizeCommandItems(commands).filter((item) => String(item.command || "").includes(needle));
 }
 
+function startupSmokeCommandItems(commands = []) {
+  return normalizeCommandItems(commands).filter((item) => {
+    const command = String(item.command || "");
+    return command.includes("--start-bat-smoke-test") || command.includes("--port-conflict-smoke-test");
+  });
+}
+
 async function runSmokeSectionCommands(commands = [], section = "", { title = "建议命令" } = {}) {
   const items = smokeSectionCommandItems(commands, section);
   if (!items.length) {
@@ -3915,6 +3922,39 @@ async function runSmokeSectionCommands(commands = [], section = "", { title = "�
   });
   setBusy(false, ok ? `${section} smoke 通过` : `${section} smoke 失败`);
   return ok;
+}
+
+async function runStartupSmokeCommands(commands = [], { title = "建议命令" } = {}) {
+  const items = startupSmokeCommandItems(commands);
+  if (!items.length) {
+    showToast("当前命令列表没有启动 smoke。");
+    appendToolCall({
+      title: `没有启动 smoke 可运行：${title}`,
+      label: "$",
+      state: "跳过",
+      body: commandItemsToText(commands)
+    });
+    return false;
+  }
+  if (state.busy) {
+    showToast("代理正在运行，请稍后再运行启动 smoke。");
+    return false;
+  }
+  setBusy(true, "运行启动 smoke");
+  const ok = await runCommandBatch(items, {
+    title: `${title} · 启动 smoke`,
+    stopOnFailure: true
+  });
+  setBusy(false, ok ? "启动 smoke 通过" : "启动 smoke 失败");
+  return ok;
+}
+
+function updateStartupSmokeShortcutButton(toolbar, commands, action) {
+  const button = toolbar.querySelector(`[data-action='${action}']`);
+  if (!button) return;
+  const items = startupSmokeCommandItems(commands);
+  button.hidden = items.length === 0;
+  button.disabled = items.length === 0;
 }
 
 function updateSmokeShortcutButton(toolbar, commands, section, action) {
@@ -3955,6 +3995,7 @@ function updateCommandToolbarSummaries() {
     }
     const repairButton = toolbar.querySelector("[data-action='run-batch-evidence']");
     if (repairButton) repairButton.disabled = !commandBatchNeedsRepair(commands);
+    updateStartupSmokeShortcutButton(toolbar, commands, "run-startup-smoke");
     updateSmokeShortcutButton(toolbar, commands, "fast", "run-fast-smoke");
     updateSmokeShortcutButton(toolbar, commands, "debug", "run-debug-smoke");
     updateSmokeShortcutButton(toolbar, commands, "browser", "run-browser-smoke");
@@ -3970,6 +4011,7 @@ function renderCommandToolbar(commands = [], { title = "建议命令" } = {}) {
   toolbar.innerHTML = `
     <strong></strong>
     <small data-command-batch-summary></small>
+    <button type="button" data-action="run-startup-smoke" hidden>启动 smoke</button>
     <button type="button" data-action="run-fast-smoke" hidden>快速 smoke</button>
     <button type="button" data-action="run-debug-smoke" hidden>调试 smoke</button>
     <button type="button" data-action="run-browser-smoke" hidden>浏览器 smoke</button>
@@ -3986,6 +4028,9 @@ function renderCommandToolbar(commands = [], { title = "建议命令" } = {}) {
   `;
   toolbar.querySelector("strong").textContent = title;
   toolbar.querySelector("[data-command-batch-summary]").textContent = formatCommandBatchSummary(items);
+  toolbar.querySelector("[data-action='run-startup-smoke']").addEventListener("click", async () => {
+    await runStartupSmokeCommands(items, { title });
+  });
   toolbar.querySelector("[data-action='run-fast-smoke']").addEventListener("click", async () => {
     await runSmokeSectionCommands(items, "fast", { title });
   });
@@ -12971,6 +13016,27 @@ async function appendRemotePublishEvidenceCard(packageId = "", evidence = null) 
   return remoteEvidence;
 }
 
+async function appendRemotePublishEvidenceDraftCard(packageId = "", evidence = null) {
+  const result = await api("/api/remote-publish-evidence-draft", {
+    method: "POST",
+    body: JSON.stringify({ id: packageId || "", evidence, limit: 8 })
+  });
+  const draft = result.draft || {};
+  appendGateEvidenceCard(draft, {
+    title: "发布证据草稿已生成",
+    kind: "release",
+    state: draft.status || "draft_needs_input",
+    body: compactGateEvidence(draft)
+  });
+  if (draft.verificationCommands?.length) {
+    stageGateEvidenceVerificationCommands(draft, {
+      title: "发布证据草稿",
+      source: "remote-publish-evidence-draft"
+    });
+  }
+  return draft;
+}
+
 function appendRemotePublishContinuationPrompt(continuation = {}) {
   const evidence = {
     status: continuation.status,
@@ -13032,7 +13098,7 @@ function appendGateEvidenceCard(evidence = {}, {
   actions.className = "debug-last-failed-actions";
   const packageId = evidence.packageId || evidence.package?.id || evidence.latest?.id || evidence.latest?.plan?.package?.id || evidence.preflight?.package?.id || "";
   const releaseActions = kind === "release"
-    ? `<button type="button" data-action="release-continuation" ${packageId || evidence.summary?.total ? "" : "disabled"}>继续包</button><button type="button" data-action="release-prompt" ${packageId || evidence.paths?.evidenceTemplate ? "" : "disabled"}>发布回填提示</button><button type="button" data-action="release-evidence" ${packageId || evidence.paths?.evidenceTemplate ? "" : "disabled"}>回填证据</button>`
+    ? `<button type="button" data-action="release-continuation" ${packageId || evidence.summary?.total ? "" : "disabled"}>继续包</button><button type="button" data-action="release-prompt" ${packageId || evidence.paths?.evidenceTemplate ? "" : "disabled"}>发布回填提示</button><button type="button" data-action="release-draft" ${packageId || evidence.paths?.evidenceTemplate ? "" : "disabled"}>回填草稿</button><button type="button" data-action="release-evidence" ${packageId || evidence.paths?.evidenceTemplate || evidence.status === "ready_to_ingest" ? "" : "disabled"}>正式回填</button>`
     : "";
   actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference" ${gateEvidenceArtifactFiles(evidence).length ? "" : "disabled"}>引用文件</button><button type="button" data-action="stage" ${includeCommands && gateEvidenceCommands(evidence).length ? "" : "disabled"}>加入命令</button><button type="button" data-action="stage-verification">排队验证</button><button type="button" data-action="blocker-prompt">阻塞提示</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button>${releaseActions}<button type="button" data-action="repair">直接修复</button>`;
   actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
@@ -13083,9 +13149,28 @@ function appendGateEvidenceCard(evidence = {}, {
       });
     }
   });
+  actions.querySelector("[data-action='release-draft']")?.addEventListener("click", async () => {
+    try {
+      const continuation = evidence.evidenceTemplate ? evidence : await appendRemotePublishContinuationCard(packageId);
+      await appendRemotePublishEvidenceDraftCard(packageId, continuation.evidenceTemplate || evidence.evidenceTemplate || null);
+    } catch (error) {
+      showToast(error.message);
+      appendGateFailureEvidence(error, {
+        title: "生成发布证据草稿失败",
+        kind: "release",
+        endpoint: "/api/remote-publish-evidence-draft",
+        request: { id: packageId || "", hasEvidenceTemplate: Boolean(evidence.evidenceTemplate) }
+      });
+    }
+  });
   actions.querySelector("[data-action='release-evidence']")?.addEventListener("click", async () => {
     try {
-      await appendRemotePublishEvidenceCard(packageId, evidence.evidenceTemplate || null);
+      if (evidence.status !== "ready_to_ingest" && evidence.evidenceTemplate) {
+        await appendRemotePublishEvidenceDraftCard(packageId, evidence.evidenceTemplate);
+        showToast("当前模板仍缺字段，已先生成回填草稿。");
+        return;
+      }
+      await appendRemotePublishEvidenceCard(packageId, evidence.evidenceTemplate || evidence.evidence || null);
     } catch (error) {
       showToast(error.message);
       appendGateFailureEvidence(error, {
