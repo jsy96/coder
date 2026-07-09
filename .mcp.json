@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "local-workspace": {
+      "command": "node",
+      "args": [
+        "scripts/mcp-local-workspace.js"
+      ],
+      "env": {
+        "FORGE_WORKSPACE": "${workspaceFolder}"
+      }
+    }
+  }
+}
+

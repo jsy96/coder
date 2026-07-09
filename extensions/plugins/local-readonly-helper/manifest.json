@@ -1,0 +1,60 @@
+{
+  "name": "local-readonly-helper",
+  "version": "0.1.0",
+  "type": "plugin",
+  "description": "Versioned local read-only helper tools for workspace inspection and debugging.",
+  "capabilities": [
+    "workspace-readiness",
+    "project-doctor",
+    "repo-map",
+    "mcp-readiness"
+  ],
+  "policy": {
+    "access": "read-only",
+    "scope": "currentWorkspace",
+    "requiresApproval": true
+  },
+  "tools": [
+    {
+      "name": "workspace_readiness",
+      "description": "Read startup, validation, Git, and delivery health for the current workspace.",
+      "mapsTo": "workspace_readiness",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "includeIgnored": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    {
+      "name": "project_doctor",
+      "description": "Run the local Project Doctor summary without writing files or remote state.",
+      "mapsTo": "project_doctor",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "deep": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    {
+      "name": "repo_map",
+      "description": "Read the current repository structure and symbol summary.",
+      "mapsTo": "repo_map",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ],
+  "trust": {
+    "reviewedBy": "local-project",
+    "reviewedAt": "2026-07-09",
+    "notes": "Versioned local manifest. Execution still requires explicit approval and only bridges to built-in read-only tools."
+  }
+}
+

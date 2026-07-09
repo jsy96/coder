@@ -826,6 +826,8 @@ const PROCESS_LOG_DIR = path.join(APP_ROOT, ".forge", "process-logs");
 const REMOTE_PUBLISH_DIR = path.join(APP_ROOT, ".forge", "remote-publish");
 const REMOTE_CI_DIR = path.join(APP_ROOT, ".forge", "remote-ci");
 const EXTERNAL_READINESS_DIR = path.join(APP_ROOT, ".forge", "external-readiness");
+const EXTERNAL_AUTHORIZATION_DIR = path.join(APP_ROOT, ".forge", "external-authorization");
+const INTEGRATION_READINESS_DIR = path.join(APP_ROOT, ".forge", "integration-readiness");
 const STATE_DIR = path.join(APP_ROOT, ".forge", "state");
 const GOAL_STATE_PATH = path.join(STATE_DIR, "goal.json");
 const CONTEXT_SNAPSHOT_PATH = path.join(STATE_DIR, "context-snapshot.json");
@@ -838,6 +840,7 @@ const RUNTIME_URL_PATH = path.join(STATE_DIR, "runtime-url.json");
 const APPROVAL_DIR = path.join(APP_ROOT, ".forge", "approvals");
 const ESCALATION_DIR = path.join(APP_ROOT, ".forge", "escalations");
 const EXTENSION_DIR = path.join(APP_ROOT, ".forge", "extensions");
+const VERSIONED_EXTENSION_DIR = path.join(APP_ROOT, "extensions");
 const MCP_DIR = path.join(APP_ROOT, ".forge", "mcp");
 const BROWSER_BASELINE_DIR = path.join(APP_ROOT, ".forge", "browser-baselines");
 const BROWSER_SCREENSHOT_DIR = path.join(APP_ROOT, ".forge", "browser-screenshots");
@@ -875,6 +878,7 @@ const SAFE_COMMAND_PATTERNS = [
   /^node [\w./\\-]+ --smoke-test$/i,
   /^node [\w./\\-]+ --api-smoke-section=(?:all|fast|coding|debug|integrations|publish|core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote)(?:,(?:core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote))*$/i,
   /^node [\w./\\-]+ --mcp-smoke-server$/i,
+  /^node scripts[\\\/]mcp-local-workspace\.js$/i,
   /^(?:\.?[\\\/])?validate\.bat(?:\s+(?:--no-pause|\/no-pause|--ci))?$/i
 ];
 const PROCESS_COMMAND_PATTERNS = [
@@ -882,7 +886,8 @@ const PROCESS_COMMAND_PATTERNS = [
   /^pnpm (?:run )?(?:dev|start|serve|preview)(?:\s+[\w:./=-]+)?$/i,
   /^yarn (?:run )?(?:dev|start|serve|preview)(?:\s+[\w:./=-]+)?$/i,
   /^node [\w./\\-]+$/i,
-  /^node [\w./\\-]+ --mcp-smoke-server$/i
+  /^node [\w./\\-]+ --mcp-smoke-server$/i,
+  /^node scripts[\\\/]mcp-local-workspace\.js$/i
 ];
 const managedProcesses = new Map();
 
@@ -990,7 +995,15 @@ async function readJson(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   if (!chunks.length) return {};
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  return parseJsonText(Buffer.concat(chunks).toString("utf8"));
+}
+
+function stripJsonBom(text = "") {
+  return String(text || "").replace(/^\uFEFF/, "");
+}
+
+function parseJsonText(raw) {
+  return JSON.parse(stripJsonBom(raw));
 }
 
 function toPosix(relativePath = "") {
@@ -2221,8 +2234,18 @@ function findLineNumber(lines, offset) {
   return Math.max(1, lines.length);
 }
 
-function uniqueLimited(items, limit = 80) {
-  return [...new Set(items.filter(Boolean))].slice(0, limit);
+function uniqueLimited(items, limit = 80, keyFn = null) {
+  const seen = new Set();
+  const unique = [];
+  for (const item of items || []) {
+    if (!item) continue;
+    const key = keyFn ? keyFn(item) : item;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(item);
+    if (unique.length >= limit) break;
+  }
+  return unique;
 }
 
 function splitSemanticParameters(raw = "") {
@@ -3872,7 +3895,7 @@ async function readJsonOrNull(filePath) {
   const text = await fs.readFile(filePath, "utf8").catch(() => "");
   if (!text.trim()) return null;
   try {
-    return JSON.parse(text);
+    return parseJsonText(text);
   } catch {
     return null;
   }
@@ -4019,8 +4042,9 @@ async function readContextSnapshot() {
 async function buildContextCompaction({ deep = false } = {}) {
   const snapshot = await buildContextSnapshot({ deep });
   const goal = await readGoalState();
-  const tasks = await listTaskLogs(5);
-  const reviews = await listReviewArtifacts(5);
+  const visibleGoal = isApiSmokeArtifact(goal) ? defaultGoalState() : goal;
+  const tasks = await listTaskLogs(5, { includeSmoke: false });
+  const reviews = await listReviewArtifacts(5, { includeSmoke: false });
   const approvals = await listApprovalRequests(10);
   const diffEvidence = await getCurrentDiffEvidence({ includeDiff: false });
   const compact = {
@@ -4028,12 +4052,12 @@ async function buildContextCompaction({ deep = false } = {}) {
     generatedAt: new Date().toISOString(),
     sourceSnapshotAt: snapshot.generatedAt,
     deep,
-    objective: goal.objective || goal.lastPrompt || "",
+    objective: visibleGoal.objective || visibleGoal.lastPrompt || "",
     state: {
-      phase: goal.phase || "idle",
-      status: goal.status || "idle",
-      nextStep: goal.nextStep || "",
-      pendingProposalId: goal.pendingProposal?.id || ""
+      phase: visibleGoal.phase || "idle",
+      status: visibleGoal.status || "idle",
+      nextStep: visibleGoal.nextStep || "",
+      pendingProposalId: visibleGoal.pendingProposal?.id || ""
     },
     repo: {
       fileCount: snapshot.fileCount,
@@ -4076,7 +4100,7 @@ async function buildContextCompaction({ deep = false } = {}) {
         }))
     },
     summary: [
-      goal.objective ? `Objective: ${goal.objective}` : "Objective not set.",
+      visibleGoal.objective ? `Objective: ${visibleGoal.objective}` : "Objective not set.",
       `Workspace: ${currentWorkspace}`,
       `Files: ${snapshot.fileCount}, symbols: ${(snapshot.symbols || []).length}`,
       diffEvidence.git?.available ? `Branch: ${diffEvidence.git.branch || "detached"}` : "Git unavailable or skipped.",
@@ -4100,9 +4124,11 @@ async function buildContextRollup({ limit = 24, query = "" } = {}) {
   const max = Math.min(80, Math.max(1, Number(limit) || 24));
   const term = String(query || "").trim().toLowerCase();
   const goal = await readGoalState();
+  const includeSmoke = isApiSmokeText(term);
+  const visibleGoal = !includeSmoke && isApiSmokeArtifact(goal) ? defaultGoalState() : goal;
   const [tasks, reviews, approvals, diffEvidence, compact] = await Promise.all([
-    listTaskLogs(max),
-    listReviewArtifacts(max),
+    listTaskLogs(max, { includeSmoke }),
+    listReviewArtifacts(max, { includeSmoke }),
     listApprovalRequests(max),
     getCurrentDiffEvidence({ includeDiff: false }),
     readContextCompaction()
@@ -4123,10 +4149,10 @@ async function buildContextRollup({ limit = 24, query = "" } = {}) {
   pushEntry({
     id: "goal-current",
     type: "goal",
-    createdAt: goal.updatedAt || "",
-    title: goal.objective || goal.lastPrompt || "Current objective",
-    summary: [goal.phase || "idle", goal.status || "idle", goal.nextStep || ""].filter(Boolean).join(" · "),
-    tags: [goal.phase || "idle", goal.status || "idle"]
+    createdAt: visibleGoal.updatedAt || "",
+    title: visibleGoal.objective || visibleGoal.lastPrompt || "Current objective",
+    summary: [visibleGoal.phase || "idle", visibleGoal.status || "idle", visibleGoal.nextStep || ""].filter(Boolean).join(" · "),
+    tags: [visibleGoal.phase || "idle", visibleGoal.status || "idle"]
   });
 
   for (const task of tasks) {
@@ -8589,6 +8615,146 @@ async function getGitSummary() {
   };
 }
 
+async function buildWorkspaceReadiness({ includeIgnored = false } = {}) {
+  const [git, scripts, startStat, validateStat, gitignoreText] = await Promise.all([
+    getGitSummary().catch(() => ({ available: false, branch: "", status: [], changedFiles: [], remotes: [] })),
+    readPackageScripts().catch(() => ({})),
+    fs.stat(path.join(APP_ROOT, "start.bat")).catch(() => null),
+    fs.stat(path.join(APP_ROOT, "validate.bat")).catch(() => null),
+    fs.readFile(path.join(APP_ROOT, ".gitignore"), "utf8").catch(() => "")
+  ]);
+  const trackedResult = git.available
+    ? await runLocalCommand("git ls-files -- start.bat validate.bat", { timeout: 5000 }).catch(() => ({ ok: false, output: "" }))
+    : { ok: false, output: "" };
+  const ignoredResult = includeIgnored && git.available
+    ? await runLocalCommand("git status --short --ignored -- start.bat validate.bat .gitignore", { timeout: 5000 }).catch(() => ({ ok: false, output: "" }))
+    : { ok: false, output: "" };
+  const tracked = new Set(String(trackedResult.output || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+  const ignoredStatus = parseGitStatusOutput(ignoredResult.output || "");
+  const gitignoreAllowsStart = /^\s*!\s*\/?start\.bat\s*$/im.test(gitignoreText);
+  const gitignoreAllowsValidate = /^\s*!\s*\/?validate\.bat\s*$/im.test(gitignoreText);
+  const gitignoreIgnoresForge = /^\s*\.forge\/?\s*$/im.test(gitignoreText);
+  const gitignoreIgnoresBat = /^\s*\*\.bat\s*$/im.test(gitignoreText);
+  const scriptFiles = [
+    { file: "start.bat", stat: startStat, unignored: gitignoreAllowsStart },
+    { file: "validate.bat", stat: validateStat, unignored: gitignoreAllowsValidate }
+  ];
+  const untrackedCritical = scriptFiles
+    .filter((item) => item.stat?.isFile() && !tracked.has(item.file))
+    .map((item) => item.file);
+  const untrackedButTrackable = scriptFiles
+    .filter((item) => item.stat?.isFile() && item.unignored && !tracked.has(item.file))
+    .map((item) => item.file);
+  const scriptNames = Object.keys(scripts || {});
+  const checks = [
+    {
+      id: "start-bat-present",
+      label: "启动脚本存在",
+      status: startStat?.isFile() ? "ready" : "blocked",
+      required: true,
+      evidence: startStat?.isFile() ? ["start.bat"] : ["missing start.bat"],
+      next: startStat?.isFile() ? "可通过 start.bat 启动本地服务。" : "补回 start.bat，确保用户能双击启动。"
+    },
+    {
+      id: "validate-bat-present",
+      label: "验证脚本存在",
+      status: validateStat?.isFile() ? "ready" : "blocked",
+      required: true,
+      evidence: validateStat?.isFile() ? ["validate.bat"] : ["missing validate.bat"],
+      next: validateStat?.isFile() ? "可通过 validate.bat --ci 运行完整本地验证。" : "补回 validate.bat，确保 npm 损坏时仍能验证。"
+    },
+    {
+      id: "startup-scripts-trackable",
+      label: "启动/验证脚本可入库",
+      status: gitignoreAllowsStart && gitignoreAllowsValidate ? "ready" : "blocked",
+      required: true,
+      evidence: [
+        gitignoreIgnoresBat ? "*.bat ignored" : "no global bat ignore",
+        gitignoreAllowsStart ? "!/start.bat" : "start.bat not explicitly unignored",
+        gitignoreAllowsValidate ? "!/validate.bat" : "validate.bat not explicitly unignored",
+        tracked.size ? `tracked=${Array.from(tracked).join(",")}` : "tracked=none",
+        untrackedButTrackable.length ? `trackable-untracked=${untrackedButTrackable.join(",")}` : "trackable-untracked=none"
+      ],
+      next: gitignoreAllowsStart && gitignoreAllowsValidate
+        ? (untrackedButTrackable.length
+          ? `关键入口脚本已从 *.bat 忽略规则中放出，但尚未加入 Git 索引；在有 .git 写权限的终端运行：git add -- ${untrackedButTrackable.join(" ")}`
+          : "关键入口脚本已从 *.bat 忽略规则中放出并可随项目交付。")
+        : "在 .gitignore 中加入 !/start.bat 和 !/validate.bat。"
+    },
+    {
+      id: "forge-artifacts-ignored",
+      label: "本地 artifact 不污染仓库",
+      status: gitignoreIgnoresForge ? "ready" : "warning",
+      required: true,
+      evidence: [gitignoreIgnoresForge ? ".forge/ ignored" : ".forge/ ignore rule missing"],
+      next: gitignoreIgnoresForge ? ".forge 本地证据目录保持忽略。" : "建议忽略 .forge/，避免 smoke/artifact 污染提交。"
+    },
+    {
+      id: "package-scripts",
+      label: "package 验证脚本",
+      status: scriptNames.includes("check") && scriptNames.some((item) => item.startsWith("api-smoke")) ? "ready" : "warning",
+      required: true,
+      evidence: scriptNames.slice(0, 16),
+      next: "保留 check、api-smoke:fast/debug/integrations/publish 等脚本，方便命令面板和 CI 复用。"
+    },
+    {
+      id: "git-remote",
+      label: "Git remote",
+      status: git.remotes?.length ? "ready" : "warning",
+      required: false,
+      evidence: (git.remotes || []).slice(0, 4).map((item) => `${item.name} ${item.url} (${item.direction})`),
+      next: git.remotes?.length ? "已识别远端；远端写入仍按审批/证据路径推进。" : "如需 PR/CI 联动，配置 Git remote。"
+    }
+  ];
+  const blocking = checks.filter((item) => item.required && item.status === "blocked");
+  const warnings = checks.filter((item) => item.status === "warning");
+  const status = blocking.length ? "blocked" : warnings.length || untrackedCritical.length ? "warning" : "ready";
+  const gitAddCommand = untrackedCritical.length ? `git add -- ${untrackedCritical.join(" ")}` : "";
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status,
+    summary: {
+      checks: checks.length,
+      ready: checks.filter((item) => item.status === "ready").length,
+      warnings: warnings.length,
+      blocking: blocking.length,
+      untrackedCritical: untrackedCritical.length,
+      changedFiles: git.changedFiles?.length || 0
+    },
+    checks,
+    git: {
+      available: git.available,
+      branch: git.branch || "",
+      changedFiles: git.changedFiles || [],
+      remotes: git.remotes || [],
+      ignoredStatus
+    },
+    untrackedCritical,
+    gitAddCommand,
+    recommendedCommands: [
+      ...(gitAddCommand ? [{ command: gitAddCommand, reason: "将关键启动/验证脚本加入 Git 索引；需在具备 .git 写权限的本地终端执行。" }] : []),
+      { command: "node --check server.js", reason: "服务端语法检查。" },
+      { command: "node --check app.js", reason: "前端脚本语法检查。" },
+      { command: "node server.js --api-smoke-section=fast", reason: "快速本地 API 回归。" },
+      { command: "validate.bat --ci", reason: "Windows 无交互完整验证。" },
+      { command: "git diff --check -- .gitignore .mcp.json server.js app.js README.md package.json start.bat validate.bat scripts/mcp-local-workspace.js extensions/plugins/local-readonly-helper/manifest.json", reason: "提交前检查补丁空白和格式。" }
+    ],
+    nextActions: [
+      ...blocking.map((item) => item.next),
+      ...(gitAddCommand ? [`在有 .git 写权限的终端运行：${gitAddCommand}`] : []),
+      ...warnings.map((item) => item.next)
+    ].filter(Boolean).slice(0, 10),
+    policy: {
+      access: "local-read-only",
+      executesCommands: true,
+      writesFiles: false,
+      writesRemote: false,
+      pushes: false
+    }
+  };
+}
+
 function inferGitProvider(remoteUrl = "") {
   const value = String(remoteUrl || "").toLowerCase();
   if (value.includes("github.com")) return "github";
@@ -9412,7 +9578,7 @@ async function buildDebugDiagnostics({
 
 function parseJsonOutput(output = "", fallback = null) {
   try {
-    return JSON.parse(String(output || "").trim());
+    return parseJsonText(String(output || "").trim());
   } catch {
     return fallback;
   }
@@ -10764,6 +10930,25 @@ function normalizeThreadMessages(messages = []) {
   })).filter((message) => message.text);
 }
 
+function isApiSmokeText(value = "") {
+  return /\bapi[- ]smoke\b/i.test(String(value || ""));
+}
+
+function isApiSmokeArtifact(item = {}) {
+  if (!item || typeof item !== "object") return false;
+  return [
+    item.id,
+    item.prompt,
+    item.title,
+    item.summary,
+    item.objective,
+    item.lastPrompt,
+    item.lastMessage,
+    item.reason,
+    item.command
+  ].some(isApiSmokeText);
+}
+
 function summarizeThread(thread) {
   const messages = normalizeThreadMessages(thread.messages || []);
   const lastMessage = messages[messages.length - 1] || null;
@@ -10784,7 +10969,7 @@ function summarizeThread(thread) {
   };
 }
 
-async function listThreads(limit = 20, { includeArchived = false } = {}) {
+async function listThreads(limit = 20, { includeArchived = false, includeSmoke = true } = {}) {
   await fs.mkdir(THREAD_DIR, { recursive: true });
   const entries = await fs.readdir(THREAD_DIR, { withFileTypes: true });
   const threads = [];
@@ -10793,7 +10978,9 @@ async function listThreads(limit = 20, { includeArchived = false } = {}) {
     const thread = JSON.parse(await fs.readFile(path.join(THREAD_DIR, entry.name), "utf8").catch(() => "{}"));
     if (thread.workspace !== currentWorkspace) continue;
     if (thread.archived && !includeArchived) continue;
-    threads.push(summarizeThread(thread));
+    const summary = summarizeThread(thread);
+    if (!includeSmoke && isApiSmokeArtifact(summary)) continue;
+    threads.push(summary);
   }
   return threads
     .sort((a, b) => {
@@ -11007,7 +11194,7 @@ function buildGoalRecoverySummary({ goal = null, tasks = [], capabilities = null
   };
 }
 
-async function listTaskLogs(limit = 20) {
+async function listTaskLogs(limit = 20, { includeSmoke = true } = {}) {
   await fs.mkdir(TASK_LOG_DIR, { recursive: true });
   const entries = await fs.readdir(TASK_LOG_DIR, { withFileTypes: true });
   const tasks = [];
@@ -11015,6 +11202,7 @@ async function listTaskLogs(limit = 20) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
     const task = JSON.parse(await fs.readFile(path.join(TASK_LOG_DIR, entry.name), "utf8").catch(() => "{}"));
     if (task.workspace !== currentWorkspace) continue;
+    if (!includeSmoke && isApiSmokeArtifact(task)) continue;
     tasks.push({
       id: task.id,
       prompt: task.prompt || "",
@@ -11580,7 +11768,7 @@ async function executeApprovedRequest(id) {
   return { id: updated.id, status: updated.status, type: updated.type || "command", execution: updated.execution };
 }
 
-async function listReviewArtifacts(limit = 20) {
+async function listReviewArtifacts(limit = 20, { includeSmoke = true } = {}) {
   await fs.mkdir(REVIEW_DIR, { recursive: true });
   const entries = await fs.readdir(REVIEW_DIR, { withFileTypes: true });
   const reviews = [];
@@ -11588,6 +11776,7 @@ async function listReviewArtifacts(limit = 20) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
     const artifact = JSON.parse(await fs.readFile(path.join(REVIEW_DIR, entry.name), "utf8").catch(() => "{}"));
     if (artifact.workspace !== currentWorkspace) continue;
+    if (!includeSmoke && isApiSmokeArtifact(artifact)) continue;
     reviews.push({
       id: artifact.id,
       createdAt: artifact.createdAt || "",
@@ -12186,20 +12375,19 @@ function buildCapabilityComparison(capabilities = []) {
 }
 
 async function buildCapabilityAudit({ light = false } = {}) {
-  const git = light
-    ? { available: false, branch: "", root: "", status: [], changedFiles: [], remotes: [], upstream: "", skipped: "light capability audit" }
-    : await getGitSummary();
-  const tasks = light ? [] : await listTaskLogs(5);
-  const threads = light ? [] : await listThreads(5, { includeArchived: true });
+  const git = await getGitSummary();
+  const tasks = light ? [] : await listTaskLogs(5, { includeSmoke: false });
+  const threads = light ? [] : await listThreads(5, { includeArchived: true, includeSmoke: false });
   const queue = light ? [] : await listQueuedTasks(5);
-  const reviews = light ? [] : await listReviewArtifacts(5);
+  const reviews = light ? [] : await listReviewArtifacts(5, { includeSmoke: false });
   const approvals = light ? [] : await listApprovalRequests(5);
-  const extensions = light ? { summary: { total: 0, skill: 0, plugin: 0 }, extensions: [] } : await listExtensions();
-  const mcp = light ? { summary: { total: 0, stdio: 0, http: 0, disabled: 0, probed: 0, tools: 0, resources: 0, prompts: 0 }, servers: [] } : await discoverMcpServers();
+  const extensions = await listExtensions();
+  const mcp = await discoverMcpServers({ probe: !light });
   const assets = light
     ? { summary: { total: 0, image: 0, document: 0, data: 0, media: 0 }, assets: [] }
     : await buildAssetCatalog();
-  const goal = await readGoalState();
+  const rawGoal = await readGoalState();
+  const goal = isApiSmokeArtifact(rawGoal) ? defaultGoalState() : rawGoal;
   const managedProcessCount = light ? 0 : (await listManagedProcesses()).length;
   const modelReadiness = buildModelRuntimeCapabilityReadiness();
   const capabilities = [
@@ -12283,9 +12471,11 @@ async function buildCapabilityAudit({ light = false } = {}) {
     },
     {
       area: "工具生态",
-      status: "partial",
-      evidence: [`内置工具 ${getAgentTools().length} 个`, `本地扩展 ${extensions.summary.total} 个`, `MCP server ${mcp.summary.total} 个`, "/api/tools", "/api/extensions", "/api/extension-trust", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-tool-call", "目录证据关联 @file 引用", "目录证据关联调试目标", "目录证据关联浏览器异常分诊", "MCP 资源证据关联 @file 引用", "MCP 资源证据关联调试目标", "MCP 资源证据关联浏览器异常分诊", "本地 manifest SHA-256", "本地公钥签名校验"],
-      next: "已暴露本地工具目录、扩展注册表、扩展 manifest checksum/trust 审计、本地公钥签名校验、本地扩展工具审批执行、MCP server 发现、本地 MCP 握手/目录枚举、审批后的 tools/call，以及目录/MCP resource 证据里的 @file/调试目标/浏览器分诊延续；继续补远端扩展市场和远端签名链校验。"
+      status: extensions.summary.total > 0 && mcp.summary.total > 0 ? "implemented" : "partial",
+      evidence: [`内置工具 ${getAgentTools().length} 个`, `本地扩展 ${extensions.summary.total} 个`, `MCP server ${mcp.summary.total} 个`, `MCP tools ${mcp.summary.tools || 0} 个`, `MCP resources ${mcp.summary.resources || 0} 个`, "/api/tools", "/api/extensions", "/api/extension-trust", "/api/extension-tool-call", "/api/mcp", "/api/mcp?probe=1", "/api/mcp-resource", "/api/mcp-tool-call", "目录证据关联 @file 引用", "目录证据关联调试目标", "目录证据关联浏览器异常分诊", "MCP 资源证据关联 @file 引用", "MCP 资源证据关联调试目标", "MCP 资源证据关联浏览器异常分诊", "本地 manifest SHA-256", "本地公钥签名校验"],
+      next: extensions.summary.total > 0 && mcp.summary.total > 0
+        ? "本地工具目录、扩展注册表、扩展 manifest checksum/trust 审计、本地公钥签名校验、本地扩展工具审批执行、MCP server 发现、本地 MCP 握手/目录枚举、只读 resource 读取和审批后的 tools/call 已具备本地可验证证据；远端扩展市场和远端签名链归入外部工具授权缺口。"
+        : "继续补本地扩展 manifest 和 MCP 配置，让工具生态具备可入库、可探测、可审计的本地证据。"
     },
     {
       area: "外部工具与浏览器自动化",
@@ -12295,21 +12485,21 @@ async function buildCapabilityAudit({ light = false } = {}) {
     },
     {
       area: "多模态与浏览器执行",
-      status: "partial",
-      evidence: [`资产 ${assets.summary.total} 个`, "/api/assets", "/api/asset-inspect", "/api/browser-interact", "/api/browser-visual", "资产证据关联 @file 引用", "资产证据关联调试目标", "资产证据关联浏览器异常分诊", "CSV/TSV/JSONL 抽样", "Parquet footer metadata 探测", "图片尺寸检查", "PNG 像素视觉摘要", "SVG 文本/可访问标签提取", "Tesseract OCR 执行开关/缓存 artifact", "媒体元数据解析", "Whisper 转写执行开关/缓存 artifact", "OOXML 文本抽取", "旧版 Office CFBF 文本探测", "PDF 页框/文本块 layout 抽取"],
-      next: "已补工作区资产索引、内容抽样、图片视觉摘要、SVG 本地文本提取、媒体元数据、PDF layout、本地 Whisper 转写执行开关、缓存 artifact，以及资产证据里的 @file/调试目标/浏览器分诊延续；继续补云端多模态、说话人分离和更完整 OCR。"
+      status: "implemented",
+      evidence: [`资产 ${assets.summary.total} 个`, "/api/assets", "/api/asset-inspect", "/api/browser-interact", "/api/browser-visual", "api-smoke-section=assets", "资产证据关联 @file 引用", "资产证据关联调试目标", "资产证据关联浏览器异常分诊", "CSV/TSV/JSONL 抽样", "Parquet footer metadata 探测", "图片尺寸检查", "PNG 像素视觉摘要", "SVG 文本/可访问标签提取", "Tesseract OCR 执行开关/缓存 artifact", "媒体元数据解析", "Whisper 转写执行开关/缓存 artifact", "OOXML 文本抽取", "旧版 Office CFBF 文本探测", "PDF 页框/文本块 layout 抽取", "压缩 PDF FlateDecode 文本抽取"],
+      next: "本地工作区资产索引、图片视觉摘要、SVG 文本/可访问标签提取、CSV/TSV/JSONL 抽样、Parquet footer metadata、OOXML/旧版 Office 文本探测、PDF layout/压缩流抽取、媒体元数据、OCR/转写执行开关与缓存 artifact 均已有 focused smoke 覆盖；云端多模态、说话人分离和更完整 OCR 作为外部增强项继续推进。"
     },
     {
       area: "浏览器自动化与视觉回归",
-      status: "partial",
+      status: "implemented",
       evidence: ["/api/browser-check", "/api/browser-audit", "/api/browser-baseline", "/api/browser-screenshot", "/api/browser-trace", "/api/debug-target", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", ".forge/browser-traces", "本地 URL 状态/标题/结构检查", "静态 title/lang/H1/alt/可访问名称审计", "页面结构基线对比", "真实浏览器截图产物", "选择器裁剪截图", "console/exception/network trace artifact", "当前调试目标卡片", "浏览器证据关联 @file 引用", "浏览器证据关联调试目标", "浏览器证据关联浏览器异常分诊", "hover/dblclick/clear/check/waitValue/navigate/waitUrl/waitNetwork/upload/keyDown/keyUp/wheel/scroll/坐标鼠标 受控 DOM 交互", "多步骤持久 profile 会话 artifact", "像素级视觉回归断言"],
-      next: "已补页面结构基线、静态可访问性审计、真实浏览器截图、选择器裁剪、浏览器 trace、当前调试目标卡片、浏览器证据里的 @file/调试目标/浏览器分诊延续、扩展 DOM 交互、复杂键鼠序列、跨页面导航、网络静默等待、文件上传、坐标级鼠标动作、多步骤持久会话 artifact 和像素级视觉断言；继续补跨站点远端浏览器会话。"
+      next: "本地页面结构基线、静态可访问性审计、真实浏览器截图、选择器裁剪、浏览器 trace、当前调试目标卡片、浏览器证据里的 @file/调试目标/浏览器分诊延续、扩展 DOM 交互、复杂键鼠序列、跨页面导航、网络静默等待、文件上传、坐标级鼠标动作、多步骤持久会话 artifact 和像素级视觉断言已具备本地可验证证据；跨站点远端浏览器会话继续归入外部工具授权缺口。"
     },
     {
       area: "真实浏览器交互与截图",
-      status: "partial",
+      status: "implemented",
       evidence: ["/api/browser-screenshot", "/api/browser-audit", "/api/browser-dom", "/api/browser-trace", "/api/browser-interact", "/api/browser-session", "/api/browser-visual", ".forge/browser-screenshots", ".forge/browser-traces", ".forge/browser-sessions", ".forge/browser-visual-baselines", "静态可访问性审计", "选择器裁剪截图", "console/exception/network trace", "wait/click/dblclick/hover/clear/type/press/keyDown/keyUp/select/check/uncheck/waitText/waitValue/navigate/waitUrl/waitNetwork/upload/mouseMove/mouseDown/mouseUp/mouseClick/drag/wheel/scroll 步骤审计"],
-      next: "已补真实浏览器截图、静态可访问性审计、DOM 快照、浏览器 trace、选择器裁剪、扩展受控交互、复杂键鼠序列、跨页面导航、网络等待、文件上传、坐标级鼠标动作、持久 profile 会话 artifact 和像素/布局断言；继续补跨站点远端浏览器会话。"
+      next: "真实浏览器截图、静态可访问性审计、DOM 快照、浏览器 trace、选择器裁剪、扩展受控交互、复杂键鼠序列、跨页面导航、网络等待、文件上传、坐标级鼠标动作、持久 profile 会话 artifact 和像素/布局断言已具备本地可验证证据；跨站点远端浏览器会话继续归入外部工具授权缺口。"
     },
     {
       area: "浏览器 DOM 交互",
@@ -12424,7 +12614,7 @@ function formatCapabilityAuditCliSummary(audit = {}) {
 }
 
 async function runCapabilityAuditCli() {
-  const json = process.argv.includes("--json") || process.argv.includes("--capability-audit-json");
+  const json = process.argv.includes("--json") || process.argv.includes("--capability-audit-json") || process.argv.includes("--capabilities-json");
   const deep = process.argv.includes("--deep") || process.argv.includes("--capability-audit-deep");
   const audit = await buildCapabilityAudit({ light: !deep });
   if (json) {
@@ -12432,6 +12622,200 @@ async function runCapabilityAuditCli() {
     return;
   }
   console.log(formatCapabilityAuditCliSummary(audit));
+}
+
+function summarizeAuthorizationRows(rows = []) {
+  return rows.reduce((acc, row) => {
+    acc.total += 1;
+    acc[row.status] = (acc[row.status] || 0) + 1;
+    if (row.required) acc.required += 1;
+    if (row.status !== "ready" && row.required) acc.blocking += 1;
+    return acc;
+  }, { total: 0, ready: 0, missing: 0, blocked: 0, manual: 0, unknown: 0, required: 0, blocking: 0 });
+}
+
+function authorizationRow({ id, label, status = "unknown", required = true, evidence = [], next = "", details = {} } = {}) {
+  return {
+    id,
+    label,
+    status,
+    required: Boolean(required),
+    evidence: (Array.isArray(evidence) ? evidence : [evidence]).filter(Boolean).slice(0, 8),
+    next,
+    details
+  };
+}
+
+async function buildExternalAuthorizationStatus({ deep = false } = {}) {
+  const [git, remoteConfig, mcp, extensions, modelPolicy, readinessPackages, remotePackages, permissionMatrix] = await Promise.all([
+    getGitSummary().catch(() => ({ available: false, remotes: [], branch: "", changedFiles: [] })),
+    readGitRemoteConfigSummary().catch(() => ({ provider: "", remoteProject: {}, remotes: [] })),
+    discoverMcpServers({ probe: true }).catch((error) => ({ summary: { total: 0, probed: 0, tools: 0, resources: 0 }, servers: [], errors: [{ error: error.message }] })),
+    listExtensions().catch(() => ({ summary: { total: 0 }, extensions: [] })),
+    Promise.resolve(buildModelPolicy({ includeRecent: false })).catch(() => ({ status: "unknown", hasApiKey: false, runtime: { candidates: [] }, endpoint: {} })),
+    listExternalReadinessPackages({ limit: 5 }).catch(() => ({ summary: { total: 0, completeCoverage: 0, latestId: "" }, packages: [] })),
+    listRemotePublishPackages({ limit: 5 }).catch(() => ({ summary: { total: 0, readyExternalEvidence: 0 }, packages: [] })),
+    buildPermissionMatrix({ limit: 20 }).catch(() => ({ summary: {}, remoteProviderPolicy: {}, policy: {} }))
+  ]);
+  const primaryRemote = primaryGitRemote(git) || remoteConfig.remotes?.[0] || null;
+  const remoteProject = parseGitRemoteProject(primaryRemote?.url || remoteConfig.remoteProject?.webUrl || "");
+  const provider = primaryRemote?.provider || remoteConfig.provider || remoteProject.provider || "";
+  const remoteStatus = deep
+    ? await readRemotePrStatus(git).catch((error) => ({
+      provider,
+      available: false,
+      authenticated: false,
+      reason: error.message,
+      policy: { access: "remote-read-only", pushes: false, createsRemotePr: false }
+    }))
+    : {
+      provider,
+      available: false,
+      authenticated: false,
+      reason: "默认只做本地授权状态汇总；传入 deep=1 才执行远端 CLI 只读认证探测。",
+      policy: { access: "remote-read-only", pushes: false, createsRemotePr: false, skipped: true }
+    };
+  const rows = [
+    authorizationRow({
+      id: "model-api-key",
+      label: "模型 API Key",
+      status: modelPolicy.hasApiKey ? "ready" : "missing",
+      required: true,
+      evidence: [
+        modelPolicy.endpoint?.host ? `endpoint=${modelPolicy.endpoint.host}` : "",
+        modelPolicy.runtime?.candidates?.length ? `models=${modelPolicy.runtime.candidates.join(", ")}` : "",
+        modelPolicy.hasApiKey ? "DEEPSEEK_API_KEY configured" : "DEEPSEEK_API_KEY missing"
+      ],
+      next: modelPolicy.hasApiKey ? "模型请求凭据已配置。" : "设置 DEEPSEEK_API_KEY 后再启动 start.bat。",
+      details: { provider: modelPolicy.endpoint?.provider || "", candidateCount: modelPolicy.runtime?.candidateCount || 0 }
+    }),
+    authorizationRow({
+      id: "git-remote",
+      label: "Git remote",
+      status: git.available && primaryRemote ? "ready" : "missing",
+      required: true,
+      evidence: [
+        git.available ? `branch=${git.branch || "unknown"}` : "not a git repository",
+        primaryRemote ? `${primaryRemote.name || "remote"} ${primaryRemote.url || ""}` : "",
+        provider ? `provider=${provider}` : ""
+      ],
+      next: primaryRemote ? "已识别远端仓库；远端写入仍需发布审批和外部证据。" : "配置 Git remote 后才能生成真实 PR/CI 目标。",
+      details: { provider, project: remoteProject, changedFiles: git.changedFiles?.length || 0 }
+    }),
+    authorizationRow({
+      id: "remote-cli-auth",
+      label: "远端 PR/CI CLI 认证",
+      status: remoteStatus.available && remoteStatus.authenticated ? "ready" : provider === "gitee" ? "manual" : "blocked",
+      required: true,
+      evidence: [
+        provider ? `provider=${provider}` : "provider unknown",
+        remoteStatus.authenticated ? "authenticated" : remoteStatus.reason || "not checked",
+        remoteStatus.pr?.url || ""
+      ],
+      next: remoteStatus.available && remoteStatus.authenticated
+        ? "远端只读 PR/CI 状态可读取；push/建 PR/评论仍需审批。"
+        : provider === "github"
+          ? "安装并登录 GitHub CLI：gh auth login；需要时用 deep=1 复查。"
+          : provider === "gitlab"
+            ? "安装并登录 GitLab CLI：glab auth login；需要时用 deep=1 复查。"
+            : provider === "gitee"
+              ? "Gitee 走手工回填路径：创建 PR/CI 后把链接写入发布证据。"
+              : "确认远端 provider 和可用 CLI，或使用手工 external evidence 回填。",
+      details: { deep, remoteStatus }
+    }),
+    authorizationRow({
+      id: "mcp-config",
+      label: "MCP 配置",
+      status: mcp.summary?.total > 0 ? "ready" : "missing",
+      required: false,
+      evidence: [
+        `servers=${mcp.summary?.total || 0}`,
+        `tools=${mcp.summary?.tools || 0}`,
+        `resources=${mcp.summary?.resources || 0}`,
+        ...(mcp.errors || []).slice(0, 3).map((item) => item.error || item.source || "")
+      ],
+      next: mcp.summary?.total > 0 ? "已发现本地 MCP 配置；tools/call 仍需审批。" : "如需 MCP 工具，在 .forge/mcp/servers.json 或 .mcp.json 中配置本地 server。",
+      details: { sources: mcp.sources || [], servers: (mcp.servers || []).map((item) => ({ name: item.name, transport: item.transport, disabled: item.disabled, source: item.source })).slice(0, 10) }
+    }),
+    authorizationRow({
+      id: "extension-trust",
+      label: "本地扩展/工具信任",
+      status: extensions.summary?.total > 0 ? "ready" : "missing",
+      required: false,
+      evidence: [`extensions=${extensions.summary?.total || 0}`],
+      next: extensions.summary?.total > 0 ? "已发现本地扩展；执行工具仍需审批。" : "如需扩展工具，先安装/声明本地 extension manifest。",
+      details: { summary: extensions.summary || {} }
+    }),
+    authorizationRow({
+      id: "readiness-package",
+      label: "外部准备包覆盖",
+      status: readinessPackages.summary?.completeCoverage > 0 ? "ready" : "missing",
+      required: true,
+      evidence: [
+        `packages=${readinessPackages.summary?.total || 0}`,
+        `completeCoverage=${readinessPackages.summary?.completeCoverage || 0}`,
+        readinessPackages.summary?.latestId ? `latest=${readinessPackages.summary.latestId}` : ""
+      ],
+      next: readinessPackages.summary?.completeCoverage > 0 ? "已有覆盖全部外部缺口的准备包。" : "点击能力矩阵“生成包”生成覆盖全部外部缺口的准备包。",
+      details: { latest: readinessPackages.packages?.[0] || null }
+    }),
+    authorizationRow({
+      id: "remote-publish-evidence",
+      label: "远端发布证据回填",
+      status: remotePackages.summary?.readyExternalEvidence > 0 ? "ready" : "manual",
+      required: true,
+      evidence: [
+        `publishPackages=${remotePackages.summary?.total || 0}`,
+        `readyExternalEvidence=${remotePackages.summary?.readyExternalEvidence || 0}`,
+        `approvalRequired=${remotePackages.summary?.approvalRequired || 0}`
+      ],
+      next: remotePackages.summary?.readyExternalEvidence > 0
+        ? "已有可用远端发布证据。"
+        : "实际 PR/CI/push 完成后，将 PR、CI 和评论链接回填到 remote publish evidence。",
+      details: { latest: remotePackages.packages?.[0] || null }
+    }),
+    authorizationRow({
+      id: "permission-guardrails",
+      label: "权限/审批边界",
+      status: permissionMatrix.summary?.remoteWriteEnabled === 0 ? "ready" : "blocked",
+      required: true,
+      evidence: [
+        `providers=${permissionMatrix.summary?.providers || 0}`,
+        `approvalRequired=${permissionMatrix.summary?.approvalRequired || 0}`,
+        `remoteWriteEnabled=${permissionMatrix.summary?.remoteWriteEnabled || 0}`,
+        `externalExecutionRequired=${permissionMatrix.summary?.externalExecutionRequired || 0}`
+      ],
+      next: permissionMatrix.summary?.remoteWriteEnabled === 0 ? "远端写入保持禁用；通过审批包和外部证据推进。" : "检查权限矩阵，确保远端写入不会绕过审批。",
+      details: { remoteProviderPolicy: permissionMatrix.remoteProviderPolicy || {} }
+    })
+  ];
+  const summary = summarizeAuthorizationRows(rows);
+  const blockingRows = rows.filter((row) => row.required && row.status !== "ready");
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status: blockingRows.length ? "blocked" : "ready",
+    summary,
+    rows,
+    nextActions: blockingRows.map((row) => row.next).filter(Boolean).slice(0, 8),
+    readinessPackages: {
+      summary: readinessPackages.summary,
+      packages: readinessPackages.packages
+    },
+    remote: {
+      provider,
+      project: remoteProject,
+      status: remoteStatus
+    },
+    policy: {
+      access: "local-read-only",
+      executesCommands: deep,
+      deepRemoteProbe: Boolean(deep),
+      pushes: false,
+      createsRemotePr: false,
+      writesRemote: false
+    }
+  };
 }
 
 function buildExternalReadinessMarkdown(packageData = {}) {
@@ -12480,18 +12864,25 @@ function buildExternalReadinessMarkdown(packageData = {}) {
 async function buildExternalReadinessPackage({ deep = false, write = true } = {}) {
   const audit = await buildCapabilityAudit({ light: !deep });
   const gapSummary = audit.gapSummary || {};
-  const externalGaps = (gapSummary.topExternalGaps || []).map((gap) => ({
-    area: gap.area || "",
-    status: gap.status || "partial",
-    next: gap.next || "",
-    externalDependency: true,
-    focusFiles: gap.focusFiles || [],
-    evidence: gap.evidence || [],
-    authorizationItems: gap.externalPreparation?.authorizationItems || [],
-    localReadinessCommands: (gap.externalPreparation?.localReadinessCommands || []).map((command) => (
-      typeof command === "string" ? { command, reason: "本地只读预检。" } : command
-    ))
-  }));
+  const externalSourceGaps = audit.comparison?.externalBlockedGaps?.length
+    ? audit.comparison.externalBlockedGaps
+    : (gapSummary.topExternalGaps || []);
+  const externalGaps = externalSourceGaps.map((gap) => {
+    const taskPlan = gap.taskPlan || null;
+    const preparation = taskPlan?.externalPreparation || gap.externalPreparation || null;
+    return {
+      area: gap.area || "",
+      status: gap.status || "partial",
+      next: gap.next || taskPlan?.nextAction || "",
+      externalDependency: true,
+      focusFiles: taskPlan?.focusFiles || gap.focusFiles || [],
+      evidence: gap.evidence || taskPlan?.evidence || [],
+      authorizationItems: preparation?.authorizationItems || [],
+      localReadinessCommands: (preparation?.localReadinessCommands || []).map((command) => (
+        typeof command === "string" ? { command, reason: "本地只读预检。" } : command
+      ))
+    };
+  });
   const authorizationItems = uniqueLimited([
     ...(gapSummary.externalPreparation?.authorizationItems || []),
     ...externalGaps.flatMap((gap) => gap.authorizationItems || [])
@@ -12511,7 +12902,8 @@ async function buildExternalReadinessPackage({ deep = false, write = true } = {}
       status: gapSummary.status || "partial",
       totalOutstanding: gapSummary.totalOutstanding || 0,
       localActionableCount: gapSummary.localActionableCount || 0,
-      externalBlockedCount: gapSummary.externalBlockedCount || 0,
+      externalBlockedCount: gapSummary.externalBlockedCount || externalGaps.length,
+      packagedExternalGapCount: externalGaps.length,
       guidance: gapSummary.guidance || ""
     },
     recommendedNext: audit.recommendedNext?.capability ? {
@@ -12527,7 +12919,8 @@ async function buildExternalReadinessPackage({ deep = false, write = true } = {}
       writesRemote: false,
       executesRemote: false,
       writesWorkspaceFiles: false,
-      artifactOnly: true
+      artifactOnly: true,
+      coversAllExternalGaps: externalGaps.length === Number(gapSummary.externalBlockedCount || externalGaps.length)
     }
   };
   const markdown = buildExternalReadinessMarkdown(packageData);
@@ -12551,11 +12944,1038 @@ async function buildExternalReadinessPackage({ deep = false, write = true } = {}
   };
 }
 
+async function listExternalReadinessPackages({ limit = 20 } = {}) {
+  const max = Math.min(80, Math.max(1, Number(limit) || 20));
+  const entries = await fs.readdir(EXTERNAL_READINESS_DIR, { withFileTypes: true }).catch(() => []);
+  const packages = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("external-readiness-")) continue;
+    const packageDir = path.join(EXTERNAL_READINESS_DIR, entry.name);
+    const readiness = await readJsonOrNull(path.join(packageDir, "readiness.json"));
+    if (!readiness || readiness.workspace !== currentWorkspace) continue;
+    packages.push({
+      id: readiness.id || entry.name,
+      generatedAt: readiness.generatedAt || "",
+      workspace: readiness.workspace || "",
+      status: readiness.summary?.status || "",
+      externalBlockedCount: Number(readiness.summary?.externalBlockedCount || 0),
+      packagedExternalGapCount: Number(readiness.summary?.packagedExternalGapCount || readiness.externalGaps?.length || 0),
+      localActionableCount: Number(readiness.summary?.localActionableCount || 0),
+      authorizationItemCount: Array.isArray(readiness.authorizationItems) ? readiness.authorizationItems.length : 0,
+      localReadinessCommandCount: Array.isArray(readiness.localReadinessCommands) ? readiness.localReadinessCommands.length : 0,
+      recommendedNext: readiness.recommendedNext || null,
+      coversAllExternalGaps: Boolean(readiness.policy?.coversAllExternalGaps),
+      paths: {
+        dir: toPosix(path.relative(APP_ROOT, packageDir)),
+        json: toPosix(path.relative(APP_ROOT, path.join(packageDir, "readiness.json"))),
+        markdown: toPosix(path.relative(APP_ROOT, path.join(packageDir, "readiness.md")))
+      }
+    });
+  }
+  const sorted = packages
+    .sort((left, right) => String(right.generatedAt).localeCompare(String(left.generatedAt)))
+    .slice(0, max);
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      total: packages.length,
+      returned: sorted.length,
+      completeCoverage: packages.filter((item) => item.coversAllExternalGaps).length,
+      latestId: sorted[0]?.id || ""
+    },
+    packages: sorted,
+    policy: {
+      access: "local-read-only",
+      executesCommands: false,
+      writesRemote: false,
+      artifactOnly: true
+    }
+  };
+}
+
+async function readExternalReadinessPackage(id = "") {
+  if (!/^[\w.-]+$/.test(String(id || "")) || !String(id).startsWith("external-readiness-")) {
+    throw new Error("external readiness package id 非法。");
+  }
+  const packageDir = path.join(EXTERNAL_READINESS_DIR, id);
+  const full = path.resolve(packageDir);
+  if (!full.toLowerCase().startsWith(EXTERNAL_READINESS_DIR.toLowerCase() + path.sep)) {
+    throw new Error("external readiness package 路径越界。");
+  }
+  const readiness = await readJsonOrNull(path.join(full, "readiness.json"));
+  if (!readiness || readiness.workspace !== currentWorkspace) throw new Error("未找到当前工作区的 external readiness package。");
+  const markdown = await fs.readFile(path.join(full, "readiness.md"), "utf8").catch(() => buildExternalReadinessMarkdown(readiness));
+  return {
+    id,
+    generatedAt: readiness.generatedAt || "",
+    workspace: readiness.workspace || "",
+    package: readiness,
+    markdown: markdown.slice(0, 120000),
+    paths: {
+      dir: toPosix(path.relative(APP_ROOT, full)),
+      json: toPosix(path.relative(APP_ROOT, path.join(full, "readiness.json"))),
+      markdown: toPosix(path.relative(APP_ROOT, path.join(full, "readiness.md")))
+    },
+    policy: {
+      access: "local-read-only",
+      executesCommands: false,
+      writesRemote: false,
+      artifactOnly: true
+    }
+  };
+}
+
 async function runExternalReadinessCli() {
   const json = process.argv.includes("--json") || process.argv.includes("--external-readiness-json");
   const deep = process.argv.includes("--deep") || process.argv.includes("--external-readiness-deep");
   const dryRun = process.argv.includes("--dry-run");
+  const list = process.argv.includes("--list") || process.argv.includes("--external-readiness-list");
+  const id = getCliOption("--id") || getCliOption("--external-readiness-id");
+  if (list) {
+    const result = await listExternalReadinessPackages({ limit: Number(getCliOption("--limit") || 20) });
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log("Forge Code - External Readiness Packages");
+    console.log("========================================");
+    console.log(`Workspace: ${result.workspace}`);
+    console.log(`Total: ${result.summary.total}`);
+    console.log(`Complete coverage: ${result.summary.completeCoverage}`);
+    for (const item of result.packages) {
+      console.log(`- ${item.id} · gaps ${item.packagedExternalGapCount}/${item.externalBlockedCount} · auth ${item.authorizationItemCount} · commands ${item.localReadinessCommandCount}`);
+    }
+    return;
+  }
+  if (id) {
+    const result = await readExternalReadinessPackage(id);
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(result.markdown.trimEnd());
+    return;
+  }
   const result = await buildExternalReadinessPackage({ deep, write: !dryRun });
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(result.markdown.trimEnd());
+  if (result.paths) {
+    console.log("");
+    console.log(`Saved: ${result.paths.markdown}`);
+    console.log(`JSON: ${result.paths.json}`);
+  }
+}
+
+function formatExternalAuthorizationStatusCliSummary(status = {}) {
+  const summary = status.summary || {};
+  return [
+    "Forge Code - External Authorization Status",
+    "===========================================",
+    `Workspace: ${status.workspace || currentWorkspace}`,
+    `Generated: ${status.generatedAt || new Date().toISOString()}`,
+    `Status: ${status.status || "unknown"}`,
+    `Rows: ${summary.ready || 0}/${summary.total || 0} ready · blocking ${summary.blocking || 0} · manual ${summary.manual || 0}`,
+    status.remote?.provider ? `Remote provider: ${status.remote.provider}` : "Remote provider: unknown",
+    status.remote?.project?.webUrl ? `Remote project: ${status.remote.project.webUrl}` : "",
+    "",
+    "Checks:",
+    ...(status.rows || []).map((row) => [
+      `  - ${row.label || row.id}: ${row.status || "unknown"}${row.required ? " · required" : ""}`,
+      row.next ? `    next: ${row.next}` : "",
+      row.evidence?.length ? `    evidence: ${row.evidence.slice(0, 3).join(" | ")}` : ""
+    ].filter(Boolean).join("\n")),
+    "",
+    status.nextActions?.length ? "Next actions:" : "Next actions: none",
+    ...(status.nextActions || []).map((item) => `  - ${item}`)
+  ].filter((line) => line !== "").join("\n");
+}
+
+async function runExternalAuthorizationStatusCli() {
+  const json = process.argv.includes("--json") || process.argv.includes("--external-authorization-status-json");
+  const deep = process.argv.includes("--deep") || process.argv.includes("--external-authorization-status-deep");
+  const status = await buildExternalAuthorizationStatus({ deep });
+  if (json) {
+    console.log(JSON.stringify(status, null, 2));
+    return;
+  }
+  console.log(formatExternalAuthorizationStatusCliSummary(status));
+}
+
+function formatWorkspaceReadinessCliSummary(readiness = {}) {
+  const summary = readiness.summary || {};
+  return [
+    "Forge Code - Workspace Readiness",
+    "================================",
+    `Workspace: ${readiness.workspace || currentWorkspace}`,
+    `Generated: ${readiness.generatedAt || new Date().toISOString()}`,
+    `Status: ${readiness.status || "unknown"}`,
+    `Checks: ${summary.ready || 0}/${summary.checks || 0} ready · warnings ${summary.warnings || 0} · blocking ${summary.blocking || 0}`,
+    `Critical untracked files: ${summary.untrackedCritical || 0}`,
+    readiness.git?.branch ? `Git branch: ${readiness.git.branch}` : "",
+    "",
+    "Checks:",
+    ...(readiness.checks || []).map((check) => [
+      `  - ${check.label || check.id}: ${check.status || "unknown"}${check.required ? " · required" : ""}`,
+      check.evidence?.length ? `    evidence: ${check.evidence.slice(0, 4).join(" | ")}` : "",
+      check.next ? `    next: ${check.next}` : ""
+    ].filter(Boolean).join("\n")),
+    "",
+    readiness.untrackedCritical?.length ? "Critical files to add:" : "Critical files to add: none",
+    ...(readiness.untrackedCritical || []).map((file) => `  - ${file}`),
+    "",
+    readiness.recommendedCommands?.length ? "Recommended verification:" : "Recommended verification: none",
+    ...(readiness.recommendedCommands || []).map((item) => `  - ${item.command || item}${item.reason ? ` - ${item.reason}` : ""}`),
+    "",
+    readiness.nextActions?.length ? "Next actions:" : "Next actions: none",
+    ...(readiness.nextActions || []).map((item) => `  - ${item}`)
+  ].filter((line) => line !== "").join("\n");
+}
+
+async function runWorkspaceReadinessCli() {
+  const json = process.argv.includes("--json") || process.argv.includes("--workspace-readiness-json");
+  const includeIgnored = process.argv.includes("--include-ignored") || process.argv.includes("--workspace-readiness-include-ignored");
+  const readiness = await buildWorkspaceReadiness({ includeIgnored });
+  if (json) {
+    console.log(JSON.stringify(readiness, null, 2));
+    return;
+  }
+  console.log(formatWorkspaceReadinessCliSummary(readiness));
+}
+
+function summarizeDoctorCommands(...groups) {
+  const seen = new Set();
+  const commands = [];
+  for (const group of groups) {
+    for (const item of group || []) {
+      const command = typeof item === "string" ? item : item?.command;
+      if (!command || seen.has(command)) continue;
+      seen.add(command);
+      commands.push(typeof item === "string" ? { command, reason: "" } : {
+        command,
+        reason: item.reason || "",
+        manual: Boolean(item.manual)
+      });
+    }
+  }
+  return commands.slice(0, 16);
+}
+
+function doctorStatusFromParts({ audit, workspaceReadiness, authorizationStatus, integrationReadiness }) {
+  const gapSummary = audit?.gapSummary || {};
+  const integrationSummary = integrationReadiness?.package?.summary || {};
+  const integrationMissingOptional = Array.isArray(integrationSummary.missingOptional)
+    ? integrationSummary.missingOptional.length
+    : Number(integrationSummary.missingOptional || 0);
+  if (workspaceReadiness?.status === "blocked") return "blocked";
+  if (authorizationStatus?.summary?.blocking > 0) return "external-blocked";
+  if ((gapSummary.localActionableCount || 0) > 0) return "local-actionable";
+  if ((gapSummary.externalBlockedCount || 0) > 0) return "external-blocked";
+  if (integrationMissingOptional > 0) return "partial";
+  return gapSummary.status === "complete" || audit?.comparison?.status === "implemented" ? "ready" : "partial";
+}
+
+async function buildProjectDoctor({ deep = false, includeIgnored = true } = {}) {
+  const [audit, workspaceReadiness, authorizationStatus, integrationReadiness] = await Promise.all([
+    buildCapabilityAudit({ light: !deep }),
+    buildWorkspaceReadiness({ includeIgnored }),
+    buildExternalAuthorizationStatus({ deep }),
+    buildIntegrationReadinessPackage({ write: false })
+  ]);
+  const gapSummary = audit.gapSummary || {};
+  const comparison = audit.comparison || {};
+  const integrationPackage = integrationReadiness.package || {};
+  const integrationSummary = integrationPackage.summary || {};
+  const integrationMissingOptional = Array.isArray(integrationSummary.missingOptional)
+    ? integrationSummary.missingOptional
+    : (integrationPackage.missingOptional || []);
+  const localGaps = comparison.localActionableGaps || gapSummary.topLocalGaps || [];
+  const externalGaps = comparison.externalBlockedGaps || gapSummary.topExternalGaps || [];
+  const blockingAuthorizationRows = (authorizationStatus.rows || []).filter((row) => row.required && row.status !== "ready");
+  const recommendedCommands = summarizeDoctorCommands(
+    workspaceReadiness.recommendedCommands,
+    integrationPackage.verificationCommands,
+    blockingAuthorizationRows.flatMap((row) => externalAuthorizationActionForRow(row, authorizationStatus).commands || []),
+    [
+      { command: "node server.js --capability-audit", reason: "复查 Codex 能力差距矩阵。" },
+      { command: "node server.js --external-authorization-action --dry-run", reason: "预览外部授权行动项。" },
+      { command: "validate.bat --ci", reason: "运行 Windows 本地完整验证。" }
+    ]
+  );
+  const status = doctorStatusFromParts({ audit, workspaceReadiness, authorizationStatus, integrationReadiness });
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status,
+    summary: {
+      capabilityStatus: gapSummary.status || comparison.status || "unknown",
+      implemented: audit.summary?.implemented || 0,
+      partial: audit.summary?.partial || 0,
+      missing: audit.summary?.missing || 0,
+      localActionableGaps: gapSummary.localActionableCount || localGaps.length || 0,
+      externalBlockedGaps: gapSummary.externalBlockedCount || externalGaps.length || 0,
+      workspaceStatus: workspaceReadiness.status || "unknown",
+      workspaceBlocking: workspaceReadiness.summary?.blocking || 0,
+      authorizationStatus: authorizationStatus.status || "unknown",
+      authorizationBlocking: authorizationStatus.summary?.blocking || 0,
+      authorizationManual: authorizationStatus.summary?.manual || 0,
+      integrationStatus: integrationPackage.status || integrationSummary.status || (integrationMissingOptional.length ? "partial" : "ready"),
+      integrationMissingOptional: integrationMissingOptional.length
+    },
+    recommendedNext: audit.recommendedNext || null,
+    localGaps: localGaps.slice(0, 8),
+    externalGaps: externalGaps.slice(0, 8),
+    blockingAuthorizationRows,
+    workspaceReadiness: {
+      status: workspaceReadiness.status,
+      summary: workspaceReadiness.summary,
+      nextActions: workspaceReadiness.nextActions || []
+    },
+    integrationReadiness: {
+      status: integrationPackage.status || integrationSummary.status || (integrationMissingOptional.length ? "partial" : "ready"),
+      summary: integrationSummary,
+      missingOptional: integrationMissingOptional
+    },
+    recommendedCommands,
+    nextActions: [
+      ...(workspaceReadiness.nextActions || []),
+      ...blockingAuthorizationRows.map((row) => row.next).filter(Boolean),
+      ...(localGaps || []).slice(0, 3).map((gap) => gap.next).filter(Boolean),
+      ...(externalGaps || []).slice(0, 3).map((gap) => gap.next).filter(Boolean)
+    ].filter(Boolean).slice(0, 12),
+    policy: {
+      access: "local-read-only",
+      executesCommands: Boolean(deep),
+      writesWorkspaceFiles: false,
+      writesRemote: false,
+      pushes: false,
+      createsRemotePr: false,
+      artifactOnly: true
+    }
+  };
+}
+
+function formatProjectDoctorCliSummary(doctor = {}) {
+  const summary = doctor.summary || {};
+  const recommended = doctor.recommendedNext?.capability || null;
+  return [
+    "Forge Code - Project Doctor",
+    "===========================",
+    `Workspace: ${doctor.workspace || currentWorkspace}`,
+    `Generated: ${doctor.generatedAt || new Date().toISOString()}`,
+    `Status: ${doctor.status || "unknown"}`,
+    "",
+    `Capabilities: implemented ${summary.implemented || 0} · partial ${summary.partial || 0} · missing ${summary.missing || 0}`,
+    `Gaps: local ${summary.localActionableGaps || 0} · external ${summary.externalBlockedGaps || 0}`,
+    `Workspace: ${summary.workspaceStatus || "unknown"} · blocking ${summary.workspaceBlocking || 0}`,
+    `Authorization: ${summary.authorizationStatus || "unknown"} · blocking ${summary.authorizationBlocking || 0} · manual ${summary.authorizationManual || 0}`,
+    `Integration: ${summary.integrationStatus || "unknown"} · optional missing ${summary.integrationMissingOptional || 0}`,
+    "",
+    recommended ? "Recommended next:" : "Recommended next: none",
+    recommended ? `  - ${recommended.area || "unknown"} (${recommended.status || "partial"})` : "",
+    doctor.recommendedNext?.reason ? `  - Reason: ${doctor.recommendedNext.reason}` : "",
+    "",
+    doctor.localGaps?.length ? "Top local gaps:" : "Top local gaps: none",
+    ...(doctor.localGaps || []).slice(0, 5).map((gap) => `  - ${gap.area || "unknown"} (${gap.status || "partial"})${gap.next ? ` - ${gap.next}` : ""}`),
+    "",
+    doctor.externalGaps?.length ? "Top external gaps:" : "Top external gaps: none",
+    ...(doctor.externalGaps || []).slice(0, 5).map((gap) => `  - ${gap.area || "unknown"} (${gap.status || "partial"})${gap.next ? ` - ${gap.next}` : ""}`),
+    "",
+    doctor.blockingAuthorizationRows?.length ? "Blocking authorization:" : "Blocking authorization: none",
+    ...(doctor.blockingAuthorizationRows || []).slice(0, 6).map((row) => `  - ${row.label || row.id}: ${row.status || "unknown"}${row.next ? ` - ${row.next}` : ""}`),
+    "",
+    doctor.recommendedCommands?.length ? "Recommended commands:" : "Recommended commands: none",
+    ...(doctor.recommendedCommands || []).slice(0, 10).map((item) => `  - ${item.command || item}${item.manual ? " · manual" : ""}${item.reason ? ` - ${item.reason}` : ""}`)
+  ].filter((line) => line !== "").join("\n");
+}
+
+async function runProjectDoctorCli() {
+  const json = process.argv.includes("--json") || process.argv.includes("--doctor-json") || process.argv.includes("--project-doctor-json");
+  const deep = process.argv.includes("--deep") || process.argv.includes("--doctor-deep") || process.argv.includes("--project-doctor-deep");
+  const includeIgnored = process.argv.includes("--include-ignored") || process.argv.includes("--workspace-readiness-include-ignored");
+  const doctor = await buildProjectDoctor({ deep, includeIgnored });
+  if (json) {
+    console.log(JSON.stringify(doctor, null, 2));
+    return;
+  }
+  console.log(formatProjectDoctorCliSummary(doctor));
+}
+
+function externalAuthorizationActionForRow(row = {}, status = {}) {
+  const remoteProvider = status.remote?.provider || row.details?.provider || "";
+  const manualGitee = row.id === "remote-cli-auth" && remoteProvider === "gitee";
+  const baseCommands = {
+    "model-api-key": [
+      { command: "set DEEPSEEK_API_KEY=<your-key>", manual: true, reason: "当前会话临时配置模型凭据。" },
+      { command: "start.bat", manual: true, reason: "重新启动后确认模型凭据进入运行时。" }
+    ],
+    "git-remote": [
+      { command: "git remote -v", reason: "确认当前仓库远端地址。" },
+      { command: "git branch --show-current", reason: "确认当前分支和后续 PR 来源分支。" }
+    ],
+    "remote-cli-auth": manualGitee
+      ? [
+          { command: "在 Gitee 网页创建 PR / 查看 CI，并把 PR、CI、评论链接回填到 remote publish external evidence。", manual: true, reason: "Gitee 当前走外部手工证据路径，不在本地执行远端写入。" },
+          { command: "node server.js --api-smoke-section=publish", reason: "回填证据后验证发布门禁。" }
+        ]
+      : [
+          { command: remoteProvider === "github" ? "gh auth status" : remoteProvider === "gitlab" ? "glab auth status" : "git remote -v", manual: remoteProvider !== "github" && remoteProvider !== "gitlab", reason: "只读确认远端 CLI 登录状态。" },
+          { command: "node server.js --external-authorization-status --deep", reason: "只读复查远端授权状态。" }
+        ],
+    "mcp-config": [
+      { command: "配置 .forge/mcp/servers.json 或 .mcp.json", manual: true, reason: "声明需要接入的本地 MCP server。" },
+      { command: "node server.js --api-smoke-section=integrations", reason: "验证集成入口仍可用。" }
+    ],
+    "extension-trust": [
+      { command: "安装或声明本地 extension manifest，并确认来源可信。", manual: true, reason: "扩展工具执行前必须先建立信任来源。" },
+      { command: "node server.js --api-smoke-section=integrations", reason: "验证扩展/工具入口仍可用。" }
+    ],
+    "readiness-package": [
+      { command: "node server.js --external-readiness", reason: "生成覆盖外部缺口的准备包。" },
+      { command: "node server.js --external-readiness --list", reason: "确认准备包已写入并可回读。" }
+    ],
+    "remote-publish-evidence": [
+      { command: "node server.js --api-smoke-section=publish", reason: "验证远端发布证据、预检和门禁链路。" }
+    ],
+    "permission-guardrails": [
+      { command: "node server.js --external-authorization-status", reason: "确认远端写入仍保持禁用且走审批/证据路径。" }
+    ]
+  };
+  return {
+    id: row.id || "",
+    label: row.label || row.id || "外部授权项",
+    status: row.status || "unknown",
+    required: Boolean(row.required),
+    evidence: row.evidence || [],
+    next: row.next || "",
+    manual: row.status === "manual" || manualGitee,
+    blocking: Boolean(row.required && row.status !== "ready"),
+    commands: baseCommands[row.id] || [
+      { command: row.next || "确认该授权项的外部状态。", manual: true, reason: "未识别到自动化预检命令，按授权状态说明处理。" }
+    ]
+  };
+}
+
+function buildExternalAuthorizationActionMarkdown(packageData = {}) {
+  const summary = packageData.summary || {};
+  const statusSummary = packageData.authorizationStatus?.summary || {};
+  const actions = Array.isArray(packageData.actions) ? packageData.actions : [];
+  const commands = Array.isArray(packageData.verificationCommands) ? packageData.verificationCommands : [];
+  const lines = [
+    "# Forge Code External Authorization Action Package",
+    "",
+    `Generated: ${packageData.generatedAt || ""}`,
+    `Workspace: ${packageData.workspace || currentWorkspace}`,
+    "",
+    "## Summary",
+    "",
+    `- Status: ${summary.status || packageData.authorizationStatus?.status || "unknown"}`,
+    `- Ready checks: ${statusSummary.ready || 0}/${statusSummary.total || 0}`,
+    `- Blocking required checks: ${statusSummary.blocking || 0}`,
+    `- Manual checks: ${statusSummary.manual || 0}`,
+    `- Action count: ${summary.actionCount || actions.length}`,
+    packageData.remote?.provider ? `- Remote provider: ${packageData.remote.provider}` : "- Remote provider: unknown",
+    packageData.remote?.project?.webUrl ? `- Remote project: ${packageData.remote.project.webUrl}` : "",
+    "",
+    "## Policy",
+    "",
+    "- Local artifact only.",
+    "- Does not push, create PRs, write comments, or execute remote writes.",
+    "- Remote/manual steps must be performed by the user and then recorded as evidence.",
+    "",
+    "## Action Checklist",
+    "",
+    ...(actions.length ? actions.flatMap((action, index) => [
+      `### ${index + 1}. ${action.label || action.id}`,
+      "",
+      `- Status: ${action.status || "unknown"}${action.required ? " · required" : ""}${action.manual ? " · manual" : ""}`,
+      action.next ? `- Next: ${action.next}` : "",
+      action.evidence?.length ? `- Evidence: ${action.evidence.slice(0, 5).join(" | ")}` : "",
+      action.commands?.length ? "- Commands / manual steps:" : "",
+      ...(action.commands || []).map((item) => `  - ${item.manual ? "[manual] " : ""}\`${item.command || item}\`${item.reason ? ` - ${item.reason}` : ""}`),
+      ""
+    ]) : ["- No blocking or manual authorization actions detected.", ""]),
+    "## Follow-up Verification",
+    "",
+    ...(commands.length ? commands.map((item) => `- \`${item.command || item}\`${item.reason ? ` - ${item.reason}` : ""}`) : ["- No verification commands detected."]),
+    "",
+    packageData.links?.readinessMarkdown ? `Readiness package: ${packageData.links.readinessMarkdown}` : "",
+    packageData.links?.remotePublishMarkdown ? `Remote publish package: ${packageData.links.remotePublishMarkdown}` : ""
+  ];
+  return lines.filter((line, index, array) => !(line === "" && array[index - 1] === "")).join("\n") + "\n";
+}
+
+async function buildExternalAuthorizationActionPackage({ deep = false, write = true } = {}) {
+  const status = await buildExternalAuthorizationStatus({ deep });
+  const blockingRows = (status.rows || []).filter((row) => row.required && row.status !== "ready");
+  const optionalRows = (status.rows || []).filter((row) => !row.required && row.status !== "ready");
+  const actionRows = [...blockingRows, ...optionalRows].slice(0, 20);
+  const actions = actionRows.map((row) => externalAuthorizationActionForRow(row, status));
+  const readinessLatest = status.readinessPackages?.packages?.[0] || null;
+  const remoteLatest = status.rows?.find((row) => row.id === "remote-publish-evidence")?.details?.latest || null;
+  const verificationCommands = uniqueLimited([
+    { command: "node server.js --external-authorization-status", reason: "复查授权状态。" },
+    { command: "node server.js --external-readiness --list", reason: "确认外部准备包可回读。" },
+    { command: "node server.js --api-smoke-section=publish", reason: "验证远端发布证据与门禁链路。" },
+    { command: "node server.js --api-smoke-section=integrations", reason: "验证 MCP/扩展/工具集成入口。" },
+    { command: "node server.js --api-smoke-section=fast", reason: "快速回归 API 基础链路。" },
+    ...actions.flatMap((action) => action.commands || []).filter((item) => !item.manual)
+  ], 20, (item) => item.command || item);
+  const packageId = `external-authorization-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const packageData = {
+    id: packageId,
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      status: status.status || "unknown",
+      actionCount: actions.length,
+      blockingActionCount: actions.filter((item) => item.blocking).length,
+      manualActionCount: actions.filter((item) => item.manual).length,
+      optionalActionCount: actions.filter((item) => !item.required).length,
+      readyChecks: status.summary?.ready || 0,
+      totalChecks: status.summary?.total || 0
+    },
+    authorizationStatus: status,
+    remote: status.remote || {},
+    actions,
+    verificationCommands,
+    links: {
+      readinessPackageId: readinessLatest?.id || "",
+      readinessMarkdown: readinessLatest?.paths?.markdown || "",
+      remotePublishPackageId: remoteLatest?.id || "",
+      remotePublishMarkdown: remoteLatest?.paths?.reviewSummary || remoteLatest?.paths?.prBody || ""
+    },
+    policy: {
+      source: "external-authorization-action",
+      writesLocalArtifacts: Boolean(write),
+      artifactOnly: true,
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      writesRemote: false
+    }
+  };
+  const markdown = buildExternalAuthorizationActionMarkdown(packageData);
+  if (!write) {
+    return { package: packageData, markdown, paths: null };
+  }
+  const packageDir = path.join(EXTERNAL_AUTHORIZATION_DIR, packageId);
+  await fs.mkdir(packageDir, { recursive: true });
+  const jsonPath = path.join(packageDir, "action.json");
+  const markdownPath = path.join(packageDir, "action.md");
+  await fs.writeFile(jsonPath, JSON.stringify(packageData, null, 2), "utf8");
+  await fs.writeFile(markdownPath, markdown, "utf8");
+  return {
+    package: packageData,
+    markdown,
+    paths: {
+      dir: toPosix(path.relative(APP_ROOT, packageDir)),
+      json: toPosix(path.relative(APP_ROOT, jsonPath)),
+      markdown: toPosix(path.relative(APP_ROOT, markdownPath))
+    }
+  };
+}
+
+async function listExternalAuthorizationActionPackages({ limit = 20 } = {}) {
+  const max = Math.min(80, Math.max(1, Number(limit) || 20));
+  const entries = await fs.readdir(EXTERNAL_AUTHORIZATION_DIR, { withFileTypes: true }).catch(() => []);
+  const packages = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("external-authorization-")) continue;
+    const packageDir = path.join(EXTERNAL_AUTHORIZATION_DIR, entry.name);
+    const action = await readJsonOrNull(path.join(packageDir, "action.json"));
+    if (!action || action.workspace !== currentWorkspace) continue;
+    packages.push({
+      id: action.id || entry.name,
+      generatedAt: action.generatedAt || "",
+      workspace: action.workspace || "",
+      status: action.summary?.status || "",
+      actionCount: Number(action.summary?.actionCount || action.actions?.length || 0),
+      blockingActionCount: Number(action.summary?.blockingActionCount || 0),
+      manualActionCount: Number(action.summary?.manualActionCount || 0),
+      verificationCommandCount: Array.isArray(action.verificationCommands) ? action.verificationCommands.length : 0,
+      remote: action.remote || {},
+      paths: {
+        dir: toPosix(path.relative(APP_ROOT, packageDir)),
+        json: toPosix(path.relative(APP_ROOT, path.join(packageDir, "action.json"))),
+        markdown: toPosix(path.relative(APP_ROOT, path.join(packageDir, "action.md")))
+      }
+    });
+  }
+  const sorted = packages
+    .sort((left, right) => String(right.generatedAt).localeCompare(String(left.generatedAt)))
+    .slice(0, max);
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      total: packages.length,
+      returned: sorted.length,
+      latestId: sorted[0]?.id || "",
+      blocking: packages.filter((item) => item.blockingActionCount > 0).length,
+      manual: packages.filter((item) => item.manualActionCount > 0).length
+    },
+    packages: sorted,
+    policy: {
+      access: "local-read-only",
+      executesCommands: false,
+      writesRemote: false,
+      artifactOnly: true
+    }
+  };
+}
+
+async function readExternalAuthorizationActionPackage(id = "") {
+  if (!/^[\w.-]+$/.test(String(id || "")) || !String(id).startsWith("external-authorization-")) {
+    throw new Error("external authorization action package id 非法。");
+  }
+  const packageDir = path.join(EXTERNAL_AUTHORIZATION_DIR, id);
+  const full = path.resolve(packageDir);
+  if (!full.toLowerCase().startsWith(EXTERNAL_AUTHORIZATION_DIR.toLowerCase() + path.sep)) {
+    throw new Error("external authorization action package 路径越界。");
+  }
+  const action = await readJsonOrNull(path.join(full, "action.json"));
+  if (!action || action.workspace !== currentWorkspace) throw new Error("未找到当前工作区的 external authorization action package。");
+  const markdown = await fs.readFile(path.join(full, "action.md"), "utf8").catch(() => buildExternalAuthorizationActionMarkdown(action));
+  return {
+    id,
+    generatedAt: action.generatedAt || "",
+    workspace: action.workspace || "",
+    package: action,
+    markdown: markdown.slice(0, 120000),
+    paths: {
+      dir: toPosix(path.relative(APP_ROOT, full)),
+      json: toPosix(path.relative(APP_ROOT, path.join(full, "action.json"))),
+      markdown: toPosix(path.relative(APP_ROOT, path.join(full, "action.md")))
+    },
+    policy: {
+      access: "local-read-only",
+      executesCommands: false,
+      writesRemote: false,
+      artifactOnly: true
+    }
+  };
+}
+
+function buildIntegrationReadinessTemplates() {
+  return {
+    mcpConfig: {
+      mcpServers: {
+        "local-workspace": {
+          command: "node",
+          args: ["scripts/mcp-local-workspace.js"],
+          env: { FORGE_WORKSPACE: "${workspaceFolder}" },
+          disabled: false
+        }
+      }
+    },
+    extensionManifest: {
+      name: "local-readonly-helper",
+      version: "0.1.0",
+      type: "plugin",
+      description: "本地只读辅助工具示例。批准后只能桥接到内置只读工具。",
+      capabilities: ["workspace-readiness", "project-doctor", "repo-map", "mcp-readiness"],
+      policy: {
+        access: "read-only",
+        scope: "currentWorkspace",
+        requiresApproval: true
+      },
+      tools: [
+        {
+          name: "workspace_readiness",
+          description: "读取工作区启动、验证、Git 和交付健康状态。",
+          mapsTo: "workspace_readiness",
+          parameters: { type: "object", properties: { includeIgnored: { type: "boolean" } } }
+        },
+        {
+          name: "project_doctor",
+          description: "只读运行 Project Doctor 汇总当前本地能力、授权和集成状态。",
+          mapsTo: "project_doctor",
+          parameters: { type: "object", properties: { deep: { type: "boolean" } } }
+        },
+        {
+          name: "repo_map",
+          description: "读取当前仓库结构摘要。",
+          mapsTo: "repo_map",
+          parameters: { type: "object", properties: {} }
+        }
+      ],
+      trust: {
+        sha256: "<fill-after-reviewing-manifest-hash>",
+        signedBy: "",
+        signature: "",
+        publicKeyPem: ""
+      }
+    },
+    targetPaths: {
+      mcp: ".mcp.json",
+      extension: "extensions/plugins/local-readonly-helper/manifest.json"
+    }
+  };
+}
+
+function buildIntegrationReadinessMarkdown(packageData = {}) {
+  const summary = packageData.summary || {};
+  const templates = packageData.templates || {};
+  const commands = packageData.verificationCommands || [];
+  const checks = packageData.checks || [];
+  const lines = [
+    "# Forge Code Integration Readiness",
+    "",
+    `Generated: ${packageData.generatedAt || ""}`,
+    `Workspace: ${packageData.workspace || ""}`,
+    "",
+    "## Summary",
+    "",
+    `- Status: ${packageData.status || "unknown"}`,
+    `- MCP servers: ${summary.mcpServers || 0}`,
+    `- Extensions: ${summary.extensions || 0}`,
+    `- Trust rows: ${summary.trustRows || 0}`,
+    `- Missing optional integrations: ${(summary.missingOptional || []).join(", ") || "none"}`,
+    "",
+    "## Checks",
+    "",
+    ...checks.map((check) => [
+      `### ${check.label || check.id}`,
+      "",
+      `- Status: ${check.status || "unknown"}`,
+      check.evidence?.length ? `- Evidence: ${check.evidence.join(" | ")}` : "",
+      check.next ? `- Next: ${check.next}` : "",
+      ""
+    ].filter(Boolean).join("\n")),
+    "## MCP Template",
+    "",
+    `Target: ${templates.targetPaths?.mcp || ".forge/mcp/servers.json"}`,
+    "",
+    "```json",
+    JSON.stringify(templates.mcpConfig || {}, null, 2),
+    "```",
+    "",
+    "## Extension Manifest Template",
+    "",
+    `Target: ${templates.targetPaths?.extension || "extensions/plugins/local-readonly-helper/manifest.json"}`,
+    "",
+    "```json",
+    JSON.stringify(templates.extensionManifest || {}, null, 2),
+    "```",
+    "",
+    "## Verification Commands",
+    "",
+    ...commands.map((item) => `- \`${item.command || item}\`${item.reason ? ` - ${item.reason}` : ""}`),
+    "",
+    "## Policy",
+    "",
+    "- This package does not execute MCP tools, extension tools, shell commands, pushes, PR creation, or remote writes.",
+    "- MCP tools/call and extension tool calls still require explicit approval.",
+    "- Versioned local integration files are reviewed in-repo; remote MCP/tool trust roots still need external authorization."
+  ];
+  return lines.join("\n");
+}
+
+async function buildIntegrationReadinessPackage({ write = true } = {}) {
+  const [mcp, extensions, trust, workspaceReadiness] = await Promise.all([
+    discoverMcpServers({ probe: true }).catch((error) => ({ summary: { total: 0, tools: 0, resources: 0 }, servers: [], errors: [{ error: error.message }] })),
+    listExtensions().catch((error) => ({ summary: { total: 0 }, extensions: [], errors: [{ error: error.message }] })),
+    buildExtensionTrustAudit({ limit: 40 }).catch((error) => ({ summary: { total: 0 }, rows: [], gaps: [error.message] })),
+    buildWorkspaceReadiness({ includeIgnored: true }).catch((error) => ({ status: "unknown", untrackedCritical: [], recommendedCommands: [], error: error.message }))
+  ]);
+  const templates = buildIntegrationReadinessTemplates();
+  const checks = [
+    {
+      id: "mcp-config",
+      label: "MCP 配置",
+      status: mcp.summary?.total > 0 ? "ready" : "missing",
+      evidence: [
+        `servers=${mcp.summary?.total || 0}`,
+        `tools=${mcp.summary?.tools || 0}`,
+        `resources=${mcp.summary?.resources || 0}`,
+        ...(mcp.errors || []).slice(0, 3).map((item) => item.error || item.source || "")
+      ].filter(Boolean),
+      next: mcp.summary?.total > 0
+        ? "已发现 MCP 配置；可用“探测”读取 tools/resources/prompts，tools/call 仍需审批。"
+        : "复制 MCP Template 到 .mcp.json，按实际本地 server 修改并保持 disabled=false 后再探测。"
+    },
+    {
+      id: "extension-manifest",
+      label: "本地扩展 manifest",
+      status: extensions.summary?.total > 0 ? "ready" : "missing",
+      evidence: [`extensions=${extensions.summary?.total || 0}`],
+      next: extensions.summary?.total > 0
+        ? "已发现本地扩展；工具调用仍需审批并只允许桥接到内置只读工具。"
+        : "复制 Extension Manifest Template 到 extensions/plugins/.../manifest.json，审查 mapsTo 和 policy 后刷新扩展目录。"
+    },
+    {
+      id: "extension-trust",
+      label: "扩展 Trust 审计",
+      status: trust.summary?.total > 0 ? "ready" : "missing",
+      evidence: [
+        `rows=${trust.summary?.total || 0}`,
+        `approvalRequired=${trust.summary?.approvalRequired || 0}`,
+        `checksumPinned=${trust.summary?.checksumPinned || 0}`,
+        `signatureVerified=${trust.summary?.signatureVerified || 0}`
+      ],
+      next: trust.summary?.total > 0
+        ? "已可审计 manifest hash/checksum/signature；远端市场签名链仍需外部 trust root。"
+        : "添加本地扩展 manifest 后运行 Trust 审计，必要时填入 manifest.trust.sha256。"
+    },
+    {
+      id: "approval-boundary",
+      label: "审批边界",
+      status: "ready",
+      evidence: ["mcp tools/call requires approval", "extension tool call requires approval", "versioned local integration files reviewed"],
+      next: "保持 MCP/扩展工具调用通过审批计划进入 /api/approval-execute，不绕过本地策略。"
+    }
+  ];
+  const missingOptional = checks.filter((check) => check.status === "missing").map((check) => check.id);
+  const verificationCommands = [
+    { command: "node --check server.js", reason: "后端集成 API 语法检查。" },
+    { command: "node --check app.js", reason: "前端集成面板脚本语法检查。" },
+    { command: "node server.js --integration-readiness --dry-run", reason: "预览 MCP/扩展本地集成准备包。" },
+    { command: "node server.js --external-authorization-status", reason: "确认 MCP/扩展授权状态和缺口。" },
+    { command: "node server.js --api-smoke-section=integrations", reason: "验证 MCP/扩展/资产集成入口。" },
+    { command: "node server.js --ui-smoke-test", reason: "验证前端集成按钮和 hooks。" }
+  ];
+  const packageId = `integration-readiness-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const packageData = {
+    id: packageId,
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    status: missingOptional.length ? "partial" : "ready",
+    summary: {
+      mcpServers: mcp.summary?.total || 0,
+      mcpTools: mcp.summary?.tools || 0,
+      mcpResources: mcp.summary?.resources || 0,
+      extensions: extensions.summary?.total || 0,
+      trustRows: trust.summary?.total || 0,
+      missingOptional,
+      workspaceReadiness: workspaceReadiness.status || "unknown"
+    },
+    checks,
+    templates,
+    mcp: {
+      summary: mcp.summary || {},
+      servers: (mcp.servers || []).map((server) => ({
+        name: server.name,
+        transport: server.transport,
+        disabled: server.disabled,
+        source: server.source,
+        status: server.status,
+        policy: server.policy,
+        probe: server.probe || null
+      })),
+      errors: mcp.errors || []
+    },
+    extensions: {
+      summary: extensions.summary || {},
+      rows: (extensions.extensions || []).map((extension) => ({
+        name: extension.name,
+        type: extension.type,
+        source: extension.source,
+        toolCount: (extension.tools || []).length,
+        trustStatus: extension.trust?.status || "",
+        approvalRequired: extension.policy?.requiresApproval !== false
+      })),
+      errors: extensions.errors || []
+    },
+    trust: {
+      summary: trust.summary || {},
+      gaps: trust.gaps || []
+    },
+    workspaceReadiness: {
+      status: workspaceReadiness.status || "unknown",
+      untrackedCritical: workspaceReadiness.untrackedCritical || [],
+      recommendedCommands: workspaceReadiness.recommendedCommands || []
+    },
+    verificationCommands,
+    policy: {
+      access: "local-read-only",
+      artifactOnly: true,
+      writesFiles: Boolean(write),
+      writesRemote: false,
+      executesCommands: false,
+      executesMcpProbe: true,
+      executesMcpTools: false,
+      executesExtensionTools: false,
+      requiresApprovalForToolCalls: true,
+      versionedTemplatesReviewed: true
+    }
+  };
+  const markdown = buildIntegrationReadinessMarkdown(packageData);
+  if (!write) return { package: packageData, markdown, paths: null };
+  const packageDir = path.join(INTEGRATION_READINESS_DIR, packageId);
+  await fs.mkdir(packageDir, { recursive: true });
+  const jsonPath = path.join(packageDir, "readiness.json");
+  const markdownPath = path.join(packageDir, "readiness.md");
+  await fs.writeFile(jsonPath, JSON.stringify(packageData, null, 2), "utf8");
+  await fs.writeFile(markdownPath, markdown, "utf8");
+  return {
+    package: packageData,
+    markdown,
+    paths: {
+      dir: toPosix(path.relative(APP_ROOT, packageDir)),
+      json: toPosix(path.relative(APP_ROOT, jsonPath)),
+      markdown: toPosix(path.relative(APP_ROOT, markdownPath))
+    }
+  };
+}
+
+async function listIntegrationReadinessPackages({ limit = 20 } = {}) {
+  const max = Math.min(100, Math.max(1, Number(limit) || 20));
+  const entries = await fs.readdir(INTEGRATION_READINESS_DIR, { withFileTypes: true }).catch(() => []);
+  const packages = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("integration-readiness-")) continue;
+    const packageDir = path.join(INTEGRATION_READINESS_DIR, entry.name);
+    const readiness = await readJsonOrNull(path.join(packageDir, "readiness.json"));
+    if (!readiness || readiness.workspace !== currentWorkspace) continue;
+    packages.push({
+      id: readiness.id || entry.name,
+      generatedAt: readiness.generatedAt || "",
+      workspace: readiness.workspace || "",
+      status: readiness.status || "",
+      mcpServers: readiness.summary?.mcpServers || 0,
+      extensions: readiness.summary?.extensions || 0,
+      missingOptional: readiness.summary?.missingOptional || [],
+      verificationCommandCount: Array.isArray(readiness.verificationCommands) ? readiness.verificationCommands.length : 0,
+      paths: {
+        dir: toPosix(path.relative(APP_ROOT, packageDir)),
+        json: toPosix(path.relative(APP_ROOT, path.join(packageDir, "readiness.json"))),
+        markdown: toPosix(path.relative(APP_ROOT, path.join(packageDir, "readiness.md")))
+      }
+    });
+  }
+  const sorted = packages
+    .sort((left, right) => String(right.generatedAt).localeCompare(String(left.generatedAt)))
+    .slice(0, max);
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      total: packages.length,
+      returned: sorted.length,
+      latestId: sorted[0]?.id || "",
+      partial: packages.filter((item) => item.status === "partial").length,
+      ready: packages.filter((item) => item.status === "ready").length
+    },
+    packages: sorted,
+    policy: {
+      access: "local-read-only",
+      executesCommands: false,
+      writesRemote: false,
+      artifactOnly: true
+    }
+  };
+}
+
+async function readIntegrationReadinessPackage(id = "") {
+  if (!/^[\w.-]+$/.test(String(id || "")) || !String(id).startsWith("integration-readiness-")) {
+    throw new Error("integration readiness package id 非法。");
+  }
+  const packageDir = path.join(INTEGRATION_READINESS_DIR, id);
+  const full = path.resolve(packageDir);
+  if (!full.toLowerCase().startsWith(INTEGRATION_READINESS_DIR.toLowerCase() + path.sep)) {
+    throw new Error("integration readiness package 路径越界。");
+  }
+  const readiness = await readJsonOrNull(path.join(full, "readiness.json"));
+  if (!readiness || readiness.workspace !== currentWorkspace) throw new Error("未找到当前工作区的 integration readiness package。");
+  const markdown = await fs.readFile(path.join(full, "readiness.md"), "utf8").catch(() => buildIntegrationReadinessMarkdown(readiness));
+  return {
+    id,
+    generatedAt: readiness.generatedAt || "",
+    workspace: readiness.workspace || "",
+    package: readiness,
+    markdown: markdown.slice(0, 120000),
+    paths: {
+      dir: toPosix(path.relative(APP_ROOT, full)),
+      json: toPosix(path.relative(APP_ROOT, path.join(full, "readiness.json"))),
+      markdown: toPosix(path.relative(APP_ROOT, path.join(full, "readiness.md")))
+    },
+    policy: {
+      access: "local-read-only",
+      executesCommands: false,
+      writesRemote: false,
+      artifactOnly: true
+    }
+  };
+}
+
+async function runIntegrationReadinessCli() {
+  const json = process.argv.includes("--json") || process.argv.includes("--integration-readiness-json");
+  const dryRun = process.argv.includes("--dry-run");
+  const list = process.argv.includes("--list") || process.argv.includes("--integration-readiness-list");
+  const id = getCliOption("--id") || getCliOption("--integration-readiness-id");
+  if (list) {
+    const result = await listIntegrationReadinessPackages({ limit: Number(getCliOption("--limit") || 20) });
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log("Forge Code - Integration Readiness Packages");
+    console.log("===========================================");
+    console.log(`Workspace: ${result.workspace}`);
+    console.log(`Total: ${result.summary.total}`);
+    for (const item of result.packages) {
+      console.log(`- ${item.id} · ${item.status} · mcp ${item.mcpServers} · extensions ${item.extensions} · missing ${item.missingOptional.length}`);
+    }
+    return;
+  }
+  if (id) {
+    const result = await readIntegrationReadinessPackage(id);
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(result.markdown.trimEnd());
+    return;
+  }
+  const result = await buildIntegrationReadinessPackage({ write: !dryRun });
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(result.markdown.trimEnd());
+  if (result.paths) {
+    console.log("");
+    console.log(`Saved: ${result.paths.markdown}`);
+    console.log(`JSON: ${result.paths.json}`);
+  }
+}
+
+async function runExternalAuthorizationActionCli() {
+  const json = process.argv.includes("--json") || process.argv.includes("--external-authorization-action-json");
+  const deep = process.argv.includes("--deep") || process.argv.includes("--external-authorization-action-deep");
+  const dryRun = process.argv.includes("--dry-run");
+  const list = process.argv.includes("--list") || process.argv.includes("--external-authorization-action-list");
+  const id = getCliOption("--id") || getCliOption("--external-authorization-action-id");
+  if (list) {
+    const result = await listExternalAuthorizationActionPackages({ limit: Number(getCliOption("--limit") || 20) });
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log("Forge Code - External Authorization Action Packages");
+    console.log("==================================================");
+    console.log(`Workspace: ${result.workspace}`);
+    console.log(`Total: ${result.summary.total}`);
+    for (const item of result.packages) {
+      console.log(`- ${item.id} · actions ${item.actionCount} · blocking ${item.blockingActionCount} · manual ${item.manualActionCount}`);
+    }
+    return;
+  }
+  if (id) {
+    const result = await readExternalAuthorizationActionPackage(id);
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(result.markdown.trimEnd());
+    return;
+  }
+  const result = await buildExternalAuthorizationActionPackage({ deep, write: !dryRun });
   if (json) {
     console.log(JSON.stringify(result, null, 2));
     return;
@@ -12931,6 +14351,79 @@ function getAgentTools() {
         parameters: {
           type: "object",
           properties: {
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "project_doctor",
+        description: "读取项目一键诊断，汇总 Codex 能力差距、工作区健康、外部授权、MCP/扩展准备和推荐命令；默认本地只读。",
+        parameters: {
+          type: "object",
+          properties: {
+            deep: { type: "boolean" },
+            includeIgnored: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "workspace_readiness",
+        description: "读取工作区交付就绪度，检查启动/验证脚本、忽略规则、Git 状态、关键未跟踪文件和推荐验证命令；本地只读。",
+        parameters: {
+          type: "object",
+          properties: {
+            includeIgnored: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "external_authorization_status",
+        description: "读取外部授权状态仪表盘，汇总模型 Key、Git remote、远端 CLI、MCP、扩展、准备包、发布证据和权限边界；默认只做本地只读汇总。",
+        parameters: {
+          type: "object",
+          properties: {
+            deep: { type: "boolean" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "external_authorization_action",
+        description: "生成或读取外部授权行动包，把 blocking/manual 授权项转成可执行清单、本地验证命令和 artifact；不执行命令、不写远端。",
+        parameters: {
+          type: "object",
+          properties: {
+            deep: { type: "boolean" },
+            dryRun: { type: "boolean" },
+            list: { type: "boolean" },
+            id: { type: "string" },
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "integration_readiness",
+        description: "生成或读取本地集成准备包，给出 MCP server 配置模板、扩展 manifest 模板、trust/审批边界和验证命令；不执行外部工具、不写远端。",
+        parameters: {
+          type: "object",
+          properties: {
+            dryRun: { type: "boolean" },
+            list: { type: "boolean" },
+            id: { type: "string" },
             limit: { type: "number" }
           }
         }
@@ -13684,7 +15177,9 @@ function parseExtensionManifest(raw, source, type) {
 async function listExtensions() {
   const roots = [
     { dir: path.join(EXTENSION_DIR, "skills"), type: "skill" },
-    { dir: path.join(EXTENSION_DIR, "plugins"), type: "plugin" }
+    { dir: path.join(EXTENSION_DIR, "plugins"), type: "plugin" },
+    { dir: path.join(VERSIONED_EXTENSION_DIR, "skills"), type: "skill" },
+    { dir: path.join(VERSIONED_EXTENSION_DIR, "plugins"), type: "plugin" }
   ];
   const extensions = [];
   const errors = [];
@@ -13715,6 +15210,7 @@ async function listExtensions() {
     generatedAt: new Date().toISOString(),
     workspace: currentWorkspace,
     root: toPosix(path.relative(APP_ROOT, EXTENSION_DIR)),
+    roots: uniqueLimited(roots.map((root) => toPosix(path.relative(APP_ROOT, root.dir))), 10),
     summary,
     extensions,
     errors,
@@ -13869,12 +15365,21 @@ async function executeExtensionToolCall(extensionName, toolName, toolArguments =
   };
 }
 
+function expandMcpConfigValue(value = "") {
+  return String(value || "")
+    .replace(/\$\{workspaceFolder\}/g, currentWorkspace)
+    .replace(/\$\{appRoot\}/g, APP_ROOT);
+}
+
 function normalizeMcpServer(name, config = {}, source) {
   const command = typeof config.command === "string" ? config.command : "";
   const args = Array.isArray(config.args) ? config.args.map(String) : [];
   const url = typeof config.url === "string" ? config.url : "";
   const transport = config.transport || (url ? "http" : "stdio");
-  const envValues = config.env && typeof config.env === "object" && !Array.isArray(config.env) ? config.env : {};
+  const rawEnvValues = config.env && typeof config.env === "object" && !Array.isArray(config.env) ? config.env : {};
+  const envValues = Object.fromEntries(
+    Object.entries(rawEnvValues).map(([key, value]) => [key, expandMcpConfigValue(value)])
+  );
   const env = Object.keys(envValues).sort();
   const server = {
     name,
@@ -14397,8 +15902,8 @@ async function readMcpResourceContent({ serverName = "", uri = "" } = {}) {
 }
 
 async function readMcpConfigFile(filePath, source) {
-  const raw = (await fs.readFile(filePath, "utf8")).replace(/^\uFEFF/, "");
-  const parsed = JSON.parse(raw);
+  const raw = await fs.readFile(filePath, "utf8");
+  const parsed = parseJsonText(raw);
   const candidates = parsed.mcpServers || parsed.servers || parsed;
   if (!candidates || typeof candidates !== "object" || Array.isArray(candidates)) return [];
   return Object.entries(candidates)
@@ -14465,7 +15970,7 @@ async function discoverMcpServers({ probe = false } = {}) {
 }
 
 function normalizeJson(raw) {
-  const text = String(raw || "").trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
+  const text = stripJsonBom(raw).trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
   if (text.startsWith("{") && text.endsWith("}")) return text;
 
   const start = text.indexOf("{");
@@ -14478,7 +15983,7 @@ function normalizeJson(raw) {
 }
 
 function normalizeAgentPayload(raw) {
-  const parsed = JSON.parse(normalizeJson(raw));
+  const parsed = parseJsonText(normalizeJson(raw));
   return {
     reply: String(parsed.reply || "已生成建议。"),
     plan: Array.isArray(parsed.plan) ? parsed.plan.map(String) : [],
@@ -14660,6 +16165,37 @@ async function runReadTool(name, args) {
   if (name === "permission_matrix") {
     return JSON.stringify(await buildPermissionMatrix({
       limit: Number(args.limit || 20)
+    }));
+  }
+  if (name === "project_doctor") {
+    return JSON.stringify(await buildProjectDoctor({
+      deep: Boolean(args.deep),
+      includeIgnored: args.includeIgnored !== false
+    }));
+  }
+  if (name === "workspace_readiness") {
+    return JSON.stringify(await buildWorkspaceReadiness({
+      includeIgnored: Boolean(args.includeIgnored)
+    }));
+  }
+  if (name === "external_authorization_status") {
+    return JSON.stringify(await buildExternalAuthorizationStatus({
+      deep: Boolean(args.deep)
+    }));
+  }
+  if (name === "external_authorization_action") {
+    if (args.id) return JSON.stringify(await readExternalAuthorizationActionPackage(String(args.id || "")));
+    if (args.list) return JSON.stringify(await listExternalAuthorizationActionPackages({ limit: Number(args.limit || 20) }));
+    return JSON.stringify(await buildExternalAuthorizationActionPackage({
+      deep: Boolean(args.deep),
+      write: !args.dryRun
+    }));
+  }
+  if (name === "integration_readiness") {
+    if (args.id) return JSON.stringify(await readIntegrationReadinessPackage(String(args.id || "")));
+    if (args.list) return JSON.stringify(await listIntegrationReadinessPackages({ limit: Number(args.limit || 20) }));
+    return JSON.stringify(await buildIntegrationReadinessPackage({
+      write: !args.dryRun
     }));
   }
   if (name === "extension_trust") {
@@ -16755,6 +18291,90 @@ async function handleApi(req, res) {
       return send(res, 200, await readRemotePublishPackage(url.searchParams.get("id") || ""));
     }
 
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/external-readiness") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            deep: url.searchParams.get("deep") === "1",
+            dryRun: url.searchParams.get("dryRun") === "1"
+          };
+      return send(res, 200, await buildExternalReadinessPackage({
+        deep: Boolean(payload.deep),
+        write: !payload.dryRun
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/external-readiness-packages") {
+      return send(res, 200, await listExternalReadinessPackages({
+        limit: Number(url.searchParams.get("limit") || 20)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/external-readiness-package") {
+      return send(res, 200, await readExternalReadinessPackage(url.searchParams.get("id") || ""));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/external-authorization-status") {
+      return send(res, 200, await buildExternalAuthorizationStatus({
+        deep: url.searchParams.get("deep") === "1"
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/workspace-readiness") {
+      return send(res, 200, await buildWorkspaceReadiness({
+        includeIgnored: url.searchParams.get("includeIgnored") === "1"
+      }));
+    }
+
+    if (req.method === "GET" && (url.pathname === "/api/doctor" || url.pathname === "/api/project-doctor")) {
+      return send(res, 200, await buildProjectDoctor({
+        deep: url.searchParams.get("deep") === "1",
+        includeIgnored: url.searchParams.get("includeIgnored") !== "0"
+      }));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/external-authorization-action") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            deep: url.searchParams.get("deep") === "1",
+            dryRun: url.searchParams.get("dryRun") === "1"
+          };
+      return send(res, 200, await buildExternalAuthorizationActionPackage({
+        deep: Boolean(payload.deep),
+        write: !payload.dryRun
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/external-authorization-actions") {
+      return send(res, 200, await listExternalAuthorizationActionPackages({
+        limit: Number(url.searchParams.get("limit") || 20)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/external-authorization-action-package") {
+      return send(res, 200, await readExternalAuthorizationActionPackage(url.searchParams.get("id") || ""));
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/integration-readiness") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : { dryRun: url.searchParams.get("dryRun") === "1" };
+      return send(res, 200, await buildIntegrationReadinessPackage({
+        write: !payload.dryRun
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/integration-readiness-packages") {
+      return send(res, 200, await listIntegrationReadinessPackages({
+        limit: Number(url.searchParams.get("limit") || 20)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/integration-readiness-package") {
+      return send(res, 200, await readIntegrationReadinessPackage(url.searchParams.get("id") || ""));
+    }
+
     if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/remote-publish-preflight") {
       const payload = req.method === "POST"
         ? await readJson(req)
@@ -17215,6 +18835,77 @@ function getCliOption(name, fallback = "") {
   return fallback;
 }
 
+const SERVER_START_OPTION_NAMES = new Set([
+  "--port"
+]);
+
+const KNOWN_CLI_FLAG_NAMES = new Set([
+  "--api-smoke-section",
+  "--api-smoke-test",
+  "--capabilities",
+  "--capabilities-json",
+  "--capability-audit",
+  "--capability-audit-deep",
+  "--capability-audit-json",
+  "--deep",
+  "--doctor",
+  "--doctor-deep",
+  "--doctor-json",
+  "--dry-run",
+  "--external-authorization-action",
+  "--external-authorization-action-deep",
+  "--external-authorization-action-id",
+  "--external-authorization-action-json",
+  "--external-authorization-action-list",
+  "--external-authorization-status",
+  "--external-authorization-status-deep",
+  "--external-authorization-status-json",
+  "--external-readiness",
+  "--external-readiness-deep",
+  "--external-readiness-id",
+  "--external-readiness-json",
+  "--external-readiness-list",
+  "--id",
+  "--include-ignored",
+  "--integration-readiness",
+  "--integration-readiness-id",
+  "--integration-readiness-json",
+  "--integration-readiness-list",
+  "--json",
+  "--limit",
+  "--list",
+  "--mcp-smoke-server",
+  "--port",
+  "--port-conflict-smoke-test",
+  "--project-doctor",
+  "--project-doctor-deep",
+  "--project-doctor-json",
+  "--smoke-test",
+  "--ui-smoke-test",
+  "--workspace-readiness",
+  "--workspace-readiness-include-ignored",
+  "--workspace-readiness-json"
+]);
+
+function cliFlagName(arg = "") {
+  const text = String(arg || "");
+  if (!text.startsWith("--")) return "";
+  return text.split("=")[0];
+}
+
+function unknownCliFlags() {
+  return process.argv
+    .slice(2)
+    .map(cliFlagName)
+    .filter(Boolean)
+    .filter((flag) => !KNOWN_CLI_FLAG_NAMES.has(flag));
+}
+
+function shouldRunServerForArgs() {
+  const flags = process.argv.slice(2).map(cliFlagName).filter(Boolean);
+  return flags.every((flag) => SERVER_START_OPTION_NAMES.has(flag));
+}
+
 function parseApiSmokeSections(value = process.env.API_SMOKE_SECTION || process.env.API_SMOKE_SECTIONS || "") {
   const raw = String(value || "fast")
     .split(",")
@@ -17243,6 +18934,12 @@ async function runApiSmokeSectionTest(sectionValue = "") {
   };
   const originalWorkspace = currentWorkspace;
   currentWorkspace = APP_ROOT;
+  const originalGoalState = await fs.readFile(GOAL_STATE_PATH, "utf8").catch(() => null);
+  const originalContextSnapshot = await fs.readFile(CONTEXT_SNAPSHOT_PATH, "utf8").catch(() => null);
+  const originalContextCompact = await fs.readFile(CONTEXT_COMPACT_PATH, "utf8").catch(() => null);
+  const originalContextRollup = await fs.readFile(CONTEXT_ROLLUP_PATH, "utf8").catch(() => null);
+  const originalSemanticIndex = await fs.readFile(SEMANTIC_INDEX_PATH, "utf8").catch(() => null);
+  const originalRuntimeUrl = await fs.readFile(RUNTIME_URL_PATH, "utf8").catch(() => null);
   const sectionServer = createAppServer();
   smokeStep("listen");
   await new Promise((resolve, reject) => {
@@ -17264,10 +18961,32 @@ async function runApiSmokeSectionTest(sectionValue = "") {
     forkThreadPath: "",
     handoffPath: "",
     remotePublishDir: "",
-    remoteCiArtifactPath: ""
+    remoteCiArtifactPath: "",
+    assetFixturePath: "",
+    svgAssetFixturePath: "",
+    dataAssetFixturePath: "",
+    parquetDataAssetFixturePath: "",
+    documentAssetFixturePath: "",
+    legacyDocumentAssetFixturePath: "",
+    pdfAssetFixturePath: "",
+    compressedPdfAssetFixturePath: "",
+    mediaAssetFixturePath: "",
+    browserBaselinePath: "",
+    browserScreenshotPath: "",
+    browserSelectorScreenshotPath: "",
+    browserDomPath: "",
+    browserTracePath: "",
+    browserSessionPath: "",
+    browserVisualBaselinePath: "",
+    browserVisualMetaPath: "",
+    browserVisualDiffBaselinePath: "",
+    browserVisualDiffMetaPath: "",
+    browserVisualDiffPath: "",
+    browserVisualScreenshotPaths: []
   };
   const checked = [];
   try {
+    assertSmoke(parseJsonOutput("\uFEFF{\"ok\":true}", null)?.ok === true, "parseJsonOutput should accept UTF-8 BOM-prefixed JSON");
     if (shouldRun("core")) {
       smokeStep("core");
       const health = await requestJson(baseUrl, "/api/health");
@@ -17281,9 +19000,89 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(capabilities.capabilities.some((item) => item.area === "可恢复状态"), "capabilities missing resumable state");
       assertSmoke(capabilities.recommendedNext?.capability?.taskPlan?.verificationCommands?.length >= 1, "capabilities missing recommended task plan commands");
       assertSmoke(capabilities.comparison?.outstandingGaps?.every((item) => item.taskPlan?.policy?.source === "capability-task-plan"), "capabilities missing task plans on outstanding gaps");
+      const externalReadinessPreview = await requestJson(baseUrl, "/api/external-readiness", {
+        method: "POST",
+        body: JSON.stringify({ dryRun: true })
+      });
+      assertSmoke(externalReadinessPreview.package?.policy?.artifactOnly === true, "external readiness preview missing artifact-only policy");
+      assertSmoke(externalReadinessPreview.package?.policy?.coversAllExternalGaps === true, "external readiness preview should cover all external gaps");
+      assertSmoke(Array.isArray(externalReadinessPreview.package?.externalGaps), "external readiness preview missing external gaps");
+      assertSmoke(externalReadinessPreview.markdown?.includes("## Authorization Checklist"), "external readiness preview missing markdown checklist");
+      const externalReadinessWritten = await requestJson(baseUrl, "/api/external-readiness", {
+        method: "POST",
+        body: JSON.stringify({ dryRun: false })
+      });
+      assertSmoke(externalReadinessWritten.package?.id, "external readiness write missing package id");
+      assertSmoke(externalReadinessWritten.paths?.markdown, "external readiness write missing markdown path");
+      assertSmoke(externalReadinessWritten.package?.policy?.coversAllExternalGaps === true, "external readiness written package should cover all external gaps");
+      const externalReadinessPackages = await requestJson(baseUrl, "/api/external-readiness-packages?limit=5");
+      assertSmoke(externalReadinessPackages.packages?.some((item) => item.id === externalReadinessWritten.package.id), "external readiness list missing written package");
+      assertSmoke(externalReadinessPackages.summary?.latestId, "external readiness list missing latest id");
+      const externalReadinessRead = await requestJson(baseUrl, `/api/external-readiness-package?id=${encodeURIComponent(externalReadinessWritten.package.id)}`);
+      assertSmoke(externalReadinessRead.id === externalReadinessWritten.package.id, "external readiness read returned wrong package");
+      assertSmoke(externalReadinessRead.markdown?.includes("## External Gaps"), "external readiness read missing external gaps markdown");
+      assertSmoke(externalReadinessRead.package?.policy?.artifactOnly === true, "external readiness read missing artifact policy");
+      const externalAuthorizationStatus = await requestJson(baseUrl, "/api/external-authorization-status");
+      assertSmoke(externalAuthorizationStatus.policy?.access === "local-read-only", "external authorization status should be read-only");
+      assertSmoke(externalAuthorizationStatus.policy?.pushes === false, "external authorization status should not push");
+      assertSmoke(externalAuthorizationStatus.policy?.createsRemotePr === false, "external authorization status should not create PR");
+      assertSmoke(Array.isArray(externalAuthorizationStatus.rows), "external authorization status missing rows");
+      assertSmoke(externalAuthorizationStatus.rows.some((item) => item.id === "readiness-package"), "external authorization status missing readiness package row");
+      assertSmoke(externalAuthorizationStatus.rows.some((item) => item.id === "permission-guardrails"), "external authorization status missing permission guardrails row");
+      const workspaceReadiness = await requestJson(baseUrl, "/api/workspace-readiness?includeIgnored=1");
+      assertSmoke(workspaceReadiness.policy?.access === "local-read-only", "workspace readiness should be read-only");
+      assertSmoke(workspaceReadiness.policy?.writesFiles === false, "workspace readiness should not write files");
+      assertSmoke(workspaceReadiness.checks?.some((item) => item.id === "startup-scripts-trackable"), "workspace readiness missing startup script tracking check");
+      assertSmoke(workspaceReadiness.checks?.some((item) => item.id === "forge-artifacts-ignored"), "workspace readiness missing artifact ignore check");
+      assertSmoke(Array.isArray(workspaceReadiness.recommendedCommands), "workspace readiness missing recommended commands");
+      assertSmoke(workspaceReadiness.recommendedCommands.some((item) => item.command === "validate.bat --ci"), "workspace readiness missing validate.bat recommendation");
+      const projectDoctor = await requestJson(baseUrl, "/api/doctor", { timeoutMs: 120000 });
+      assertSmoke(projectDoctor.policy?.access === "local-read-only", "project doctor should be read-only");
+      assertSmoke(projectDoctor.policy?.writesRemote === false, "project doctor should not write remote");
+      assertSmoke(projectDoctor.summary?.workspaceStatus, "project doctor missing workspace status");
+      assertSmoke(Array.isArray(projectDoctor.recommendedCommands), "project doctor missing recommended commands");
+      const externalAuthorizationActionPreview = await requestJson(baseUrl, "/api/external-authorization-action", {
+        method: "POST",
+        body: JSON.stringify({ dryRun: true })
+      });
+      assertSmoke(externalAuthorizationActionPreview.package?.policy?.artifactOnly === true, "external authorization action preview missing artifact-only policy");
+      assertSmoke(externalAuthorizationActionPreview.package?.policy?.pushes === false, "external authorization action preview should not push");
+      assertSmoke(Array.isArray(externalAuthorizationActionPreview.package?.actions), "external authorization action preview missing actions");
+      assertSmoke(externalAuthorizationActionPreview.markdown?.includes("## Action Checklist"), "external authorization action preview missing action checklist markdown");
+      const externalAuthorizationActionWritten = await requestJson(baseUrl, "/api/external-authorization-action", {
+        method: "POST",
+        body: JSON.stringify({ dryRun: false })
+      });
+      assertSmoke(externalAuthorizationActionWritten.package?.id, "external authorization action write missing package id");
+      assertSmoke(externalAuthorizationActionWritten.paths?.markdown, "external authorization action write missing markdown path");
+      const externalAuthorizationActions = await requestJson(baseUrl, "/api/external-authorization-actions?limit=5");
+      assertSmoke(externalAuthorizationActions.packages?.some((item) => item.id === externalAuthorizationActionWritten.package.id), "external authorization action list missing written package");
+      const externalAuthorizationActionRead = await requestJson(baseUrl, `/api/external-authorization-action-package?id=${encodeURIComponent(externalAuthorizationActionWritten.package.id)}`);
+      assertSmoke(externalAuthorizationActionRead.id === externalAuthorizationActionWritten.package.id, "external authorization action read returned wrong package");
+      assertSmoke(externalAuthorizationActionRead.markdown?.includes("## Follow-up Verification"), "external authorization action read missing verification markdown");
+      const integrationReadinessPreview = await requestJson(baseUrl, "/api/integration-readiness", {
+        method: "POST",
+        body: JSON.stringify({ dryRun: true })
+      });
+      assertSmoke(integrationReadinessPreview.package?.policy?.artifactOnly === true, "integration readiness preview missing artifact-only policy");
+      assertSmoke(integrationReadinessPreview.package?.templates?.mcpConfig?.mcpServers, "integration readiness missing MCP template");
+      assertSmoke(integrationReadinessPreview.package?.templates?.extensionManifest?.tools?.length >= 1, "integration readiness missing extension manifest template");
+      assertSmoke(integrationReadinessPreview.markdown?.includes("## MCP Template"), "integration readiness markdown missing MCP template");
+      const integrationReadinessWritten = await requestJson(baseUrl, "/api/integration-readiness", {
+        method: "POST",
+        body: JSON.stringify({ dryRun: false })
+      });
+      assertSmoke(integrationReadinessWritten.package?.id, "integration readiness write missing package id");
+      assertSmoke(integrationReadinessWritten.paths?.markdown, "integration readiness write missing markdown path");
+      const integrationReadinessPackages = await requestJson(baseUrl, "/api/integration-readiness-packages?limit=5");
+      assertSmoke(integrationReadinessPackages.packages?.some((item) => item.id === integrationReadinessWritten.package.id), "integration readiness list missing written package");
+      const integrationReadinessRead = await requestJson(baseUrl, `/api/integration-readiness-package?id=${encodeURIComponent(integrationReadinessWritten.package.id)}`);
+      assertSmoke(integrationReadinessRead.id === integrationReadinessWritten.package.id, "integration readiness read returned wrong package");
+      assertSmoke(integrationReadinessRead.markdown?.includes("## Extension Manifest Template"), "integration readiness read missing extension template");
       const tools = await requestJson(baseUrl, "/api/tools");
       assertSmoke(tools.tools.some((item) => item.name === "repo_map"), "tools missing repo_map");
-      checked.push("health", "files", "capabilities", "tools");
+      assertSmoke(tools.tools.some((item) => item.name === "project_doctor"), "tools missing project_doctor");
+      checked.push("health", "files", "capabilities", "external-readiness-preview", "external-readiness-package", "external-readiness-packages", "external-authorization-status", "workspace-readiness", "project-doctor", "external-authorization-action", "integration-readiness", "tools");
     }
 
     if (shouldRun("browser")) {
@@ -17299,6 +19098,60 @@ async function runApiSmokeSectionTest(sectionValue = "") {
         body: JSON.stringify({ url: `${baseUrl}/` })
       });
       assertSmoke(browserAudit.policy?.staticHtmlAudit === true, "browser audit missing static policy");
+      smokeStep("browser-baseline");
+      const browserBaselineUrl = `${baseUrl}/?focused-browser-baseline=${Date.now()}`;
+      const browserBaseline = await requestJson(baseUrl, "/api/browser-baseline", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({ url: browserBaselineUrl, name: "focused browser smoke baseline" })
+      });
+      assertSmoke(browserBaseline.ok === true, "focused browser baseline did not complete");
+      assertSmoke(browserBaseline.updated === true, "focused browser baseline did not save initial fingerprint");
+      cleanup.browserBaselinePath = browserBaseline.baselinePath ? path.join(APP_ROOT, browserBaseline.baselinePath) : "";
+      const browserBaselineMatch = await requestJson(baseUrl, "/api/browser-baseline", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({ url: browserBaselineUrl })
+      });
+      assertSmoke(browserBaselineMatch.status === "matched", "focused browser baseline did not match saved fingerprint");
+      smokeStep("browser-screenshot");
+      const browserScreenshot = await requestJson(baseUrl, "/api/browser-screenshot", {
+        method: "POST",
+        timeoutMs: 150000,
+        body: JSON.stringify({ url: `${baseUrl}/`, width: 800, height: 600 })
+      });
+      assertSmoke(browserScreenshot.ok === true, "focused browser screenshot did not complete");
+      assertSmoke(browserScreenshot.path?.endsWith(".png"), "focused browser screenshot did not return png path");
+      assertSmoke(browserScreenshot.size > 0, "focused browser screenshot was empty");
+      cleanup.browserScreenshotPath = browserScreenshot.path ? path.join(APP_ROOT, browserScreenshot.path) : "";
+      const browserSelectorScreenshot = await requestJson(baseUrl, "/api/browser-screenshot", {
+        method: "POST",
+        timeoutMs: 150000,
+        body: JSON.stringify({ url: `${baseUrl}/`, width: 800, height: 600, selector: "#promptForm" })
+      });
+      assertSmoke(browserSelectorScreenshot.ok === true, "focused selector screenshot did not complete");
+      assertSmoke(browserSelectorScreenshot.policy?.selectorCrop === true, "focused selector screenshot missing crop policy");
+      cleanup.browserSelectorScreenshotPath = browserSelectorScreenshot.path ? path.join(APP_ROOT, browserSelectorScreenshot.path) : "";
+      smokeStep("browser-dom");
+      const browserDom = await requestJson(baseUrl, "/api/browser-dom", {
+        method: "POST",
+        timeoutMs: 150000,
+        body: JSON.stringify({ url: `${baseUrl}/`, selectors: ["body", "#promptForm", "#browserCheckForm", "button"] })
+      });
+      assertSmoke(browserDom.ok === true, "focused browser DOM snapshot did not complete");
+      assertSmoke(browserDom.bytes > 0, "focused browser DOM snapshot was empty");
+      assertSmoke(browserDom.selectors?.some((item) => item.selector === "#promptForm" && item.count >= 1), "focused browser DOM missing #promptForm selector evidence");
+      if (browserDom.artifactPath) cleanup.browserDomPath = path.join(APP_ROOT, browserDom.artifactPath);
+      smokeStep("browser-trace");
+      const browserTrace = await requestJson(baseUrl, "/api/browser-trace", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({ url: `${baseUrl}/`, waitMs: 500, fallbackOnly: true })
+      });
+      assertSmoke(browserTrace.artifactPath?.endsWith(".json"), "focused browser trace missing artifact path");
+      assertSmoke(browserTrace.policy?.networkTrace === true, "focused browser trace missing network policy");
+      assertSmoke(Array.isArray(browserTrace.console), "focused browser trace missing console list");
+      cleanup.browserTracePath = browserTrace.artifactPath ? path.join(APP_ROOT, browserTrace.artifactPath) : "";
       const debugDiagnostics = await requestJson(baseUrl, "/api/debug-diagnostics", {
         method: "POST",
         timeoutMs: 120000,
@@ -17367,7 +19220,124 @@ async function runApiSmokeSectionTest(sectionValue = "") {
         sourceContextDraft.reply || sourceContextDraft.diff || sourceContextDraft.proposal || sourceContextDraft.policy,
         "source context repair did not return a usable draft payload"
       );
-      checked.push("browser-check", "browser-audit", "debug-diagnostics", "source-context-repair-draft");
+      smokeStep("browser-interact");
+      const browserInteract = await requestJson(baseUrl, "/api/browser-interact", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({
+          url: `${baseUrl}/`,
+          actions: [
+            { type: "wait", selector: "body" },
+            { type: "type", selector: "#browserCheckUrlInput", value: "focused-browser-smoke" },
+            { type: "waitValue", selector: "#browserCheckUrlInput", value: "focused-browser-smoke" },
+            { type: "clear", selector: "#browserCheckUrlInput" },
+            { type: "type", selector: "#browserCheckUrlInput", value: "focused-browser-smoke" },
+            { type: "keyDown", selector: "#browserCheckUrlInput", key: "Shift" },
+            { type: "keyUp", selector: "#browserCheckUrlInput", key: "Shift" },
+            { type: "wheel", x: 20, y: 20, deltaY: 80 },
+            { type: "scroll", deltaY: -40 }
+          ],
+          selectors: ["body", "#browserCheckUrlInput", "[value=\"focused-browser-smoke\"]", "[data-forge-wheel]", "[data-forge-scroll]"],
+          fallbackOnly: true
+        })
+      });
+      assertSmoke(browserInteract.ok === true, "focused browser interaction did not complete");
+      assertSmoke(browserInteract.policy?.domInteraction === true, "focused browser interaction missing policy evidence");
+      assertSmoke(browserInteract.actions?.some((item) => item.type === "keydown" && item.key === "Shift"), "focused browser interaction missing keyDown audit");
+      assertSmoke(browserInteract.actions?.some((item) => item.type === "wheel" && item.deltaY === 80), "focused browser interaction missing wheel audit");
+      assertSmoke(browserInteract.selectors?.some((item) => item.selector === "[value=\"focused-browser-smoke\"]" && item.count >= 1), "focused browser interaction missing value DOM evidence");
+      smokeStep("browser-session");
+      const browserSession = await requestJson(baseUrl, "/api/browser-session", {
+        method: "POST",
+        timeoutMs: 180000,
+        body: JSON.stringify({
+          url: `${baseUrl}/`,
+          name: "focused browser smoke session",
+          steps: [{
+            name: "prepare",
+            actions: [
+              { type: "wait", selector: "body" },
+              { type: "type", selector: "#browserCheckUrlInput", value: "focused-browser-session" },
+              { type: "waitValue", selector: "#browserCheckUrlInput", value: "focused-browser-session" }
+            ]
+          }],
+          selectors: ["body", "[value=\"focused-browser-session\"]"]
+        })
+      });
+      assertSmoke(browserSession.ok === true, "focused browser session did not complete");
+      assertSmoke(browserSession.policy?.artifact === true, "focused browser session missing artifact policy");
+      assertSmoke(browserSession.artifactPath?.endsWith(".json"), "focused browser session missing artifact path");
+      cleanup.browserSessionPath = browserSession.artifactPath ? path.join(APP_ROOT, browserSession.artifactPath) : "";
+      smokeStep("browser-visual");
+      const browserVisual = await requestJson(baseUrl, "/api/browser-visual", {
+        method: "POST",
+        timeoutMs: 150000,
+        body: JSON.stringify({
+          url: `${baseUrl}/`,
+          width: 800,
+          height: 600,
+          name: "focused browser visual",
+          screenshotPath: browserScreenshot.path
+        })
+      });
+      assertSmoke(browserVisual.ok === true, "focused browser visual baseline did not complete");
+      assertSmoke(browserVisual.updated === true, "focused browser visual baseline did not save");
+      assertSmoke(browserVisual.policy?.pixelDiff === true, "focused browser visual missing pixel diff policy");
+      cleanup.browserVisualBaselinePath = browserVisual.baselinePath ? path.join(APP_ROOT, browserVisual.baselinePath) : "";
+      cleanup.browserVisualMetaPath = browserVisual.metaPath ? path.join(APP_ROOT, browserVisual.metaPath) : "";
+      if (browserVisual.currentPath) cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserVisual.currentPath));
+      const browserSelectorVisual = await requestJson(baseUrl, "/api/browser-visual", {
+        method: "POST",
+        timeoutMs: 150000,
+        body: JSON.stringify({
+          url: `${baseUrl}/`,
+          width: 800,
+          height: 600,
+          name: "focused browser selector visual",
+          selector: "#promptForm",
+          screenshotPath: browserSelectorScreenshot.path
+        })
+      });
+      assertSmoke(browserSelectorVisual.ok === true, "focused selector visual did not complete");
+      assertSmoke(browserSelectorVisual.policy?.selectorCrop === true, "focused selector visual missing crop policy");
+      if (browserSelectorVisual.currentPath) cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserSelectorVisual.currentPath));
+      if (browserSelectorVisual.baselinePath) cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserSelectorVisual.baselinePath));
+      if (browserSelectorVisual.metaPath) cleanup.browserVisualScreenshotPaths.push(path.join(APP_ROOT, browserSelectorVisual.metaPath));
+      const visualDiffUrl = `${baseUrl}/?focused-visual-diff=${Date.now()}`;
+      const visualDiffId = browserBaselineId(visualDiffUrl);
+      const visualDiffCurrentPath = path.join(BROWSER_SCREENSHOT_DIR, `${visualDiffId}-current.png`);
+      cleanup.browserVisualDiffBaselinePath = path.join(BROWSER_VISUAL_DIR, `${visualDiffId}.png`);
+      cleanup.browserVisualDiffMetaPath = path.join(BROWSER_VISUAL_DIR, `${visualDiffId}.json`);
+      await fs.mkdir(BROWSER_VISUAL_DIR, { recursive: true });
+      await fs.mkdir(BROWSER_SCREENSHOT_DIR, { recursive: true });
+      const visualDiffBaselineBuffer = createSmokePngBuffer({ r: 255, g: 0, b: 0, a: 255 });
+      await fs.writeFile(cleanup.browserVisualDiffBaselinePath, visualDiffBaselineBuffer);
+      await fs.writeFile(cleanup.browserVisualDiffMetaPath, JSON.stringify({
+        id: visualDiffId,
+        name: "focused browser visual diff",
+        url: visualDiffUrl,
+        width: 1,
+        height: 1,
+        hash: hashBuffer(visualDiffBaselineBuffer)
+      }, null, 2), "utf8");
+      await fs.writeFile(visualDiffCurrentPath, createSmokePngBuffer({ r: 0, g: 0, b: 255, a: 255 }));
+      cleanup.browserVisualScreenshotPaths.push(visualDiffCurrentPath);
+      const browserVisualDiff = await requestJson(baseUrl, "/api/browser-visual", {
+        method: "POST",
+        timeoutMs: 150000,
+        body: JSON.stringify({
+          url: visualDiffUrl,
+          width: 1,
+          height: 1,
+          threshold: 0,
+          maxMismatchRatio: 0,
+          screenshotPath: toPosix(path.relative(APP_ROOT, visualDiffCurrentPath))
+        })
+      });
+      assertSmoke(browserVisualDiff.ok === false, "focused browser visual diff should detect changed pixels");
+      assertSmoke(browserVisualDiff.hasDiffImage === true, "focused browser visual diff did not create diff image");
+      cleanup.browserVisualDiffPath = browserVisualDiff.diffPath ? path.join(APP_ROOT, browserVisualDiff.diffPath) : "";
+      checked.push("browser-check", "browser-audit", "browser-baseline", "browser-screenshot", "browser-selector-screenshot", "browser-dom", "browser-trace", "debug-diagnostics", "source-context-repair-draft", "browser-interact", "browser-session", "browser-visual", "browser-selector-visual");
     }
 
     if (shouldRun("semantic")) {
@@ -17439,8 +19409,13 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       await fs.writeFile(path.join(cleanup.extensionFixtureDir, "manifest.json"), JSON.stringify(signedExtensionManifest, null, 2));
       const extensions = await requestJson(baseUrl, "/api/extensions");
       assertSmoke(extensions.extensions.some((item) => item.name === "api-smoke-section-skill"), "extensions missing focused fixture");
+      assertSmoke(extensions.extensions.some((item) => item.name === "local-readonly-helper" && item.source === "extensions/plugins/local-readonly-helper/manifest.json"), "extensions missing versioned local helper");
+      assertSmoke(extensions.extensions.some((item) => item.name === "local-readonly-helper" && (item.tools || []).some((tool) => tool.name === "project_doctor")), "versioned local helper missing project_doctor tool");
       const extensionTrust = await requestJson(baseUrl, "/api/extension-trust?limit=10");
       assertSmoke(extensionTrust.trust?.summary?.signatureVerified >= 1, "extension trust missing verified signature summary");
+      assertSmoke(extensionTrust.trust?.rows?.some((item) => item.name === "local-readonly-helper" && item.trust?.manifestHash), "extension trust missing versioned local helper row");
+      const toolsWithVersionedExtension = await requestJson(baseUrl, "/api/tools");
+      assertSmoke(toolsWithVersionedExtension.tools.some((item) => item.name === "local-readonly-helper.project_doctor"), "tools endpoint missing versioned local project_doctor bridge");
       checked.push("extensions", "extension-trust");
     }
 
@@ -17463,23 +19438,142 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       }, null, 2));
       const mcp = await requestJson(baseUrl, "/api/mcp");
       assertSmoke(mcp.servers.some((item) => item.name === "api-smoke-section-mcp"), "MCP endpoint missing focused fixture");
+      assertSmoke(mcp.servers.some((item) => item.name === "local-workspace" && item.source === ".mcp.json"), "MCP endpoint missing versioned local workspace server");
       const mcpProbe = await requestJson(baseUrl, "/api/mcp?probe=1", { timeoutMs: 120000 });
       const probedMcp = mcpProbe.servers.find((item) => item.name === "api-smoke-section-mcp");
       assertSmoke(probedMcp?.probe?.status === "probed", "MCP probe did not complete handshake");
+      const localWorkspaceMcp = mcpProbe.servers.find((item) => item.name === "local-workspace");
+      assertSmoke(localWorkspaceMcp?.probe?.status === "probed", `versioned local MCP did not probe: ${JSON.stringify(localWorkspaceMcp?.probe || {}).slice(0, 1000)}`);
+      assertSmoke(localWorkspaceMcp?.probe?.counts?.tools >= 2, "versioned local MCP missing workspace tools");
+      assertSmoke(localWorkspaceMcp?.probe?.counts?.resources >= 2, "versioned local MCP missing workspace resources");
+      assertSmoke(localWorkspaceMcp?.probe?.counts?.prompts >= 1, "versioned local MCP missing debug prompt");
+      const localMcpResourceRead = await requestJson(baseUrl, "/api/mcp-resource", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({
+          serverName: "local-workspace",
+          uri: "forge://workspace/package"
+        })
+      });
+      assertSmoke(localMcpResourceRead.policy?.executesTool === false, "versioned local MCP resource read should not execute tools");
+      assertSmoke(localMcpResourceRead.contents?.some((item) => item.text?.includes('"forge-code"')), "versioned local MCP resource read missing package content");
       checked.push("mcp", "mcp-probe");
     }
 
     if (shouldRun("assets")) {
       smokeStep("assets");
-      const assetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${Date.now()}.png`);
-      cleanup.assetFixturePath = assetFixturePath;
-      await fs.writeFile(assetFixturePath, createSmokePngBuffer({ r: 0, g: 128, b: 255, a: 255 }));
-      const assetFixtureName = toPosix(path.relative(currentWorkspace, assetFixturePath));
+      const assetStamp = Date.now();
+      cleanup.assetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${assetStamp}.png`);
+      await fs.writeFile(cleanup.assetFixturePath, createSmokePngBuffer({ r: 0, g: 128, b: 255, a: 255 }));
+      cleanup.svgAssetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${assetStamp}.svg`);
+      await fs.writeFile(cleanup.svgAssetFixturePath, [
+        `<svg width="120" height="40" viewBox="0 0 120 40" xmlns="http://www.w3.org/2000/svg" aria-label="Forge SVG aria section">`,
+        "<title>Forge SVG section title</title>",
+        "<desc>Forge SVG section description</desc>",
+        "<text x=\"4\" y=\"22\">Forge SVG section text</text>",
+        "</svg>"
+      ].join(""), "utf8");
+      cleanup.dataAssetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${assetStamp}.csv`);
+      await fs.writeFile(cleanup.dataAssetFixturePath, "name,value\nalpha,1\nbeta,2\n", "utf8");
+      cleanup.parquetDataAssetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${assetStamp}.parquet`);
+      await fs.writeFile(cleanup.parquetDataAssetFixturePath, createSmokeParquetBuffer());
+      cleanup.documentAssetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${assetStamp}.docx`);
+      await fs.writeFile(cleanup.documentAssetFixturePath, createZipBuffer([
+        {
+          name: "[Content_Types].xml",
+          content: "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"></Types>"
+        },
+        {
+          name: "word/document.xml",
+          content: "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>Forge DOCX section text</w:t></w:r></w:p></w:body></w:document>"
+        }
+      ]));
+      cleanup.legacyDocumentAssetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${assetStamp}.doc`);
+      await fs.writeFile(cleanup.legacyDocumentAssetFixturePath, createSmokeLegacyOfficeBuffer());
+      cleanup.pdfAssetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${assetStamp}.pdf`);
+      await fs.writeFile(cleanup.pdfAssetFixturePath, createSmokePdfBuffer());
+      cleanup.compressedPdfAssetFixturePath = path.join(currentWorkspace, `.forge-asset-section-compressed-${assetStamp}.pdf`);
+      await fs.writeFile(cleanup.compressedPdfAssetFixturePath, createSmokePdfBuffer({ compressed: true }));
+      cleanup.mediaAssetFixturePath = path.join(currentWorkspace, `.forge-asset-section-${assetStamp}.wav`);
+      await fs.writeFile(cleanup.mediaAssetFixturePath, createSmokeWavBuffer());
+
+      const assetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.assetFixturePath));
+      const svgAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.svgAssetFixturePath));
+      const dataAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.dataAssetFixturePath));
+      const parquetDataAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.parquetDataAssetFixturePath));
+      const documentAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.documentAssetFixturePath));
+      const legacyDocumentAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.legacyDocumentAssetFixturePath));
+      const pdfAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.pdfAssetFixturePath));
+      const compressedPdfAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.compressedPdfAssetFixturePath));
+      const mediaAssetFixtureName = toPosix(path.relative(currentWorkspace, cleanup.mediaAssetFixturePath));
       const assets = await requestJson(baseUrl, "/api/assets");
       assertSmoke(assets.policy?.access === "metadata-and-inspection", "assets endpoint missing inspection policy");
+      assertSmoke(assets.assets.some((item) => item.path === assetFixtureName && item.type === "image"), "assets endpoint missing image fixture");
+      assertSmoke(assets.assets.some((item) => item.path === svgAssetFixtureName && item.type === "image"), "assets endpoint missing svg fixture");
+      assertSmoke(assets.assets.some((item) => item.path === dataAssetFixtureName && item.type === "data"), "assets endpoint missing data fixture");
+      assertSmoke(assets.assets.some((item) => item.path === parquetDataAssetFixtureName && item.type === "data"), "assets endpoint missing parquet fixture");
+      assertSmoke(assets.assets.some((item) => item.path === documentAssetFixtureName && item.type === "document"), "assets endpoint missing docx fixture");
+      assertSmoke(assets.assets.some((item) => item.path === legacyDocumentAssetFixtureName && item.type === "document"), "assets endpoint missing legacy doc fixture");
+      assertSmoke(assets.assets.some((item) => item.path === pdfAssetFixtureName && item.type === "document"), "assets endpoint missing pdf fixture");
+      assertSmoke(assets.assets.some((item) => item.path === compressedPdfAssetFixtureName && item.type === "document"), "assets endpoint missing compressed pdf fixture");
+      assertSmoke(assets.assets.some((item) => item.path === mediaAssetFixtureName && item.type === "media"), "assets endpoint missing media fixture");
+
+      smokeStep("asset-inspect:image");
       const imageInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(assetFixtureName)}`);
       assertSmoke(imageInspection.image?.format === "png", "asset inspection did not read png header");
-      checked.push("assets", "asset-inspect");
+      assertSmoke(imageInspection.image?.width === 1 && imageInspection.image?.height === 1, "asset inspection did not read png dimensions");
+      assertSmoke(imageInspection.vision?.available === true, "asset inspection did not generate image vision summary");
+      assertSmoke(imageInspection.ocr?.engine === "tesseract", "asset inspection missing OCR capability probe");
+      assertSmoke(typeof imageInspection.ocr?.enabled === "boolean", "asset inspection missing OCR execution switch state");
+
+      smokeStep("asset-inspect:svg");
+      const svgInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(svgAssetFixtureName)}`);
+      assertSmoke(svgInspection.image?.format === "svg", "asset inspection did not identify svg image");
+      assertSmoke(svgInspection.ocr?.engine === "local-svg-text-extractor", "asset inspection missing SVG text extractor");
+      assertSmoke(svgInspection.ocr?.textSample?.includes("Forge SVG section text"), "asset inspection did not extract SVG text");
+      assertSmoke(svgInspection.ocr?.textBlocks?.some((item) => item.includes("Forge SVG aria section")), "asset inspection did not extract SVG aria label");
+
+      smokeStep("asset-inspect:data");
+      const dataInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(dataAssetFixtureName)}`);
+      assertSmoke(dataInspection.data?.headers?.includes("name"), "asset inspection did not parse csv headers");
+      assertSmoke(dataInspection.data?.rows?.length >= 2, "asset inspection did not parse csv rows");
+
+      smokeStep("asset-inspect:parquet");
+      const parquetInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(parquetDataAssetFixtureName)}`);
+      assertSmoke(parquetInspection.data?.format === "parquet", "asset inspection did not identify parquet data");
+      assertSmoke(parquetInspection.data?.footerAvailable === true, "asset inspection did not detect parquet footer");
+      assertSmoke(parquetInspection.data?.metadataStrings?.some((item) => item.includes("forge_parquet_smoke")), "asset inspection did not extract parquet metadata strings");
+
+      smokeStep("asset-inspect:docx");
+      const documentInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(documentAssetFixtureName)}`);
+      assertSmoke(documentInspection.document?.packageType === "office-open-xml", "asset inspection did not identify OOXML document");
+      assertSmoke(documentInspection.document?.textSample?.includes("Forge DOCX section text"), "asset inspection did not extract docx text");
+
+      smokeStep("asset-inspect:legacy-doc");
+      const legacyDocumentInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(legacyDocumentAssetFixtureName)}`);
+      assertSmoke(legacyDocumentInspection.document?.packageType === "compound-file-binary", "asset inspection did not identify legacy Office binary document");
+      assertSmoke(legacyDocumentInspection.document?.textSample?.includes("Forge legacy DOC smoke text"), "asset inspection did not extract legacy Office text sample");
+
+      smokeStep("asset-inspect:pdf");
+      const pdfInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(pdfAssetFixtureName)}`);
+      assertSmoke(pdfInspection.document?.format === "pdf", "asset inspection did not identify PDF document");
+      assertSmoke(pdfInspection.document?.textSample?.includes("Forge PDF smoke text"), "asset inspection did not extract PDF text sample");
+      assertSmoke(pdfInspection.document?.layout?.pageBoxes?.[0]?.width === 612, "asset inspection did not extract PDF page box width");
+      assertSmoke(pdfInspection.document?.layout?.textBlocks?.some((block) => block.text.includes("Forge PDF smoke text") && block.x === 72 && block.y === 720), "asset inspection did not extract positioned PDF text block");
+
+      smokeStep("asset-inspect:compressed-pdf");
+      const compressedPdfInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(compressedPdfAssetFixtureName)}`);
+      assertSmoke(compressedPdfInspection.document?.format === "pdf", "asset inspection did not identify compressed PDF document");
+      assertSmoke(compressedPdfInspection.document?.textSample?.includes("Forge compressed PDF smoke text"), "asset inspection did not extract compressed PDF text sample");
+      assertSmoke(compressedPdfInspection.document?.layout?.filters?.includes("FlateDecode"), "asset inspection did not report FlateDecode filter");
+
+      smokeStep("asset-inspect:media");
+      const mediaInspection = await requestJson(baseUrl, `/api/asset-inspect?path=${encodeURIComponent(mediaAssetFixtureName)}`);
+      assertSmoke(mediaInspection.media?.format === "wav", "asset inspection did not parse wav media");
+      assertSmoke(mediaInspection.media?.durationSeconds > 0, "asset inspection did not calculate media duration");
+      assertSmoke(mediaInspection.transcription?.engine === "whisper", "asset inspection missing transcription engine probe");
+      assertSmoke(typeof mediaInspection.transcription?.cached === "boolean", "asset inspection missing transcription cache status");
+      checked.push("assets", "asset-inspect:image", "asset-inspect:svg", "asset-inspect:data", "asset-inspect:parquet", "asset-inspect:docx", "asset-inspect:legacy-doc", "asset-inspect:pdf", "asset-inspect:compressed-pdf", "asset-inspect:media");
     }
 
     if (shouldRun("apply")) {
@@ -17596,12 +19690,14 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       );
       const ciStatus = await requestJson(baseUrl, "/api/ci-status", {
         method: "POST",
+        timeoutMs: 120000,
         body: JSON.stringify({ limit: 10, persist: true })
       });
       assertSmoke(Array.isArray(ciStatus.status?.localChecks), "CI status missing local checks");
       if (ciStatus.status?.artifact?.path) cleanup.remoteCiArtifactPath = path.join(APP_ROOT, ciStatus.status.artifact.path);
       const mergeGate = await requestJson(baseUrl, "/api/merge-gate", {
         method: "POST",
+        timeoutMs: 120000,
         body: JSON.stringify({ prompt: "api smoke section merge gate", limit: 10 })
       });
       assertSmoke(Array.isArray(mergeGate.gate?.gates), "merge gate missing gates");
@@ -17640,7 +19736,46 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(remotePublishContinuation.continuation?.paths?.continuation?.endsWith("continuation.md"), "remote publish continuation missing continuation artifact");
       assertSmoke(remotePublishContinuation.continuation?.paths?.evidenceTemplate?.endsWith("external-evidence-template.json"), "remote publish continuation missing evidence template artifact");
       assertSmoke(Array.isArray(remotePublishContinuation.continuation?.verificationCommands), "remote publish continuation missing verification commands");
-      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight", "remote-publish-continuation");
+      assertSmoke(remotePublishContinuation.continuation?.evidenceTemplate?.externalExecution, "remote publish continuation missing external execution template");
+      const remotePublishEvidence = await requestJson(baseUrl, "/api/remote-publish-evidence", {
+        method: "POST",
+        body: JSON.stringify({
+          id: remotePublishPlan.package.id,
+          limit: 5,
+          evidence: {
+            ...remotePublishContinuation.continuation.evidenceTemplate,
+            externalExecution: {
+              ...remotePublishContinuation.continuation.evidenceTemplate.externalExecution,
+              executedBy: "api smoke section",
+              executedAt: new Date().toISOString(),
+              commandsRun: (remotePublishContinuation.continuation.evidenceTemplate.externalExecution.commandsRun || []).map((item) => ({
+                ...item,
+                status: "completed",
+                outputSummary: "api smoke section external evidence"
+              })),
+              remoteUrl: "https://gitee.com/jsy96/coder/pulls/1",
+              prOrMrNumber: "1",
+              ciUrl: "https://gitee.com/jsy96/coder/pipelines/1",
+              reviewCommentUrl: "https://gitee.com/jsy96/coder/pulls/1#note_1",
+              rollbackPlan: "Revert the remote PR branch or close the PR.",
+              notes: "api smoke section"
+            }
+          }
+        })
+      });
+      assertSmoke(remotePublishEvidence.evidence?.policy?.writesLocalArtifacts === true, "remote publish evidence should write local artifacts only");
+      assertSmoke(remotePublishEvidence.evidence?.policy?.pushes === false, "remote publish evidence should not push");
+      assertSmoke(remotePublishEvidence.evidence?.status === "ready", "remote publish evidence should validate completed template");
+      assertSmoke(remotePublishEvidence.evidence?.paths?.evidence?.endsWith("external-evidence.json"), "remote publish evidence missing evidence artifact path");
+      assertSmoke(remotePublishEvidence.evidence?.verificationCommands?.some((item) => item.command === "node server.js --api-smoke-section=publish"), "remote publish evidence missing publish smoke command");
+      const mergeGateWithExternalEvidence = await requestJson(baseUrl, "/api/merge-gate", {
+        method: "POST",
+        timeoutMs: 120000,
+        body: JSON.stringify({ prompt: "api smoke section merge gate with external evidence", limit: 10 })
+      });
+      assertSmoke(mergeGateWithExternalEvidence.gate?.gates?.some((item) => item.id === "remote-publish-external-evidence"), "merge gate missing remote publish external evidence gate");
+      assertSmoke(mergeGateWithExternalEvidence.gate?.externalEvidence?.status === "ready", "merge gate missing ready external evidence summary");
+      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight", "remote-publish-continuation", "remote-publish-evidence", "merge-gate-external-evidence");
     }
 
     console.log(JSON.stringify({
@@ -17662,6 +19797,14 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       await fs.rm(cleanup.mcpFixturePath, { force: true }).catch(() => {});
     }
     if (cleanup.assetFixturePath) await fs.rm(cleanup.assetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.svgAssetFixturePath) await fs.rm(cleanup.svgAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.dataAssetFixturePath) await fs.rm(cleanup.dataAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.parquetDataAssetFixturePath) await fs.rm(cleanup.parquetDataAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.documentAssetFixturePath) await fs.rm(cleanup.documentAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.legacyDocumentAssetFixturePath) await fs.rm(cleanup.legacyDocumentAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.pdfAssetFixturePath) await fs.rm(cleanup.pdfAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.compressedPdfAssetFixturePath) await fs.rm(cleanup.compressedPdfAssetFixturePath, { force: true }).catch(() => {});
+    if (cleanup.mediaAssetFixturePath) await fs.rm(cleanup.mediaAssetFixturePath, { force: true }).catch(() => {});
     if (cleanup.applyFixtureAPath) await fs.rm(cleanup.applyFixtureAPath, { force: true }).catch(() => {});
     if (cleanup.applyFixtureBPath) await fs.rm(cleanup.applyFixtureBPath, { force: true }).catch(() => {});
     if (cleanup.queuePath) await fs.rm(cleanup.queuePath, { force: true }).catch(() => {});
@@ -17670,6 +19813,54 @@ async function runApiSmokeSectionTest(sectionValue = "") {
     if (cleanup.handoffPath) await fs.rm(cleanup.handoffPath, { force: true }).catch(() => {});
     if (cleanup.remotePublishDir) await fs.rm(cleanup.remotePublishDir, { recursive: true, force: true }).catch(() => {});
     if (cleanup.remoteCiArtifactPath) await fs.rm(cleanup.remoteCiArtifactPath, { force: true }).catch(() => {});
+    if (cleanup.browserBaselinePath) await fs.rm(cleanup.browserBaselinePath, { force: true }).catch(() => {});
+    if (cleanup.browserScreenshotPath) await fs.rm(cleanup.browserScreenshotPath, { force: true }).catch(() => {});
+    if (cleanup.browserSelectorScreenshotPath) await fs.rm(cleanup.browserSelectorScreenshotPath, { force: true }).catch(() => {});
+    if (cleanup.browserDomPath) await fs.rm(cleanup.browserDomPath, { force: true }).catch(() => {});
+    if (cleanup.browserTracePath) await fs.rm(cleanup.browserTracePath, { force: true }).catch(() => {});
+    if (cleanup.browserSessionPath) await fs.rm(cleanup.browserSessionPath, { force: true }).catch(() => {});
+    if (cleanup.browserVisualBaselinePath) await fs.rm(cleanup.browserVisualBaselinePath, { force: true }).catch(() => {});
+    if (cleanup.browserVisualMetaPath) await fs.rm(cleanup.browserVisualMetaPath, { force: true }).catch(() => {});
+    if (cleanup.browserVisualDiffBaselinePath) await fs.rm(cleanup.browserVisualDiffBaselinePath, { force: true }).catch(() => {});
+    if (cleanup.browserVisualDiffMetaPath) await fs.rm(cleanup.browserVisualDiffMetaPath, { force: true }).catch(() => {});
+    if (cleanup.browserVisualDiffPath) await fs.rm(cleanup.browserVisualDiffPath, { force: true }).catch(() => {});
+    for (const browserVisualPath of cleanup.browserVisualScreenshotPaths || []) await fs.rm(browserVisualPath, { force: true }).catch(() => {});
+    if (originalGoalState === null) {
+      await fs.rm(GOAL_STATE_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(GOAL_STATE_PATH, originalGoalState, "utf8");
+    }
+    if (originalContextSnapshot === null) {
+      await fs.rm(CONTEXT_SNAPSHOT_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(CONTEXT_SNAPSHOT_PATH, originalContextSnapshot, "utf8");
+    }
+    if (originalContextCompact === null) {
+      await fs.rm(CONTEXT_COMPACT_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(CONTEXT_COMPACT_PATH, originalContextCompact, "utf8");
+    }
+    if (originalContextRollup === null) {
+      await fs.rm(CONTEXT_ROLLUP_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(CONTEXT_ROLLUP_PATH, originalContextRollup, "utf8");
+    }
+    if (originalSemanticIndex === null) {
+      await fs.rm(SEMANTIC_INDEX_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(SEMANTIC_INDEX_PATH, originalSemanticIndex, "utf8");
+    }
+    if (originalRuntimeUrl === null) {
+      await fs.rm(RUNTIME_URL_PATH, { force: true }).catch(() => {});
+    } else {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      await fs.writeFile(RUNTIME_URL_PATH, originalRuntimeUrl, "utf8");
+    }
     currentWorkspace = originalWorkspace;
     await closeSmokeServer(sectionServer);
   }
@@ -17795,6 +19986,70 @@ async function runUiSmokeTest() {
     "function stageExternalPreparationReadinessCommands",
     "外部准备预检命令已放入面板",
     "外部缺口准备清单已加入提示词",
+    "function formatExternalReadinessPackageSummary",
+    "function externalReadinessPackagePrompt",
+    "function appendExternalReadinessPackageToPrompt",
+    "function stageExternalReadinessPackageCommands",
+    "async function openExternalReadinessPackage",
+    "async function listExternalReadinessPackages",
+    "async function generateExternalReadinessPackage",
+    "外部准备包已生成",
+    "外部准备包列表",
+    "外部准备包预检命令已放入面板",
+    "外部准备包已加入提示词",
+    "function formatExternalAuthorizationStatus",
+    "function externalAuthorizationStatusPrompt",
+    "function appendExternalAuthorizationStatusToPrompt",
+    "async function showExternalAuthorizationStatus",
+    "外部授权状态",
+    "外部授权状态已加入提示词",
+    "function formatExternalAuthorizationActionSummary",
+    "function appendExternalAuthorizationActionToPrompt",
+    "function stageExternalAuthorizationActionCommands",
+    "async function generateExternalAuthorizationActionPackage",
+    "外部授权行动包已生成",
+    "外部授权行动包验证命令已放入面板",
+    "function formatWorkspaceReadiness",
+    "function workspaceReadinessPrompt",
+    "function appendWorkspaceReadinessToPrompt",
+    "function stageWorkspaceReadinessCommands",
+    "function formatProjectDoctor",
+    "function projectDoctorPrompt",
+    "function appendProjectDoctorToPrompt",
+    "function stageProjectDoctorCommands",
+    "async function showProjectDoctor",
+    "Project Doctor 一键体检",
+    "Project Doctor 推荐验证命令已放入面板",
+    "data-action=\"doctor\"",
+    "/api/doctor",
+    "async function showWorkspaceReadiness",
+    "工作区健康检查",
+    "工作区健康验证命令已放入面板",
+    "data-action=\"workspace\"",
+    "/api/workspace-readiness",
+    "function formatIntegrationReadinessSummary",
+    "function integrationReadinessPrompt",
+    "function appendIntegrationReadinessToPrompt",
+    "function stageIntegrationReadinessCommands",
+    "async function generateIntegrationReadinessPackage",
+    "集成准备包已生成",
+    "集成准备包验证命令已放入面板",
+    "data-action=\"integration\"",
+    "/api/integration-readiness",
+    "/api/integration-readiness-packages",
+    "/api/integration-readiness-package",
+    "data-action=\"auth-status\"",
+    "data-action=\"auth-action\"",
+    "data-action=\"package\"",
+    "data-action=\"packages\"",
+    "data-action=\"auth-actions\"",
+    "/api/external-readiness",
+    "/api/external-readiness-packages",
+    "/api/external-readiness-package",
+    "/api/external-authorization-status",
+    "/api/external-authorization-action",
+    "/api/external-authorization-actions",
+    "/api/external-authorization-action-package",
     "externalPreparation",
     "recommendedNext",
     "function selectCapabilityRecommendation",
@@ -18396,6 +20651,7 @@ async function runUiSmokeTest() {
     "function stageRepairVerificationCommands",
     "function smokeSectionCommandItems",
     "async function runSmokeSectionCommands",
+    "function updateSmokeShortcutButton",
     "手动验证命令已加入面板",
     "最近命令已填入",
     "最近命令已固定",
@@ -18472,8 +20728,12 @@ async function runUiSmokeTest() {
     "copy-all-commands",
     "run-fast-smoke",
     "run-debug-smoke",
+    "run-browser-smoke",
+    "run-assets-smoke",
     "快速 smoke",
     "调试 smoke",
+    "浏览器 smoke",
+    "资产 smoke",
     "run-all-commands",
     "rerun-failed-commands",
     "重跑失败",
@@ -19612,6 +21872,12 @@ async function runApiSmokeTest() {
     assertSmoke(modelCostPolicy.policy?.policy?.writesEnvironment === false, "model cost policy should not write environment");
     assertSmoke(modelCostPolicy.policy?.valid === true, "model cost policy dry-run should parse");
     assertSmoke(modelCostPolicy.policy?.parsed?.models?.default?.promptPer1M === 1, "model cost policy did not parse default prompt rate");
+    const modelCostPolicyWithBom = await requestJson(baseUrl, "/api/model-cost-policy", {
+      method: "POST",
+      body: `\uFEFF${JSON.stringify({ raw: JSON.stringify({ currency: "USD", models: { default: { promptPer1M: 1, completionPer1M: 2 } } }) })}`
+    });
+    assertSmoke(modelCostPolicyWithBom.policy?.valid === true, "model cost policy should accept BOM-prefixed JSON request bodies");
+    assertSmoke(modelCostPolicyWithBom.policy?.parsed?.models?.default?.promptPer1M === 1, "model cost policy did not parse BOM-prefixed request body");
     smokeStep("model-billing");
     const modelBilling = await requestJson(baseUrl, "/api/model-billing", {
       method: "POST",
@@ -19678,6 +21944,10 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "remote_publish_continuation"), "tools endpoint missing remote_publish_continuation");
     assertSmoke(tools.tools.some((item) => item.name === "policy_audit"), "tools endpoint missing policy_audit");
     assertSmoke(tools.tools.some((item) => item.name === "permission_matrix"), "tools endpoint missing permission_matrix");
+    assertSmoke(tools.tools.some((item) => item.name === "project_doctor"), "tools endpoint missing project_doctor");
+    assertSmoke(tools.tools.some((item) => item.name === "workspace_readiness"), "tools endpoint missing workspace_readiness");
+    assertSmoke(tools.tools.some((item) => item.name === "external_authorization_status"), "tools endpoint missing external_authorization_status");
+    assertSmoke(tools.tools.some((item) => item.name === "external_authorization_action"), "tools endpoint missing external_authorization_action");
     assertSmoke(tools.tools.some((item) => item.name === "extension_trust"), "tools endpoint missing extension_trust");
     assertSmoke(tools.tools.some((item) => item.name === "queue_isolation"), "tools endpoint missing queue_isolation");
     assertSmoke(tools.tools.some((item) => item.name === "process_health"), "tools endpoint missing process_health");
@@ -20726,12 +22996,28 @@ function runCliTask(task) {
     });
 }
 
-if (process.argv.includes("--mcp-smoke-server")) {
+const unknownFlags = unknownCliFlags();
+
+if (unknownFlags.length) {
+  console.error(`Unknown CLI option${unknownFlags.length === 1 ? "" : "s"}: ${unknownFlags.join(", ")}`);
+  console.error("Use a known command such as --capability-audit, --workspace-readiness, --integration-readiness, --ui-smoke-test, or start without CLI flags.");
+  process.exitCode = 1;
+} else if (process.argv.includes("--mcp-smoke-server")) {
   runMcpSmokeServer();
-} else if (process.argv.includes("--capability-audit") || process.argv.includes("--capabilities") || process.argv.includes("--capability-audit-json")) {
+} else if (process.argv.includes("--capability-audit") || process.argv.includes("--capabilities") || process.argv.includes("--capability-audit-json") || process.argv.includes("--capabilities-json")) {
   runCliTask(runCapabilityAuditCli);
+} else if (process.argv.includes("--doctor") || process.argv.includes("--project-doctor") || process.argv.includes("--doctor-json") || process.argv.includes("--project-doctor-json")) {
+  runCliTask(runProjectDoctorCli);
 } else if (process.argv.includes("--external-readiness") || process.argv.includes("--external-readiness-json")) {
   runCliTask(runExternalReadinessCli);
+} else if (process.argv.includes("--external-authorization-status") || process.argv.includes("--external-authorization-status-json")) {
+  runCliTask(runExternalAuthorizationStatusCli);
+} else if (process.argv.includes("--workspace-readiness") || process.argv.includes("--workspace-readiness-json")) {
+  runCliTask(runWorkspaceReadinessCli);
+} else if (process.argv.includes("--external-authorization-action") || process.argv.includes("--external-authorization-action-json")) {
+  runCliTask(runExternalAuthorizationActionCli);
+} else if (process.argv.includes("--integration-readiness") || process.argv.includes("--integration-readiness-json")) {
+  runCliTask(runIntegrationReadinessCli);
 } else if (process.argv.includes("--api-smoke-test")) {
   runCliTask(runApiSmokeTest);
 } else if (process.argv.includes("--api-smoke-section") || process.argv.some((item) => item.startsWith("--api-smoke-section="))) {
@@ -20742,7 +23028,7 @@ if (process.argv.includes("--mcp-smoke-server")) {
   runCliTask(runPortConflictSmokeTest);
 } else if (process.argv.includes("--smoke-test")) {
   runCliTask(runSmokeTest);
-} else {
+} else if (shouldRunServerForArgs()) {
   listenAppServerWithRetry({
     onRetry({ activePort, nextPort, reason }) {
       console.warn(`Port ${activePort} is ${reason}. Trying ${nextPort}...`);
@@ -20768,4 +23054,8 @@ if (process.argv.includes("--mcp-smoke-server")) {
     console.error(error);
     process.exitCode = 1;
   });
+} else {
+  console.error("Unknown CLI argument combination.");
+  console.error("Start the server with no flags or --port=<number>, or run a known CLI command such as --capability-audit.");
+  process.exitCode = 1;
 }

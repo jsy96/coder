@@ -48,3 +48,5 @@ scripts/ai_place_candidates*.json
 
 # bat
 *.bat
+!/start.bat
+!/validate.bat

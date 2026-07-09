@@ -57,6 +57,8 @@ node server.js
 node server.js --capability-audit
 # 或输出 JSON 供脚本读取
 node server.js --capability-audit --json
+# 兼容短别名，也会输出 JSON；拼错的 --xxx 参数会直接报错，不会误启动常驻服务
+node server.js --capabilities-json
 ```
 
 也可以用 npm 脚本：
@@ -68,15 +70,53 @@ npm run capabilities:json
 
 这个命令会输出已实现/部分实现/缺失统计、推荐下一步、本地可补齐缺口、外部授权阻塞项和本地预检命令，方便持续判断“还差什么”。
 
+一键体检会把 Codex 能力差距、工作区健康、外部授权状态、MCP/扩展准备度和推荐验证命令合并到一个只读报告里：
+
+```powershell
+node server.js --doctor
+# 或输出 JSON 供脚本/面板读取
+node server.js --doctor --json
+# 等价别名
+node server.js --project-doctor
+```
+
+`--doctor` 默认不执行远端写入、不创建 PR、不 push，只汇总本地证据和外部阻塞项；需要额外只读探测时可加 `--deep`。
+
+提交或交接前，可以先检查本地工作区是否处于可交付状态：
+
+```powershell
+node server.js --workspace-readiness
+# 或输出 JSON 供脚本读取
+node server.js --workspace-readiness --json
+```
+
+这个检查会确认 `start.bat`、`validate.bat`、`.gitignore` 放行规则、`.forge/` artifact 忽略规则、关键 npm 脚本和 Git remote 状态，并在入口脚本尚未加入版本控制时给出明确下一步。它是只读检查，不会修改工作区。
+
 当审计显示剩余差距都依赖外部授权时，可以生成本地准备包：
 
 ```powershell
 node server.js --external-readiness
 # 只预览，不写入 .forge artifact
 node server.js --external-readiness --dry-run
+# 查看已生成准备包
+node server.js --external-readiness --list
+# 查看当前外部授权状态，不执行远端写入
+node server.js --external-authorization-status
+# 把 blocking/manual 授权项整理成行动包
+node server.js --external-authorization-action
+# 只预览行动包，不写入 .forge artifact
+node server.js --external-authorization-action --dry-run
+# 查看已生成行动包
+node server.js --external-authorization-action --list
+# 生成 MCP/扩展本地集成准备包
+node server.js --integration-readiness
+# 只预览集成准备包，不写入 .forge artifact
+node server.js --integration-readiness --dry-run
+# 查看已生成集成准备包
+node server.js --integration-readiness --list
 ```
 
-准备包会写入 `.forge/external-readiness/<id>/readiness.md` 和 `readiness.json`，整理授权清单、本地只读预检命令和每个外部阻塞缺口的下一步，方便后续接入远端 PR/CI、MCP、跨站点浏览器或系统级沙箱时逐项推进。
+准备包会写入 `.forge/external-readiness/<id>/readiness.md` 和 `readiness.json`，整理授权清单、本地只读预检命令和每个外部阻塞缺口的下一步；行动包会写入 `.forge/external-authorization/<id>/action.md` 和 `action.json`，把 blocking/manual 授权项转成可执行清单、手工步骤和 follow-up verification 命令；集成准备包会写入 `.forge/integration-readiness/<id>/readiness.md` 和 `readiness.json`，提供 MCP server 配置模板、本地扩展 manifest 模板、trust 审计边界和验证命令。`/api/external-readiness-packages`、`/api/external-readiness-package?id=...`、`/api/external-authorization-actions`、`/api/external-authorization-action-package?id=...`、`/api/integration-readiness-packages` 和 `/api/integration-readiness-package?id=...` 可只读复用这些 artifact。网页左侧能力矩阵的“剩余差距摘要”也提供“工作区健康”“集成准备”“授权状态”“行动包”“生成包”“最近包”和“最近行动”按钮，可直接查看启动/验证入口、Git remote、远端 CLI、MCP、扩展、模型 Key、发布证据和权限边界的只读授权状态，生成准备包/行动包/集成准备包、打开最近 artifact、把正文加入提示词，并把本地预检或验证命令放入命令面板，方便后续接入远端 PR/CI、MCP、跨站点浏览器或系统级沙箱时逐项推进。
 
 ## 推荐调试流程
 
@@ -163,11 +203,11 @@ node server.js --external-readiness --dry-run
 - **批量源码上下文**：命令面板工具条新增“源码上下文”和“源码修复”入口，会汇总所有失败命令的 `sourceLocations`、失败分类和附近源码片段；既可一键加入提示词，也可直接调用 `/api/source-context-repair-draft` 生成待审批的批量源码修复草稿，并把“重跑原失败命令 -> 语法检查 -> debug smoke”的验证链放回命令面板；如果接口或模型请求失败，前端会把失败命令、源码定位、错误原因和可重跑验证命令回填到提示词并保留证据卡，同时把验证命令放回命令面板，避免调试链路中断后丢上下文；该接口还支持只读 `dryRun`，用于 smoke 覆盖源码读取、策略和验证命令，不依赖真实模型请求。
 - **能力矩阵**：新增 `/api/capabilities` 和侧栏“Codex 对标”，按 partial/missing 缺口优先展示已实现、部分实现和缺失能力，并显示状态汇总；能力审计会额外输出“读懂项目上下文 / 安全改代码 / 运行与调试闭环 / 审查与交付 / 工具与多模态”五条写代码与调试主链路的覆盖度、证据、缺口和是否依赖外部授权；同时返回 `gapSummary`，汇总未完成总数、本地可补齐数量、外部授权受限数量、推荐缺口、优先本地动作和前几项本地/外部缺口；当剩余项都依赖外部授权时，还会返回 `externalPreparation`，把远端 PR、push、provider、MCP、跨站点浏览器、账单或系统级沙箱等事项拆成本地准备清单、授权边界和可运行预检命令；覆盖卡片和“剩余差距摘要”可直接启动“本地补齐”，也可把外部阻塞项作为“授权清单”或“准备清单”加入提示词，或把外部准备清单里的本地只读预检命令一键放入命令面板，避免把外部阻塞误当成本地已完成；“继续目标”提示会带入这份摘要，让下一轮优先推进可在本地验证的能力闭环；顶部会给出“推荐下一步”缺口，按真实写代码/调试影响排序；每条能力差距都可查看详情、加入提示词、把当前验证计划命令放入命令面板，或直接启动“补齐到更像 Codex”的改进任务。
 - **工具目录**：新增 `/api/tools` 和侧栏“工具目录”，展示内置 agent 工具、本地扩展工具桥接、参数 schema 和只读策略；工具行可查看详情、加入提示词或启动“目录修复”，用于补齐工具说明、参数 schema、验证入口和失败恢复路径。
-- **扩展目录**：新增 `/api/extensions` 和侧栏“扩展目录”，扫描 `.forge/extensions/{skills,plugins}` 下的本地 manifest，展示技能/插件声明、能力和审批策略；扩展行可查看详情、加入提示词、生成“准备清单”，或生成工具调用“审批示例”，不会绕过审批直接执行扩展工具。
+- **扩展目录**：新增 `/api/extensions` 和侧栏“扩展目录”，扫描 `.forge/extensions/{skills,plugins}` 和可入库的 `extensions/{skills,plugins}` 下的本地 manifest；项目自带 `extensions/plugins/local-readonly-helper/manifest.json`，声明 workspace readiness、Project Doctor 和 repo map 只读桥接工具。扩展行可查看详情、加入提示词、生成“准备清单”，或生成工具调用“审批示例”，不会绕过审批直接执行扩展工具。
 - **扩展 Trust 审计**：新增 `/api/extension-trust`、`extension_trust` 只读工具和扩展区“Trust”按钮，对本地扩展 manifest 计算 SHA-256，展示 checksum pin、本地公钥签名校验、审批要求和未接入远端签名市场的 guardrails；审计结果会作为门禁证据卡展示，可一键加入提示词或直接启动基于 trust gap 的修复任务。
 - **扩展工具调用审批**：新增 `/api/extension-tool-call`，把本地扩展声明的工具映射到内置只读工具；调用先写入 `.forge/approvals`，批准后才通过 `/api/approval-execute` 执行；审批计划卡可一键加入提示词或直接生成安全替代方案；扩展调用失败会保留 manifest、工具名、请求参数和错误证据，并提供加入提示词、重试、目录修复和直接诊断修复入口。
 - **权限策略审计**：新增 `/api/policy-audit`、`policy_audit` 只读工具和“权限审计”按钮，汇总命令/进程策略、审批状态、工具访问级别、guardrails 和当前权限缺口；不会执行命令或改变审批状态。
-- **MCP 发现与探测**：新增 `/api/mcp?probe=1` 和侧栏“MCP 服务 / 探测”，只读发现 `.forge/mcp/servers.json`、应用根目录 `.mcp.json` 与工作区 `.mcp.json` 中声明的 MCP server，并对策略允许的本地 MCP 做短时握手、工具、资源和提示词枚举；MCP 行可查看详情、读取首个资源、加入提示词或生成“准备清单”，用于整理 server 配置、资源/工具目录、审批边界和本地探测证据；`/api/mcp-resource` 和 `mcp_resource` 只读读取 MCP resource 内容，不执行 `tools/call`，读取结果可一键加入提示词或启动基于 resource 内容的处理/修复任务；MCP 探测、资源读取或工具调用审批失败都会生成可重试、可加入提示词、可回到目录修复的动作失败证据卡。
+- **MCP 发现与探测**：新增 `/api/mcp?probe=1` 和侧栏“MCP 服务 / 探测”，只读发现 `.forge/mcp/servers.json`、应用根目录 `.mcp.json` 与工作区 `.mcp.json` 中声明的 MCP server，并对策略允许的本地 MCP 做短时握手、工具、资源和提示词枚举；项目自带 `.mcp.json` 和 `scripts/mcp-local-workspace.js`，提供 `workspace_search`、`workspace_read`、README/package resources 和本地调试 prompt，作为可验证的只读 MCP 基线。MCP 行可查看详情、读取首个资源、加入提示词或生成“准备清单”，用于整理 server 配置、资源/工具目录、审批边界和本地探测证据；`/api/mcp-resource` 和 `mcp_resource` 只读读取 MCP resource 内容，不执行 `tools/call`，读取结果可一键加入提示词或启动基于 resource 内容的处理/修复任务；MCP 探测、资源读取或工具调用审批失败都会生成可重试、可加入提示词、可回到目录修复的动作失败证据卡。
 - **MCP 工具调用审批**：新增 `/api/mcp-tool-call`，先校验本地 MCP server、工具目录和参数大小，再写入 `.forge/approvals`；只有批准后通过 `/api/approval-execute` 执行 `tools/call`；前端“审批示例”会生成审批计划而不是直接执行，审批计划卡可一键加入提示词或直接生成安全替代方案；MCP 工具调用失败会保留 server、工具名、参数和探测目录证据，支持重试、目录修复和直接诊断修复。
 - **资产目录**：新增 `/api/assets` 和侧栏“资产目录”，索引工作区图片、PDF/Office、CSV/JSONL 和媒体文件的元数据；资产行支持查看检查详情、作为 `@file` 引用加入提示词、把检查摘要加入提示词，或直接启动基于资产证据的处理/修复任务；资产检查、加入提示词或直接处理失败时，会保留资产路径、检查 endpoint 和错误栈，生成可重试、可引用原文件或直接修复的资产失败证据卡。
 - **资产内容检查**：新增 `/api/asset-inspect`，支持图片头部尺寸、PNG 像素视觉摘要、SVG title/desc/text/aria-label 本地文本提取、Tesseract OCR 执行开关、缓存 artifact 和引擎探测、CSV/TSV/JSONL 抽样、Parquet footer metadata 探测、DOCX/PPTX/XLSX OOXML 文本抽取、旧版 DOC/XLS/PPT CFBF 文本探测、PDF 页框/文本块/FlateDecode layout 抽取、WAV/MP3/MP4/WebM 媒体元数据解析，以及 Whisper 转写执行开关、缓存 artifact 和引擎探测。
@@ -200,11 +240,13 @@ node server.js --api-smoke-test
 npm run api-smoke:fast
 npm run api-smoke:coding
 npm run api-smoke:debug
+npm run api-smoke:browser
+npm run api-smoke:assets
 npm run api-smoke:integrations
 npm run api-smoke:publish
 ```
 
-Windows 下也可以直接双击项目根目录的 `validate.bat`；它只依赖 `node`，会依次运行语法检查、UI smoke 和常用 API 分段 smoke，适合 `npm` 环境损坏时继续验证。在命令面板或 CI/脚本里运行时使用无交互模式：
+Windows 下也可以直接双击项目根目录的 `validate.bat`；它只依赖 `node`，会依次运行语法检查、UI smoke、debug/browser/assets/integrations/publish 等常用 API 分段 smoke，适合 `npm` 环境损坏时继续验证。在命令面板或 CI/脚本里运行时使用无交互模式：
 
 ```bat
 validate.bat --no-pause
@@ -212,7 +254,7 @@ validate.bat --no-pause
 
 Forge Code 的“验证门禁”和“一键诊断”也会优先推荐这些 `node server.js --api-smoke-section=...` 分段命令，所以在界面里点击“运行验证计划”时，会先得到更快、更容易定位失败的检查链路。
 
-命令面板会识别 `fast` 和 `debug` 分段 smoke，并在工具栏显示“快速 smoke / 调试 smoke”快捷按钮；日常改代码时可以先跑对应分段，再决定是否运行全部检查。
+命令面板会识别 `fast`、`debug`、`browser` 和 `assets` 分段 smoke，并在工具栏显示“快速 smoke / 调试 smoke / 浏览器 smoke / 资产 smoke”快捷按钮；日常改代码时可以先跑对应分段，再决定是否运行全部检查。
 
 也可以手动指定分段：
 

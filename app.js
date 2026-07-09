@@ -131,6 +131,10 @@ const state = {
   lastPreApplyReviewKey: "",
   lastPreApplyReview: null,
   lastRecoverySummary: null,
+  lastExternalReadinessPackages: null,
+  lastExternalAuthorizationStatus: null,
+  lastExternalAuthorizationActions: null,
+  lastWorkspaceReadiness: null,
   commandDebugRestoredScope: "",
   manualCommandHistoryCursor: -1,
   manualCommandHistoryDraft: "",
@@ -3913,6 +3917,14 @@ async function runSmokeSectionCommands(commands = [], section = "", { title = "�
   return ok;
 }
 
+function updateSmokeShortcutButton(toolbar, commands, section, action) {
+  const button = toolbar.querySelector(`[data-action='${action}']`);
+  if (!button) return;
+  const items = smokeSectionCommandItems(commands, section);
+  button.hidden = items.length === 0;
+  button.disabled = items.length === 0;
+}
+
 function updateCommandToolbarSummaries() {
   checksList?.querySelectorAll(".command-list-toolbar").forEach((toolbar) => {
     const summary = toolbar.querySelector("[data-command-batch-summary]");
@@ -3943,18 +3955,10 @@ function updateCommandToolbarSummaries() {
     }
     const repairButton = toolbar.querySelector("[data-action='run-batch-evidence']");
     if (repairButton) repairButton.disabled = !commandBatchNeedsRepair(commands);
-    const fastSmokeButton = toolbar.querySelector("[data-action='run-fast-smoke']");
-    if (fastSmokeButton) {
-      const fastSmokeItems = smokeSectionCommandItems(commands, "fast");
-      fastSmokeButton.hidden = fastSmokeItems.length === 0;
-      fastSmokeButton.disabled = fastSmokeItems.length === 0;
-    }
-    const debugSmokeButton = toolbar.querySelector("[data-action='run-debug-smoke']");
-    if (debugSmokeButton) {
-      const debugSmokeItems = smokeSectionCommandItems(commands, "debug");
-      debugSmokeButton.hidden = debugSmokeItems.length === 0;
-      debugSmokeButton.disabled = debugSmokeItems.length === 0;
-    }
+    updateSmokeShortcutButton(toolbar, commands, "fast", "run-fast-smoke");
+    updateSmokeShortcutButton(toolbar, commands, "debug", "run-debug-smoke");
+    updateSmokeShortcutButton(toolbar, commands, "browser", "run-browser-smoke");
+    updateSmokeShortcutButton(toolbar, commands, "assets", "run-assets-smoke");
   });
 }
 
@@ -3968,6 +3972,8 @@ function renderCommandToolbar(commands = [], { title = "建议命令" } = {}) {
     <small data-command-batch-summary></small>
     <button type="button" data-action="run-fast-smoke" hidden>快速 smoke</button>
     <button type="button" data-action="run-debug-smoke" hidden>调试 smoke</button>
+    <button type="button" data-action="run-browser-smoke" hidden>浏览器 smoke</button>
+    <button type="button" data-action="run-assets-smoke" hidden>资产 smoke</button>
     <button type="button" data-action="copy-all-commands">复制全部命令</button>
     <button type="button" data-action="reference-batch-files" disabled>引用文件</button>
     <button type="button" data-action="prompt-failed-source-contexts" disabled>源码上下文</button>
@@ -3985,6 +3991,12 @@ function renderCommandToolbar(commands = [], { title = "建议命令" } = {}) {
   });
   toolbar.querySelector("[data-action='run-debug-smoke']").addEventListener("click", async () => {
     await runSmokeSectionCommands(items, "debug", { title });
+  });
+  toolbar.querySelector("[data-action='run-browser-smoke']").addEventListener("click", async () => {
+    await runSmokeSectionCommands(items, "browser", { title });
+  });
+  toolbar.querySelector("[data-action='run-assets-smoke']").addEventListener("click", async () => {
+    await runSmokeSectionCommands(items, "assets", { title });
   });
   toolbar.querySelector("[data-action='copy-all-commands']").addEventListener("click", async () => {
     const body = commandItemsToText(items);
@@ -7989,6 +8001,779 @@ function stageExternalPreparationReadinessCommands(gapSummary = {}) {
   });
 }
 
+function formatExternalReadinessPackageSummary(packageData = {}, fallback = {}) {
+  const summary = packageData.summary || fallback.summary || {};
+  const recommended = packageData.recommendedNext || fallback.recommendedNext || null;
+  const paths = packageData.paths || fallback.paths || {};
+  const authorizationItems = packageData.authorizationItems || fallback.authorizationItems || [];
+  const commands = normalizeCommandItems(packageData.localReadinessCommands || fallback.localReadinessCommands || []);
+  return [
+    `包 ID：${packageData.id || fallback.id || "未生成"}`,
+    packageData.generatedAt || fallback.generatedAt ? `生成时间：${packageData.generatedAt || fallback.generatedAt}` : "",
+    paths.markdown ? `Markdown：${paths.markdown}` : "",
+    paths.json ? `JSON：${paths.json}` : "",
+    `外部阻塞：${summary.externalBlockedCount || 0} · 已打包：${summary.packagedExternalGapCount || packageData.externalGaps?.length || 0} · 本地缺口：${summary.localActionableCount || 0}`,
+    recommended?.area ? `推荐下一步：${recommended.area} (${recommended.status || "partial"})` : "",
+    authorizationItems.length ? `授权项：${authorizationItems.slice(0, 6).join(" / ")}` : "",
+    commands.length ? `本地预检：${commands.slice(0, 6).map((item) => item.command).join(" / ")}` : "",
+    summary.guidance || ""
+  ].filter(Boolean).join("\n");
+}
+
+function externalReadinessPackagePrompt(packageResult = {}) {
+  const packageData = packageResult.package || packageResult;
+  const markdown = packageResult.markdown || "";
+  return [
+    "请基于这份 external readiness 准备包继续推进 Codex 对标。",
+    "",
+    formatExternalReadinessPackageSummary(packageData, packageResult),
+    "",
+    markdown ? "准备包正文：" : "",
+    markdown.slice(0, 18000),
+    "",
+    "要求：不要假装已经具备外部授权；优先整理需要用户确认的凭据、CLI 登录、远端权限和只读预检命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendExternalReadinessPackageToPrompt(packageResult = {}) {
+  const context = externalReadinessPackagePrompt(packageResult);
+  if (!context) {
+    showToast("暂无可加入提示词的外部准备包。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "外部准备包已加入提示词",
+    label: "auth",
+    state: packageResult.id || packageResult.package?.id || "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("外部准备包已加入提示词。");
+  return context;
+}
+
+function stageExternalReadinessPackageCommands(packageResult = {}) {
+  const packageData = packageResult.package || packageResult;
+  const commands = normalizeCommandItems(packageData.localReadinessCommands || []);
+  if (!commands.length) {
+    appendToolCall({
+      title: "外部准备包没有本地预检命令",
+      label: "$",
+      state: "跳过",
+      body: formatExternalReadinessPackageSummary(packageData, packageResult)
+    });
+    showToast("准备包里没有本地预检命令。");
+    return [];
+  }
+  return stageRepairVerificationCommands(commands, {
+    title: "外部准备包预检命令",
+    successTitle: "外部准备包预检命令已放入面板",
+    source: "external-readiness",
+    note: formatExternalReadinessPackageSummary(packageData, packageResult)
+  });
+}
+
+async function openExternalReadinessPackage(id = "") {
+  if (!id) {
+    showToast("没有可打开的外部准备包 ID。");
+    return null;
+  }
+  try {
+    const result = await api(`/api/external-readiness-package?id=${encodeURIComponent(id)}`);
+    if (state.lastExternalReadinessPackages) {
+      state.lastExternalReadinessPackages.lastOpenedId = result.id || id;
+    }
+    appendToolCall({
+      title: `外部准备包：${result.id}`,
+      label: "auth",
+      state: result.package?.summary?.status || "ready",
+      body: [
+        formatExternalReadinessPackageSummary(result.package, result),
+        "",
+        result.markdown || ""
+      ].join("\n").slice(0, 30000)
+    });
+    showToast("外部准备包已打开。");
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "外部准备包读取失败",
+      label: "auth",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+async function listExternalReadinessPackages() {
+  try {
+    const result = await api("/api/external-readiness-packages?limit=8");
+    state.lastExternalReadinessPackages = result;
+    const rows = result.packages || [];
+    appendToolCall({
+      title: "外部准备包列表",
+      label: "auth",
+      state: `${rows.length} 个`,
+      body: rows.length
+        ? rows.map((item) => [
+            `- ${item.id}`,
+            `  status: ${item.status || "unknown"} · external=${item.externalBlockedCount || 0} · packaged=${item.packagedExternalGapCount || 0} · commands=${item.localReadinessCommandCount || 0}`,
+            item.paths?.markdown ? `  markdown: ${item.paths.markdown}` : ""
+          ].filter(Boolean).join("\n")).join("\n")
+        : "当前工作区还没有 external readiness 准备包。"
+    });
+    showToast(rows.length ? `找到 ${rows.length} 个外部准备包。` : "暂无外部准备包。");
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "外部准备包列表读取失败",
+      label: "auth",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+async function generateExternalReadinessPackage({ dryRun = false } = {}) {
+  try {
+    const result = await api("/api/external-readiness", {
+      method: "POST",
+      body: JSON.stringify({ dryRun })
+    });
+    appendToolCall({
+      title: dryRun ? "外部准备包预览已生成" : "外部准备包已生成",
+      label: "auth",
+      state: result.package?.summary?.status || "ready",
+      body: [
+        formatExternalReadinessPackageSummary(result.package, result),
+        "",
+        result.markdown || ""
+      ].join("\n").slice(0, 30000)
+    });
+    showToast(dryRun ? "外部准备包预览已生成。" : "外部准备包已写入 .forge。");
+    if (!dryRun) await listExternalReadinessPackages();
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "外部准备包生成失败",
+      label: "auth",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+function formatExternalAuthorizationStatus(result = {}) {
+  const summary = result.summary || {};
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+  return [
+    `状态：${result.status || "unknown"} · ready=${summary.ready || 0}/${summary.total || rows.length} · blocking=${summary.blocking || 0}`,
+    result.remote?.provider ? `远端：${result.remote.provider}${result.remote?.project?.webUrl ? ` · ${result.remote.project.webUrl}` : ""}` : "",
+    "",
+    ...rows.map((row) => [
+      `- ${row.label || row.id}: ${row.status || "unknown"}${row.required ? " · required" : ""}`,
+      row.evidence?.length ? `  evidence: ${row.evidence.join(" / ")}` : "",
+      row.next ? `  next: ${row.next}` : ""
+    ].filter(Boolean).join("\n")),
+    result.nextActions?.length ? "\n下一步：" : "",
+    ...(result.nextActions || []).map((item) => `- ${item}`)
+  ].filter(Boolean).join("\n");
+}
+
+function externalAuthorizationStatusPrompt(result = {}) {
+  return [
+    "请基于这份外部授权状态继续推进 Codex 对标。",
+    "",
+    formatExternalAuthorizationStatus(result),
+    "",
+    "要求：不要执行远端写入；优先处理 blocking/manual/missing 的授权项，给出本地可验证的下一步。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendExternalAuthorizationStatusToPrompt(result = {}) {
+  const context = externalAuthorizationStatusPrompt(result);
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "外部授权状态已加入提示词",
+    label: "auth",
+    state: result.status || "unknown",
+    body: context.slice(0, 12000)
+  });
+  showToast("外部授权状态已加入提示词。");
+  return context;
+}
+
+async function showExternalAuthorizationStatus({ deep = false, appendPrompt = false } = {}) {
+  try {
+    const result = await api(`/api/external-authorization-status${deep ? "?deep=1" : ""}`);
+    state.lastExternalAuthorizationStatus = result;
+    appendToolCall({
+      title: deep ? "外部授权状态（含远端只读探测）" : "外部授权状态",
+      label: "auth",
+      state: result.status || "unknown",
+      body: formatExternalAuthorizationStatus(result).slice(0, 16000)
+    });
+    if (appendPrompt) appendExternalAuthorizationStatusToPrompt(result);
+    showToast(`外部授权状态：${result.status || "unknown"}`);
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "外部授权状态读取失败",
+      label: "auth",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+function formatProjectDoctor(result = {}) {
+  const summary = result.summary || {};
+  const commands = normalizeCommandItems(result.recommendedCommands || []);
+  const authRows = Array.isArray(result.blockingAuthorizationRows) ? result.blockingAuthorizationRows : [];
+  const localGaps = Array.isArray(result.localGaps) ? result.localGaps : [];
+  const externalGaps = Array.isArray(result.externalGaps) ? result.externalGaps : [];
+  const integrationMissing = Array.isArray(result.integrationReadiness?.missingOptional)
+    ? result.integrationReadiness.missingOptional
+    : [];
+  return [
+    `状态：${result.status || "unknown"}`,
+    `能力：implemented=${summary.implemented || 0} · partial=${summary.partial || 0} · missing=${summary.missing || 0}`,
+    `差距：本地=${summary.localActionableGaps || 0} · 外部=${summary.externalBlockedGaps || 0}`,
+    `工作区：${summary.workspaceStatus || "unknown"} · blocking=${summary.workspaceBlocking || 0}`,
+    `授权：${summary.authorizationStatus || "unknown"} · blocking=${summary.authorizationBlocking || 0} · manual=${summary.authorizationManual || 0}`,
+    `集成：${summary.integrationStatus || "unknown"} · optionalMissing=${summary.integrationMissingOptional || 0}`,
+    integrationMissing.length ? `待配置：${integrationMissing.join(" / ")}` : "",
+    result.recommendedNext?.capability?.area ? `推荐下一步：${result.recommendedNext.capability.area} (${result.recommendedNext.capability.status || "partial"})` : "",
+    result.recommendedNext?.reason ? `推荐原因：${result.recommendedNext.reason}` : "",
+    localGaps.length ? "\n本地缺口：" : "\n本地缺口：无",
+    ...localGaps.slice(0, 5).map((gap) => `- ${gap.area || "unknown"} (${gap.status || "partial"})${gap.next ? `：${gap.next}` : ""}`),
+    externalGaps.length ? "\n外部缺口：" : "\n外部缺口：无",
+    ...externalGaps.slice(0, 5).map((gap) => `- ${gap.area || "unknown"} (${gap.status || "partial"})${gap.next ? `：${gap.next}` : ""}`),
+    authRows.length ? "\n阻塞授权：" : "\n阻塞授权：无",
+    ...authRows.slice(0, 6).map((row) => `- ${row.label || row.id}: ${row.status || "unknown"}${row.next ? `：${row.next}` : ""}`),
+    commands.length ? "\n推荐验证：" : "\n推荐验证：无",
+    ...commands.slice(0, 10).map((item) => `- ${item.command}${item.manual ? " · manual" : ""}${item.reason ? `：${item.reason}` : ""}`)
+  ].filter(Boolean).join("\n");
+}
+
+function projectDoctorPrompt(result = {}) {
+  return [
+    "请基于这份 Project Doctor 一键体检继续推进 Codex 对标。",
+    "",
+    formatProjectDoctor(result),
+    "",
+    "要求：优先处理本地可执行缺口；如果只剩外部授权/平台能力，请生成可执行准备清单、本地只读验证命令和明确的授权边界，不要假装已经完成远端能力。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendProjectDoctorToPrompt(result = {}) {
+  const context = projectDoctorPrompt(result);
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "Project Doctor 已加入提示词",
+    label: "audit",
+    state: result.status || "unknown",
+    body: context.slice(0, 12000)
+  });
+  showToast("Project Doctor 已加入提示词。");
+  return context;
+}
+
+function stageProjectDoctorCommands(result = {}) {
+  const commands = normalizeCommandItems(result.recommendedCommands || []);
+  if (!commands.length) {
+    appendToolCall({
+      title: "Project Doctor 没有推荐验证命令",
+      label: "$",
+      state: "跳过",
+      body: formatProjectDoctor(result)
+    });
+    showToast("Project Doctor 没有推荐验证命令。");
+    return [];
+  }
+  return stageRepairVerificationCommands(commands, {
+    title: "Project Doctor 推荐验证命令",
+    successTitle: "Project Doctor 推荐验证命令已放入面板",
+    source: "project-doctor",
+    note: formatProjectDoctor(result)
+  });
+}
+
+async function showProjectDoctor({ deep = false, appendPrompt = false, stageCommands = false } = {}) {
+  try {
+    const params = new URLSearchParams({ includeIgnored: "1" });
+    if (deep) params.set("deep", "1");
+    const result = await api(`/api/doctor?${params.toString()}`);
+    state.lastProjectDoctor = result;
+    appendToolCall({
+      title: deep ? "Project Doctor（含只读深度探测）" : "Project Doctor 一键体检",
+      label: "audit",
+      state: result.status || "unknown",
+      body: formatProjectDoctor(result).slice(0, 18000)
+    });
+    if (stageCommands) stageProjectDoctorCommands(result);
+    if (appendPrompt) appendProjectDoctorToPrompt(result);
+    showToast(`Project Doctor：${result.status || "unknown"}`);
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "Project Doctor 读取失败",
+      label: "audit",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+function formatExternalAuthorizationActionSummary(packageData = {}, fallback = {}) {
+  const summary = packageData.summary || fallback.summary || {};
+  const paths = packageData.paths || fallback.paths || {};
+  const actions = Array.isArray(packageData.actions) ? packageData.actions : [];
+  const commands = normalizeCommandItems(packageData.verificationCommands || fallback.verificationCommands || []);
+  return [
+    `行动包 ID：${packageData.id || fallback.id || "未生成"}`,
+    packageData.generatedAt || fallback.generatedAt ? `生成时间：${packageData.generatedAt || fallback.generatedAt}` : "",
+    paths.markdown ? `Markdown：${paths.markdown}` : "",
+    paths.json ? `JSON：${paths.json}` : "",
+    `状态：${summary.status || "unknown"} · actions=${summary.actionCount || actions.length || 0} · blocking=${summary.blockingActionCount || 0} · manual=${summary.manualActionCount || 0}`,
+    packageData.remote?.provider ? `远端：${packageData.remote.provider}${packageData.remote?.project?.webUrl ? ` · ${packageData.remote.project.webUrl}` : ""}` : "",
+    actions.length ? `待处理：${actions.slice(0, 5).map((item) => `${item.label || item.id}(${item.status || "unknown"})`).join(" / ")}` : "",
+    commands.length ? `验证命令：${commands.slice(0, 6).map((item) => item.command).join(" / ")}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function externalAuthorizationActionPrompt(packageResult = {}) {
+  const packageData = packageResult.package || packageResult;
+  const markdown = packageResult.markdown || "";
+  return [
+    "请基于这份外部授权行动包继续推进 Codex 对标。",
+    "",
+    formatExternalAuthorizationActionSummary(packageData, packageResult),
+    "",
+    markdown ? "行动包正文：" : "",
+    markdown.slice(0, 18000),
+    "",
+    "要求：不要假装已经完成远端授权；按 manual/blocking 清单推进，并用 follow-up verification 命令验证本地闭环。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendExternalAuthorizationActionToPrompt(packageResult = {}) {
+  const context = externalAuthorizationActionPrompt(packageResult);
+  if (!context) {
+    showToast("暂无可加入提示词的外部授权行动包。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "外部授权行动包已加入提示词",
+    label: "auth",
+    state: packageResult.id || packageResult.package?.id || "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("外部授权行动包已加入提示词。");
+  return context;
+}
+
+function stageExternalAuthorizationActionCommands(packageResult = {}) {
+  const packageData = packageResult.package || packageResult;
+  const commands = normalizeCommandItems(packageData.verificationCommands || []);
+  if (!commands.length) {
+    appendToolCall({
+      title: "外部授权行动包没有验证命令",
+      label: "$",
+      state: "跳过",
+      body: formatExternalAuthorizationActionSummary(packageData, packageResult)
+    });
+    showToast("行动包里没有验证命令。");
+    return [];
+  }
+  return stageRepairVerificationCommands(commands, {
+    title: "外部授权行动包验证命令",
+    successTitle: "外部授权行动包验证命令已放入面板",
+    source: "external-authorization-action",
+    note: formatExternalAuthorizationActionSummary(packageData, packageResult)
+  });
+}
+
+async function openExternalAuthorizationActionPackage(id = "") {
+  if (!id) {
+    showToast("没有可打开的外部授权行动包 ID。");
+    return null;
+  }
+  try {
+    const result = await api(`/api/external-authorization-action-package?id=${encodeURIComponent(id)}`);
+    if (state.lastExternalAuthorizationActions) {
+      state.lastExternalAuthorizationActions.lastOpenedId = result.id || id;
+    }
+    appendToolCall({
+      title: `外部授权行动包：${result.id}`,
+      label: "auth",
+      state: result.package?.summary?.status || "ready",
+      body: [
+        formatExternalAuthorizationActionSummary(result.package, result),
+        "",
+        result.markdown || ""
+      ].join("\n").slice(0, 30000)
+    });
+    showToast("外部授权行动包已打开。");
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "外部授权行动包读取失败",
+      label: "auth",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+async function listExternalAuthorizationActionPackages() {
+  try {
+    const result = await api("/api/external-authorization-actions?limit=8");
+    state.lastExternalAuthorizationActions = result;
+    const rows = result.packages || [];
+    appendToolCall({
+      title: "外部授权行动包列表",
+      label: "auth",
+      state: `${rows.length} 个`,
+      body: rows.length
+        ? rows.map((item) => [
+            `- ${item.id}`,
+            `  status: ${item.status || "unknown"} · actions=${item.actionCount || 0} · blocking=${item.blockingActionCount || 0} · manual=${item.manualActionCount || 0}`,
+            item.paths?.markdown ? `  markdown: ${item.paths.markdown}` : ""
+          ].filter(Boolean).join("\n")).join("\n")
+        : "当前工作区还没有 external authorization action 行动包。"
+    });
+    showToast(rows.length ? `找到 ${rows.length} 个外部授权行动包。` : "暂无外部授权行动包。");
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "外部授权行动包列表读取失败",
+      label: "auth",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+async function generateExternalAuthorizationActionPackage({ dryRun = false } = {}) {
+  try {
+    const result = await api("/api/external-authorization-action", {
+      method: "POST",
+      body: JSON.stringify({ dryRun })
+    });
+    appendToolCall({
+      title: dryRun ? "外部授权行动包预览已生成" : "外部授权行动包已生成",
+      label: "auth",
+      state: result.package?.summary?.status || "ready",
+      body: [
+        formatExternalAuthorizationActionSummary(result.package, result),
+        "",
+        result.markdown || ""
+      ].join("\n").slice(0, 30000)
+    });
+    showToast(dryRun ? "外部授权行动包预览已生成。" : "外部授权行动包已写入 .forge。");
+    if (!dryRun) await listExternalAuthorizationActionPackages();
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "外部授权行动包生成失败",
+      label: "auth",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+function formatWorkspaceReadiness(result = {}) {
+  const summary = result.summary || {};
+  const git = result.git || {};
+  const checks = Array.isArray(result.checks) ? result.checks : [];
+  const untracked = Array.isArray(result.untrackedCritical) ? result.untrackedCritical : [];
+  const commands = normalizeCommandItems(result.recommendedCommands || []);
+  return [
+    `状态：${result.status || "unknown"} · ready=${summary.ready || 0}/${summary.checks || checks.length} · blocking=${summary.blocking || 0} · warnings=${summary.warnings || 0}`,
+    result.workspace ? `工作区：${result.workspace}` : "",
+    git.branch ? `Git：${git.branch}${git.changedFiles?.length ? ` · changed=${git.changedFiles.length}` : ""}` : "",
+    untracked.length ? `关键未跟踪：${untracked.join(" / ")}` : "关键未跟踪：无",
+    result.gitAddCommand ? `纳入版本控制：${result.gitAddCommand}` : "",
+    "",
+    ...checks.map((check) => [
+      `- ${check.label || check.id}: ${check.status || "unknown"}${check.required ? " · required" : ""}`,
+      check.evidence?.length ? `  evidence: ${check.evidence.join(" / ")}` : "",
+      check.next ? `  next: ${check.next}` : ""
+    ].filter(Boolean).join("\n")),
+    result.nextActions?.length ? "\n下一步：" : "",
+    ...(result.nextActions || []).map((item) => `- ${item}`),
+    commands.length ? "\n推荐验证：" : "",
+    ...commands.map((item) => `- ${item.command}${item.reason ? `：${item.reason}` : ""}`)
+  ].filter(Boolean).join("\n");
+}
+
+function workspaceReadinessPrompt(result = {}) {
+  return [
+    "请基于这份工作区健康检查继续推进 Codex 对标。",
+    "",
+    formatWorkspaceReadiness(result),
+    "",
+    "要求：优先修复会影响启动、验证、提交交付或继续写代码/调试的本地问题；如果只剩未跟踪文件或外部授权项，请明确下一步和验证命令。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendWorkspaceReadinessToPrompt(result = {}) {
+  const context = workspaceReadinessPrompt(result);
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "工作区健康检查已加入提示词",
+    label: "audit",
+    state: result.status || "unknown",
+    body: context.slice(0, 12000)
+  });
+  showToast("工作区健康检查已加入提示词。");
+  return context;
+}
+
+function stageWorkspaceReadinessCommands(result = {}) {
+  const commands = normalizeCommandItems(result.recommendedCommands || []);
+  if (!commands.length) {
+    appendToolCall({
+      title: "工作区健康检查没有推荐验证命令",
+      label: "$",
+      state: "跳过",
+      body: formatWorkspaceReadiness(result)
+    });
+    showToast("工作区健康检查没有推荐验证命令。");
+    return [];
+  }
+  return stageRepairVerificationCommands(commands, {
+    title: "工作区健康验证命令",
+    successTitle: "工作区健康验证命令已放入面板",
+    source: "workspace-readiness",
+    note: formatWorkspaceReadiness(result)
+  });
+}
+
+async function showWorkspaceReadiness({ appendPrompt = false, stageCommands = false } = {}) {
+  try {
+    const result = await api("/api/workspace-readiness?includeIgnored=1");
+    state.lastWorkspaceReadiness = result;
+    appendToolCall({
+      title: "工作区健康检查",
+      label: "audit",
+      state: result.status || "unknown",
+      body: formatWorkspaceReadiness(result).slice(0, 16000)
+    });
+    if (stageCommands) stageWorkspaceReadinessCommands(result);
+    if (appendPrompt) appendWorkspaceReadinessToPrompt(result);
+    showToast(`工作区健康：${result.status || "unknown"}`);
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "工作区健康检查失败",
+      label: "audit",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+function formatIntegrationReadinessSummary(packageData = {}, fallback = {}) {
+  const summary = packageData.summary || fallback.summary || {};
+  const checks = Array.isArray(packageData.checks) ? packageData.checks : [];
+  const commands = normalizeCommandItems(packageData.verificationCommands || fallback.verificationCommands || []);
+  const paths = packageData.paths || fallback.paths || {};
+  return [
+    `包 ID：${packageData.id || fallback.id || "未生成"}`,
+    packageData.generatedAt || fallback.generatedAt ? `生成时间：${packageData.generatedAt || fallback.generatedAt}` : "",
+    paths.markdown ? `Markdown：${paths.markdown}` : "",
+    paths.json ? `JSON：${paths.json}` : "",
+    `状态：${packageData.status || summary.status || "unknown"} · MCP=${summary.mcpServers || 0} · Extensions=${summary.extensions || 0} · Trust=${summary.trustRows || 0}`,
+    summary.missingOptional?.length ? `待配置：${summary.missingOptional.join(" / ")}` : "待配置：无",
+    checks.length ? `检查：${checks.slice(0, 4).map((item) => `${item.label || item.id}=${item.status}`).join(" / ")}` : "",
+    commands.length ? `验证命令：${commands.slice(0, 6).map((item) => item.command).join(" / ")}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function integrationReadinessPrompt(packageResult = {}) {
+  const packageData = packageResult.package || packageResult;
+  const markdown = packageResult.markdown || "";
+  return [
+    "请基于这份本地集成准备包继续推进 Codex 对标。",
+    "",
+    formatIntegrationReadinessSummary(packageData, packageResult),
+    "",
+    markdown ? "准备包正文：" : "",
+    markdown.slice(0, 18000),
+    "",
+    "要求：优先补齐 MCP server 配置、本地扩展 manifest、trust checksum/signature 和审批边界；不要执行外部工具或远端写入，先用本地验证命令闭环。"
+  ].filter(Boolean).join("\n");
+}
+
+function appendIntegrationReadinessToPrompt(packageResult = {}) {
+  const context = integrationReadinessPrompt(packageResult);
+  const current = input.value.trim();
+  input.value = [current, context].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "集成准备包已加入提示词",
+    label: "mcp",
+    state: packageResult.package?.status || packageResult.status || "ready",
+    body: context.slice(0, 12000)
+  });
+  showToast("集成准备包已加入提示词。");
+  return context;
+}
+
+function stageIntegrationReadinessCommands(packageResult = {}) {
+  const packageData = packageResult.package || packageResult;
+  const commands = normalizeCommandItems(packageData.verificationCommands || []);
+  if (!commands.length) {
+    appendToolCall({
+      title: "集成准备包没有验证命令",
+      label: "$",
+      state: "跳过",
+      body: formatIntegrationReadinessSummary(packageData, packageResult)
+    });
+    showToast("集成准备包里没有验证命令。");
+    return [];
+  }
+  return stageRepairVerificationCommands(commands, {
+    title: "集成准备包验证命令",
+    successTitle: "集成准备包验证命令已放入面板",
+    source: "integration-readiness",
+    note: formatIntegrationReadinessSummary(packageData, packageResult)
+  });
+}
+
+async function generateIntegrationReadinessPackage({ dryRun = false } = {}) {
+  try {
+    const result = await api("/api/integration-readiness", {
+      method: "POST",
+      body: JSON.stringify({ dryRun })
+    });
+    appendToolCall({
+      title: dryRun ? "集成准备包预览已生成" : "集成准备包已生成",
+      label: "mcp",
+      state: result.package?.status || "ready",
+      body: [
+        formatIntegrationReadinessSummary(result.package, result),
+        "",
+        result.markdown || ""
+      ].join("\n").slice(0, 30000)
+    });
+    showToast(dryRun ? "集成准备包预览已生成。" : "集成准备包已写入 .forge。");
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "集成准备包生成失败",
+      label: "mcp",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+async function openIntegrationReadinessPackage(id = "") {
+  if (!id) {
+    showToast("没有可打开的集成准备包 ID。");
+    return null;
+  }
+  try {
+    const result = await api(`/api/integration-readiness-package?id=${encodeURIComponent(id)}`);
+    if (state.lastIntegrationReadinessPackages) {
+      state.lastIntegrationReadinessPackages.lastOpenedId = result.id || id;
+    }
+    appendToolCall({
+      title: `集成准备包：${result.id}`,
+      label: "mcp",
+      state: result.package?.status || result.package?.summary?.status || "ready",
+      body: [
+        formatIntegrationReadinessSummary(result.package, result),
+        "",
+        result.markdown || ""
+      ].join("\n").slice(0, 30000)
+    });
+    showToast("集成准备包已打开。");
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "集成准备包读取失败",
+      label: "mcp",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
+async function listIntegrationReadinessPackages() {
+  try {
+    const result = await api("/api/integration-readiness-packages?limit=8");
+    state.lastIntegrationReadinessPackages = result;
+    const rows = result.packages || [];
+    appendToolCall({
+      title: "集成准备包列表",
+      label: "mcp",
+      state: `${rows.length} 个`,
+      body: rows.length
+        ? rows.map((item) => [
+            `- ${item.id}`,
+            `  status: ${item.status || "unknown"} · MCP=${item.mcpServers || 0} · Extensions=${item.extensions || 0} · Trust=${item.trustRows || 0}`,
+            item.paths?.markdown ? `  markdown: ${item.paths.markdown}` : ""
+          ].filter(Boolean).join("\n")).join("\n")
+        : "当前工作区还没有 integration readiness 准备包。"
+    });
+    showToast(rows.length ? `找到 ${rows.length} 个集成准备包。` : "暂无集成准备包。");
+    return result;
+  } catch (error) {
+    appendToolCall({
+      title: "集成准备包列表读取失败",
+      label: "mcp",
+      state: "失败",
+      body: error.message
+    });
+    showToast(error.message);
+    return null;
+  }
+}
+
 function appendCapabilityGapToPrompt(capability = {}) {
   const context = buildCapabilityGapContext(capability);
   if (!context) {
@@ -8483,6 +9268,15 @@ function renderCapabilities(audit) {
         <button type="button" data-action="external">授权缺口</button>
         <button type="button" data-action="prepare">准备清单</button>
         <button type="button" data-action="readiness">预检命令</button>
+        <button type="button" data-action="doctor">一键体检</button>
+        <button type="button" data-action="workspace">工作区健康</button>
+        <button type="button" data-action="integration">集成准备</button>
+        <button type="button" data-action="integration-packages">最近集成</button>
+        <button type="button" data-action="auth-status">授权状态</button>
+        <button type="button" data-action="auth-action">行动包</button>
+        <button type="button" data-action="package">生成包</button>
+        <button type="button" data-action="packages">最近包</button>
+        <button type="button" data-action="auth-actions">最近行动</button>
       </span>
     `;
     gapCard.querySelector("small").textContent = [
@@ -8543,6 +9337,69 @@ function renderCapabilities(audit) {
     gapCard.querySelector("[data-action='readiness']").addEventListener("click", (event) => {
       event.stopPropagation();
       stageExternalPreparationReadinessCommands(gapSummary);
+    });
+    gapCard.querySelector("[data-action='doctor']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await showProjectDoctor({ stageCommands: true });
+      if (result) appendProjectDoctorToPrompt(result);
+    });
+    gapCard.querySelector("[data-action='workspace']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await showWorkspaceReadiness({ stageCommands: true });
+      if (result) appendWorkspaceReadinessToPrompt(result);
+    });
+    gapCard.querySelector("[data-action='integration']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await generateIntegrationReadinessPackage();
+      if (result) {
+        stageIntegrationReadinessCommands(result);
+        appendIntegrationReadinessToPrompt(result);
+      }
+    });
+    gapCard.querySelector("[data-action='integration-packages']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await listIntegrationReadinessPackages();
+      const latest = result?.packages?.[0];
+      if (!latest?.id) return;
+      const detail = await openIntegrationReadinessPackage(latest.id);
+      if (detail) stageIntegrationReadinessCommands(detail);
+    });
+    gapCard.querySelector("[data-action='auth-status']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await showExternalAuthorizationStatus();
+      if (result) appendExternalAuthorizationStatusToPrompt(result);
+    });
+    gapCard.querySelector("[data-action='auth-action']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await generateExternalAuthorizationActionPackage();
+      if (result) {
+        stageExternalAuthorizationActionCommands(result);
+        appendExternalAuthorizationActionToPrompt(result);
+      }
+    });
+    gapCard.querySelector("[data-action='package']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await generateExternalReadinessPackage();
+      if (result) {
+        stageExternalReadinessPackageCommands(result);
+        appendExternalReadinessPackageToPrompt(result);
+      }
+    });
+    gapCard.querySelector("[data-action='packages']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await listExternalReadinessPackages();
+      const latest = result?.packages?.[0];
+      if (!latest?.id) return;
+      const detail = await openExternalReadinessPackage(latest.id);
+      if (detail) stageExternalReadinessPackageCommands(detail);
+    });
+    gapCard.querySelector("[data-action='auth-actions']").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const result = await listExternalAuthorizationActionPackages();
+      const latest = result?.packages?.[0];
+      if (!latest?.id) return;
+      const detail = await openExternalAuthorizationActionPackage(latest.id);
+      if (detail) stageExternalAuthorizationActionCommands(detail);
     });
     gapCard.addEventListener("click", () => {
       appendToolCall({
