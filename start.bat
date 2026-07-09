@@ -46,6 +46,7 @@ if not defined FORGE_PORT_RETRY_LIMIT set "FORGE_PORT_RETRY_LIMIT=50"
 if not defined FORGE_PORT_AUTO_RETRY set "FORGE_PORT_AUTO_RETRY=1"
 if not defined FORGE_START_RETRY_ON_EADDRINUSE set "FORGE_START_RETRY_ON_EADDRINUSE=1"
 if not defined FORGE_START_NO_PAUSE set "FORGE_START_NO_PAUSE=0"
+if not defined FORGE_START_DRY_RUN set "FORGE_START_DRY_RUN=0"
 
 set "FORGE_PREFERRED_PORT=%FORGE_PORT%"
 set /a "FORGE_PORT_SCAN_END=%FORGE_PREFERRED_PORT%+%FORGE_PORT_RETRY_LIMIT%" >nul 2>nul
@@ -83,6 +84,11 @@ echo.
 echo [INFO] Starting server on port %FORGE_PORT%...
 echo.
 
+if "%FORGE_START_DRY_RUN%"=="1" (
+  echo [INFO] Dry run enabled. Server was not started.
+  exit /b 0
+)
+
 node "%CD%\server.js" "--port=%FORGE_PORT%"
 set "EXIT_CODE=%ERRORLEVEL%"
 
@@ -107,8 +113,10 @@ set "PORT_SCAN_RESULT="
 
 for /l %%P in (%~1,1,%~2) do (
   if %%P GTR 65535 goto :port_scan_done
-  netstat -ano -p tcp | findstr /r /c:":%%P .*LISTENING" >nul 2>nul
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse('127.0.0.1'), %%P); try { $listener.Start(); $listener.Stop(); exit 0 } catch { exit 1 }" >nul 2>nul
   if errorlevel 1 (
+    rem Port is busy or cannot be bound by this user.
+  ) else (
     set "PORT_SCAN_RESULT=%%P"
     goto :port_scan_done
   )

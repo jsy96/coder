@@ -8520,6 +8520,7 @@ function runLocalProcess(command, args = [], options = {}) {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd: options.cwd || currentWorkspace,
+      env: options.env || process.env,
       windowsHide: true,
       shell: false
     });
@@ -18776,11 +18777,12 @@ async function runStartBatSmokeTest() {
     "FORGE_PORT_RETRY_LIMIT",
     "FORGE_PORT_AUTO_RETRY",
     "FORGE_START_NO_PAUSE",
+    "FORGE_START_DRY_RUN",
     "FORGE_URL=http://127.0.0.1:%FORGE_PORT%",
     "Starting server on port %FORGE_PORT%",
     "call :find_free_port",
-    "netstat -ano -p tcp",
-    "findstr /r /c:\":%%P .*LISTENING\"",
+    "TcpListener",
+    "Dry run enabled. Server was not started.",
     "node \"%CD%\\server.js\" \"--port=%FORGE_PORT%\"",
     "if not \"%FORGE_START_NO_PAUSE%\"==\"1\" pause"
   ];
@@ -18793,16 +18795,56 @@ async function runStartBatSmokeTest() {
   if (!hasPortSelection || !hasBusyPortMessage) {
     throw new Error("start.bat smoke failed. Port fallback flow is incomplete.");
   }
+  let blockedServer = null;
+  let blockedPort = 0;
+  let dryRunOutput = "";
+  if (process.platform === "win32") {
+    blockedServer = http.createServer((req, res) => res.end("blocked"));
+    await new Promise((resolve) => blockedServer.listen(0, "127.0.0.1", resolve));
+    blockedPort = blockedServer.address().port;
+    const result = await runLocalProcess("cmd.exe", ["/d", "/c", "start.bat"], {
+      cwd: APP_ROOT,
+      timeout: 30000,
+      maxBuffer: 128 * 1024,
+      env: {
+        ...process.env,
+        FORGE_PORT: String(blockedPort),
+        PORT: String(blockedPort),
+        FORGE_PORT_RETRY_LIMIT: "2",
+        FORGE_START_NO_PAUSE: "1",
+        FORGE_START_DRY_RUN: "1",
+        DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY || "smoke-test"
+      }
+    });
+    dryRunOutput = result.output;
+    await closeSmokeServer(blockedServer);
+    blockedServer = null;
+    if (!result.ok) {
+      throw new Error(`start.bat dry-run smoke failed: ${result.output}`);
+    }
+    if (!dryRunOutput.includes(`Port ${blockedPort} is busy. Using free port ${blockedPort + 1}.`)) {
+      throw new Error("start.bat dry-run smoke failed. Busy port fallback was not observed.");
+    }
+    if (!dryRunOutput.includes(`URL: http://127.0.0.1:${blockedPort + 1}`)) {
+      throw new Error("start.bat dry-run smoke failed. Final fallback URL was not printed.");
+    }
+  }
   console.log(JSON.stringify({
     ok: true,
     startBatSmoke: true,
     file: "start.bat",
-    checks: requiredSnippets.length + 2,
+    checks: requiredSnippets.length + 2 + (process.platform === "win32" ? 3 : 0),
+    dryRun: process.platform === "win32" ? {
+      blockedPort,
+      selectedPort: blockedPort + 1
+    } : null,
     features: [
       "node availability guard",
       "server.js availability guard",
       "port scan fallback",
       "final URL output",
+      "bind-test busy port detection",
+      "dry-run startup verification",
       "non-interactive no-pause mode"
     ]
   }));
