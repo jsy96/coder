@@ -6,6 +6,10 @@
   "capabilities": [
     "workspace-readiness",
     "project-doctor",
+    "run-debug-guide",
+    "coding-session-brief",
+    "local-validation-pack",
+    "coding-cockpit",
     "repo-map",
     "mcp-readiness"
   ],
@@ -42,6 +46,64 @@
       }
     },
     {
+      "name": "run_debug_guide",
+      "description": "Read the current run/debug guide with startup entry, runtime URL, and verification commands.",
+      "mapsTo": "run_debug_guide",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "name": "coding_session_brief",
+      "description": "Read the current coding session brief with changed files, debug target, failures, and verification commands.",
+      "mapsTo": "coding_session_brief",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "name": "local_validation_pack",
+      "description": "Read local validation presets with syntax, UI, fast/debug/integration smoke commands.",
+      "mapsTo": "local_validation_pack",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "profile": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "name": "coding_cockpit",
+      "description": "Read the coding cockpit with startup entry, debug target, changed files, failures, and validation commands.",
+      "mapsTo": "coding_cockpit",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "profile": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
       "name": "repo_map",
       "description": "Read the current repository structure and symbol summary.",
       "mapsTo": "repo_map",
@@ -57,4 +119,3 @@
     "notes": "Versioned local manifest. Execution still requires explicit approval and only bridges to built-in read-only tools."
   }
 }
-

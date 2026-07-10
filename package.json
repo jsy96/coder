@@ -31,6 +31,7 @@
     "api-smoke:fast": "node server.js --api-smoke-section=fast",
     "api-smoke:coding": "node server.js --api-smoke-section=coding",
     "api-smoke:debug": "node server.js --api-smoke-section=debug",
+    "api-smoke:debug-full": "node server.js --api-smoke-section=debug-full",
     "api-smoke:browser": "node server.js --api-smoke-section=browser",
     "api-smoke:assets": "node server.js --api-smoke-section=assets",
     "api-smoke:integrations": "node server.js --api-smoke-section=integrations",

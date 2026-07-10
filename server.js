@@ -862,7 +862,8 @@ const CHECK_SCRIPT_NAMES = ["check", "typecheck", "test", "lint", "build"];
 const START_SCRIPT_NAMES = ["dev", "start", "serve", "preview"];
 const FOCUSED_API_SMOKE_CHECKS = [
   { command: "node server.js --api-smoke-section=fast", reason: "快速 API 分段 smoke：核心、语义、模型、写入、上下文和门禁" },
-  { command: "node server.js --api-smoke-section=debug", reason: "调试 API 分段 smoke：浏览器、诊断、运行时和门禁" },
+  { command: "node server.js --api-smoke-section=debug", reason: "快速调试 API 分段 smoke：核心、运行时和门禁；浏览器自动化单独运行 browser smoke。" },
+  { command: "node server.js --api-smoke-section=debug-full", reason: "完整调试 API 分段 smoke：核心、浏览器、语义、运行时和门禁。" },
   { command: "node server.js --api-smoke-section=integrations", reason: "集成 API 分段 smoke：扩展、MCP 和资产检查" },
   { command: "node server.js --api-smoke-section=publish", reason: "发布 API 分段 smoke：PR readiness、发布审批和预检" }
 ];
@@ -876,7 +877,7 @@ const SAFE_COMMAND_PATTERNS = [
   /^node_modules[\\\/]\.bin[\\\/]tsc(?:\.cmd)? --noEmit(?: --pretty false)?$/i,
   /^node --check [\w./\\-]+$/i,
   /^node [\w./\\-]+ --smoke-test$/i,
-  /^node [\w./\\-]+ --api-smoke-section=(?:all|fast|coding|debug|integrations|publish|core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote)(?:,(?:core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote))*$/i,
+  /^node [\w./\\-]+ --api-smoke-section=(?:all|fast|coding|debug|debug-full|integrations|publish|core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote)(?:,(?:core|browser|semantic|model|extensions|mcp|assets|apply|runtime|context|gates|remote))*$/i,
   /^node [\w./\\-]+ --mcp-smoke-server$/i,
   /^node scripts[\\\/]mcp-local-workspace\.js$/i,
   /^(?:\.?[\\\/])?validate\.bat(?:\s+(?:--no-pause|\/no-pause|--ci))?$/i
@@ -5085,6 +5086,18 @@ function extractSafeProcessScriptCommands(script) {
   return parts.filter((part) => evaluateProcessPolicy(part).allowed);
 }
 
+function manualStartupLauncherPolicy(command = "") {
+  const text = String(command || "").trim();
+  return {
+    allowed: Boolean(text),
+    risk: "manual",
+    reason: "人工启动入口；不会被受管进程自动执行。",
+    command: text,
+    startsProcesses: false,
+    manual: true
+  };
+}
+
 async function discoverStartupCommands({ limit = 8 } = {}) {
   const max = Math.min(20, Math.max(1, Number(limit) || 8));
   const scripts = await readPackageScripts();
@@ -5092,6 +5105,8 @@ async function discoverStartupCommands({ limit = 8 } = {}) {
   const runtimeUrl = await readRuntimeUrlState();
   const seen = new Set();
   const commands = [];
+  const launcherSeen = new Set();
+  const launchers = [];
   const add = (command, reason = "", source = "detected") => {
     const text = String(command || "").trim();
     if (!text || seen.has(text)) return;
@@ -5106,6 +5121,23 @@ async function discoverStartupCommands({ limit = 8 } = {}) {
       probe: inferProcessProbe({ command: text, output: "" })
     });
   };
+  const addLauncher = (command, reason = "", source = "detected") => {
+    const text = String(command || "").trim();
+    if (!text || launcherSeen.has(text)) return;
+    launcherSeen.add(text);
+    launchers.push({
+      command: text,
+      reason,
+      source,
+      managed: false,
+      policy: manualStartupLauncherPolicy(text)
+    });
+  };
+
+  const startBatStat = await fs.stat(path.join(currentWorkspace, "start.bat")).catch(() => null);
+  if (startBatStat?.isFile()) {
+    addLauncher("start.bat", "Windows 本地启动入口：自动检查 Node/API Key，并在端口占用时避让到可用端口。", "workspace-launcher");
+  }
 
   for (const name of START_SCRIPT_NAMES) {
     if (scripts[name]) {
@@ -5131,6 +5163,8 @@ async function discoverStartupCommands({ limit = 8 } = {}) {
     runtimeUrl,
     packageManager: manager,
     scripts: Object.fromEntries(START_SCRIPT_NAMES.filter((name) => scripts[name]).map((name) => [name, scripts[name]])),
+    preferredLauncher: launchers[0] || null,
+    launchers: launchers.slice(0, max),
     commands: commands.slice(0, max),
     policy: {
       access: "read-only-startup-discovery",
@@ -5138,7 +5172,444 @@ async function discoverStartupCommands({ limit = 8 } = {}) {
       executesCommands: false,
       startsProcesses: false,
       readsRuntimeUrl: true,
-      filtersByProcessPolicy: true
+      filtersByProcessPolicy: true,
+      returnsManualLaunchers: true,
+      launchersAreNotAutoStarted: true
+    }
+  };
+}
+
+async function buildRunDebugGuide({ limit = 8 } = {}) {
+  const [startup, debugTarget, workspaceReadiness, doctor] = await Promise.all([
+    discoverStartupCommands({ limit }),
+    buildDebugTarget({ limit, includeTrace: false, runChecks: false }),
+    buildWorkspaceReadiness({ includeIgnored: true }),
+    buildProjectDoctor({ deep: false, includeIgnored: true })
+  ]);
+  const preferredLauncher = startup.preferredLauncher || null;
+  const managedCommand = startup.commands?.[0] || null;
+  const runtimeUrl = debugTarget.target?.url || startup.runtimeUrl?.browserCheckUrl || startup.runtimeUrl?.url || "";
+  const verificationCommands = uniqueLimited([
+    ...(debugTarget.verificationCommands || []).map((item) => item.command || item),
+    ...(workspaceReadiness.recommendedCommands || []).map((item) => item.command || item),
+    ...(doctor.recommendedCommands || []).map((item) => item.command || item)
+  ].filter(Boolean), 10).map((command) => ({ command, reason: "运行/调试指南推荐验证命令。" }));
+  const steps = [
+    preferredLauncher ? {
+      id: "manual-start",
+      label: "本地启动",
+      command: preferredLauncher.command,
+      manual: true,
+      reason: preferredLauncher.reason || "使用项目启动入口运行服务。"
+    } : null,
+    managedCommand ? {
+      id: "managed-start",
+      label: "受管启动",
+      command: managedCommand.command,
+      manual: false,
+      reason: managedCommand.reason || "在进程面板中启动并采集日志/探针。"
+    } : null,
+    runtimeUrl ? {
+      id: "debug-url",
+      label: "页面调试",
+      url: runtimeUrl,
+      manual: false,
+      reason: "使用当前运行 URL 做页面检查、Trace 和一键调试。"
+    } : {
+      id: "debug-url",
+      label: "页面调试",
+      url: "",
+      manual: false,
+      reason: "启动服务后会自动识别真实 URL。"
+    },
+    verificationCommands[0] ? {
+      id: "verify",
+      label: "本地验证",
+      command: verificationCommands[0].command,
+      manual: false,
+      reason: "先跑最快的本地验证，确认语法和启动链路。"
+    } : null
+  ].filter(Boolean);
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      status: doctor.status || "unknown",
+      workspaceStatus: workspaceReadiness.status || "unknown",
+      localActionableGaps: doctor.summary?.localActionableGaps || 0,
+      externalBlockedGaps: doctor.summary?.externalBlockedGaps || 0,
+      runtimeUrl,
+      preferredLauncher: preferredLauncher?.command || "",
+      managedCommand: managedCommand?.command || ""
+    },
+    quickStart: {
+      preferredLauncher,
+      managedCommand,
+      runtimeUrl,
+      steps
+    },
+    debug: {
+      target: debugTarget.target || null,
+      summary: debugTarget.summary || null,
+      nextActions: debugTarget.nextActions || []
+    },
+    verificationCommands,
+    startup,
+    workspaceReadiness: {
+      status: workspaceReadiness.status,
+      summary: workspaceReadiness.summary || {},
+      nextActions: workspaceReadiness.nextActions || []
+    },
+    doctor: {
+      status: doctor.status,
+      summary: doctor.summary || {},
+      recommendedNext: doctor.recommendedNext || null,
+      blockingAuthorizationRows: doctor.blockingAuthorizationRows || []
+    },
+    policy: {
+      access: "local-run-debug-guide-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      startsProcesses: false,
+      capturesBrowserTrace: false,
+      writesFiles: false,
+      writesRemote: false
+    }
+  };
+}
+
+async function buildCodingSessionBrief({ limit = 8 } = {}) {
+  const max = Math.min(20, Math.max(1, Number(limit) || 8));
+  const [runDebugGuide, git, goal, tasks, capabilities, contextRollup] = await Promise.all([
+    buildRunDebugGuide({ limit: max }),
+    getGitSummary().catch(() => ({ available: false, branch: "", changedFiles: [], status: [], remotes: [] })),
+    readGoalState().catch(() => defaultGoalState()),
+    listTaskLogs(max, { includeSmoke: false }).catch(() => []),
+    buildCapabilityAudit().catch(() => null),
+    readContextRollup().catch(() => null)
+  ]);
+  const recoverySummary = buildGoalRecoverySummary({ goal, tasks, capabilities, contextRollup });
+  const changedFiles = uniqueLimited([
+    ...(git.changedFiles || []),
+    ...(recoverySummary.changedFiles || [])
+  ].filter(Boolean), 40);
+  const verificationCommands = uniqueLimited([
+    ...(runDebugGuide.verificationCommands || []).map((item) => item.command || item),
+    ...(recoverySummary.verificationCommands || []),
+    "node --check server.js",
+    "node --check app.js",
+    "node server.js --api-smoke-section=debug"
+  ].filter(Boolean), 10).map((command) => ({ command, reason: "继续编码/调试简报推荐验证命令。" }));
+  const prompt = [
+    "请基于当前 Coding Session Brief 继续写代码和调试程序。",
+    "",
+    `工作区：${currentWorkspace}`,
+    `状态：${runDebugGuide.summary?.status || "unknown"} · 工作区健康：${runDebugGuide.summary?.workspaceStatus || "unknown"}`,
+    `差距：本地 ${runDebugGuide.summary?.localActionableGaps || 0} / 外部 ${runDebugGuide.summary?.externalBlockedGaps || 0}`,
+    git.branch ? `Git：${git.branch} · changed=${changedFiles.length}` : "",
+    runDebugGuide.summary?.preferredLauncher ? `手动启动：${runDebugGuide.summary.preferredLauncher}` : "",
+    runDebugGuide.summary?.managedCommand ? `受管启动：${runDebugGuide.summary.managedCommand}` : "",
+    runDebugGuide.summary?.runtimeUrl ? `调试 URL：${runDebugGuide.summary.runtimeUrl}` : "调试 URL：启动后自动识别",
+    changedFiles.length ? `\n当前变更文件：\n${changedFiles.slice(0, 16).map((file) => `@${file}`).join("\n")}` : "",
+    recoverySummary.lastFailedCommand ? `\n最近失败命令：\n$ ${recoverySummary.lastFailedCommand}` : "",
+    recoverySummary.cues?.length ? `\n恢复线索：\n${recoverySummary.cues.slice(0, 8).map((item) => `- ${item}`).join("\n")}` : "",
+    recoverySummary.nextActions?.length ? `\n下一步：\n${recoverySummary.nextActions.slice(0, 6).map((item) => `- ${item}`).join("\n")}` : "",
+    verificationCommands.length ? `\n建议验证：\n${verificationCommands.slice(0, 8).map((item) => `- ${item.command}`).join("\n")}` : "",
+    "",
+    "要求：先读取相关 @file，优先处理当前变更和最近失败命令；改动保持最小；完成后运行最相关的本地验证，不要把外部授权阻塞项标成已完成。"
+  ].filter(Boolean).join("\n");
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      status: runDebugGuide.summary?.status || "unknown",
+      workspaceStatus: runDebugGuide.summary?.workspaceStatus || "unknown",
+      localActionableGaps: runDebugGuide.summary?.localActionableGaps || 0,
+      externalBlockedGaps: runDebugGuide.summary?.externalBlockedGaps || 0,
+      changedFiles: changedFiles.length,
+      lastFailedCommand: recoverySummary.lastFailedCommand || "",
+      runtimeUrl: runDebugGuide.summary?.runtimeUrl || "",
+      recommendedGap: recoverySummary.recommendedGap || null
+    },
+    prompt,
+    changedFiles,
+    recoverySummary,
+    runDebugGuide: {
+      summary: runDebugGuide.summary,
+      quickStart: runDebugGuide.quickStart,
+      debug: runDebugGuide.debug
+    },
+    verificationCommands,
+    policy: {
+      access: "local-coding-session-brief-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      startsProcesses: false,
+      writesFiles: false,
+      writesRemote: false
+    }
+  };
+}
+
+function localValidationProfileDefinitions() {
+  return [
+    {
+      id: "syntax",
+      label: "语法快检",
+      reason: "先确认前后端入口没有 JavaScript 语法错误。",
+      commands: [
+        commandItem("node --check server.js", "后端入口语法检查。", { stage: "syntax" }),
+        commandItem("node --check app.js", "前端入口语法检查。", { stage: "syntax" })
+      ]
+    },
+    {
+      id: "safe",
+      label: "日常安全验证",
+      reason: "适合每次改代码后的默认验证链：语法、UI smoke、快速 API smoke。",
+      commands: [
+        commandItem("node --check server.js", "后端入口语法检查。", { stage: "syntax" }),
+        commandItem("node --check app.js", "前端入口语法检查。", { stage: "syntax" }),
+        commandItem("node server.js --ui-smoke-test", "复查主要按钮、端点和前端入口是否仍连通。", { stage: "ui" }),
+        commandItem("node server.js --api-smoke-section=fast", "快速覆盖核心写代码、调试、上下文和门禁链路。", { stage: "fast" })
+      ]
+    },
+    {
+      id: "debug",
+      label: "调试闭环",
+      reason: "适合启动、命令失败或修复恢复链路相关改动；保持日常可快速运行，页面自动化请追加浏览器 smoke。",
+      commands: [
+        commandItem("node --check server.js", "后端入口语法检查。", { stage: "syntax" }),
+        commandItem("node --check app.js", "前端入口语法检查。", { stage: "syntax" }),
+        commandItem("node server.js --api-smoke-section=debug", "快速验证失败分类、恢复链、调试目标和本地门禁。", { stage: "debug" }),
+        commandItem("node server.js --api-smoke-section=browser", "验证页面检查、Trace、截图、DOM 和浏览器证据入口。", { stage: "browser" }),
+        commandItem("node server.js --start-bat-smoke-test", "验证 Windows start.bat 自动端口避让和 dry-run 启动链路。", { stage: "startup" })
+      ]
+    },
+    {
+      id: "integration",
+      label: "集成与扩展",
+      reason: "适合改本地扩展、工具目录、MCP 或外部授权准备包后使用。",
+      commands: [
+        commandItem("node --check server.js", "后端入口语法检查。", { stage: "syntax" }),
+        commandItem("node server.js --api-smoke-section=integrations", "验证本地扩展桥接、trust、MCP 和集成准备包。", { stage: "integrations" }),
+        commandItem("node server.js --api-smoke-section=publish", "验证交付、发布准备、外部证据和权限边界。", { stage: "publish" })
+      ]
+    },
+    {
+      id: "full-local",
+      label: "完整本地验证",
+      reason: "适合准备交付前运行较完整但仍只在本地执行的检查链。",
+      commands: [
+        commandItem("validate.bat --no-pause", "运行 Windows 本地完整验证脚本，失败时保留控制台输出。", { stage: "full-local" }),
+        commandItem("node server.js --doctor --json", "复查 Project Doctor 总状态和剩余外部阻塞。", { stage: "doctor" }),
+        commandItem("node server.js --workspace-readiness --json", "复查工作区启动、验证脚本和交付就绪度。", { stage: "readiness" })
+      ]
+    }
+  ];
+}
+
+function selectLocalValidationProfile(profile = "safe") {
+  const normalized = String(profile || "safe").trim().toLowerCase();
+  const profiles = localValidationProfileDefinitions();
+  return profiles.find((item) => item.id === normalized) || profiles.find((item) => item.id === "safe") || profiles[0];
+}
+
+async function buildLocalValidationPack({ profile = "safe", limit = 12 } = {}) {
+  const max = Math.min(30, Math.max(1, Number(limit) || 12));
+  const [runDebugGuide, codingSessionBrief, workspaceReadiness, doctor] = await Promise.all([
+    buildRunDebugGuide({ limit: max }).catch(() => null),
+    buildCodingSessionBrief({ limit: Math.min(max, 12) }).catch(() => null),
+    buildWorkspaceReadiness({ includeIgnored: true }).catch(() => null),
+    buildProjectDoctor({ deep: false, includeIgnored: true }).catch(() => null)
+  ]);
+  const selected = selectLocalValidationProfile(profile);
+  const commands = uniqueLimited([
+    ...(selected.commands || []).map((item) => item.command || item),
+    ...(runDebugGuide?.verificationCommands || []).map((item) => item.command || item),
+    ...(codingSessionBrief?.verificationCommands || []).map((item) => item.command || item),
+    ...(workspaceReadiness?.recommendedCommands || []).map((item) => item.command || item),
+    ...(doctor?.recommendedCommands || []).map((item) => item.command || item)
+  ].filter(Boolean), max).map((command) => {
+    const template = (selected.commands || []).find((item) => (item.command || item) === command);
+    return commandItem(command, template?.reason || `本地验证包 ${selected.label} 推荐命令。`, {
+      stage: template?.stage || selected.id,
+      profile: selected.id
+    });
+  });
+  const profiles = localValidationProfileDefinitions().map((item) => ({
+    id: item.id,
+    label: item.label,
+    reason: item.reason,
+    commands: item.commands.map((command) => ({ command: command.command || command, reason: command.reason || "" }))
+  }));
+  const prompt = [
+    "Local Validation Pack",
+    "",
+    `工作区：${currentWorkspace}`,
+    `预设：${selected.label} (${selected.id})`,
+    `状态：${doctor?.status || runDebugGuide?.summary?.status || "unknown"} · 工作区：${workspaceReadiness?.status || runDebugGuide?.summary?.workspaceStatus || "unknown"}`,
+    `外部阻塞：${doctor?.summary?.externalBlockedGaps || runDebugGuide?.summary?.externalBlockedGaps || 0}`,
+    "",
+    "建议按顺序运行：",
+    ...commands.slice(0, max).map((item, index) => `${index + 1}. ${item.command}${item.reason ? ` - ${item.reason}` : ""}`),
+    "",
+    "说明：这是本地只读验证建议，不执行命令、不写文件、不触碰远端。失败后把失败输出带回调试诊断或编码简报继续修复。"
+  ].join("\n");
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      status: doctor?.status || runDebugGuide?.summary?.status || "unknown",
+      workspaceStatus: workspaceReadiness?.status || runDebugGuide?.summary?.workspaceStatus || "unknown",
+      recommendedProfile: selected.id,
+      commandCount: commands.length,
+      externalBlockedGaps: doctor?.summary?.externalBlockedGaps || runDebugGuide?.summary?.externalBlockedGaps || 0,
+      localActionableGaps: doctor?.summary?.localActionableGaps || runDebugGuide?.summary?.localActionableGaps || 0
+    },
+    prompt,
+    profiles,
+    selectedProfile: {
+      id: selected.id,
+      label: selected.label,
+      reason: selected.reason
+    },
+    commands,
+    sources: {
+      runDebugGuide: runDebugGuide ? { summary: runDebugGuide.summary, verificationCommands: runDebugGuide.verificationCommands } : null,
+      codingSessionBrief: codingSessionBrief ? { summary: codingSessionBrief.summary, verificationCommands: codingSessionBrief.verificationCommands } : null,
+      workspaceReadiness: workspaceReadiness ? { status: workspaceReadiness.status, summary: workspaceReadiness.summary } : null,
+      doctor: doctor ? { status: doctor.status, summary: doctor.summary, blockingAuthorizationRows: doctor.blockingAuthorizationRows || [] } : null
+    },
+    policy: {
+      access: "local-validation-pack-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      startsProcesses: false,
+      writesFiles: false,
+      writesRemote: false
+    }
+  };
+}
+
+async function buildCodingCockpit({ profile = "safe", limit = 12 } = {}) {
+  const max = Math.min(30, Math.max(1, Number(limit) || 12));
+  const selected = selectLocalValidationProfile(profile);
+  const [runDebugGuide, codingSessionBrief, localValidationPack, debugTarget, git, doctor] = await Promise.all([
+    buildRunDebugGuide({ limit: max }).catch(() => null),
+    buildCodingSessionBrief({ limit: Math.min(max, 12) }).catch(() => null),
+    buildLocalValidationPack({ profile: selected.id, limit: max }).catch(() => null),
+    buildDebugTarget({ limit: max, includeTrace: false, runChecks: false }).catch(() => null),
+    getGitSummary().catch(() => ({ available: false, branch: "", changedFiles: [], status: [], remotes: [] })),
+    buildProjectDoctor({ deep: false, includeIgnored: true }).catch(() => null)
+  ]);
+  const changedFiles = uniqueLimited([
+    ...(git.changedFiles || []),
+    ...(codingSessionBrief?.changedFiles || [])
+  ].filter(Boolean), 40);
+  const commandTemplates = [
+    ...(localValidationPack?.commands || []),
+    ...(codingSessionBrief?.verificationCommands || []),
+    ...(runDebugGuide?.verificationCommands || []),
+    ...(debugTarget?.verificationCommands || [])
+  ];
+  const commands = uniqueLimited(commandTemplates.map((item) => item.command || item).filter(Boolean), max)
+    .map((command) => {
+      const template = commandTemplates.find((item) => (item.command || item) === command);
+      return commandItem(command, template?.reason || "编码驾驶舱推荐验证命令。", {
+        stage: template?.stage || "coding-cockpit",
+        profile: selected.id
+      });
+    });
+  const runtimeUrl = debugTarget?.target?.url || runDebugGuide?.summary?.runtimeUrl || codingSessionBrief?.summary?.runtimeUrl || "";
+  const preferredLauncher = runDebugGuide?.quickStart?.preferredLauncher || null;
+  const managedCommand = runDebugGuide?.quickStart?.managedCommand || null;
+  const lastFailedCommand = codingSessionBrief?.summary?.lastFailedCommand || codingSessionBrief?.recoverySummary?.lastFailedCommand || "";
+  const quickActions = [
+    preferredLauncher ? {
+      id: "manual-start",
+      label: "手动启动",
+      command: preferredLauncher.command,
+      manual: true,
+      reason: preferredLauncher.reason || "用项目推荐启动脚本进入本地服务。"
+    } : null,
+    managedCommand ? {
+      id: "managed-start",
+      label: "受管启动",
+      command: managedCommand.command,
+      manual: false,
+      reason: managedCommand.reason || "在进程面板启动并保留日志、健康探针和调试证据。"
+    } : null,
+    {
+      id: "debug-target",
+      label: "当前调试目标",
+      url: runtimeUrl,
+      reason: runtimeUrl ? "用这个真实 URL 做页面检查、Trace 和一键诊断。" : "启动后自动识别真实运行 URL。"
+    },
+    commands[0] ? {
+      id: "verify-first",
+      label: "第一条验证",
+      command: commands[0].command,
+      reason: commands[0].reason || "先跑最相关的本地验证。"
+    } : null,
+    {
+      id: "continue-prompt",
+      label: "继续写代码",
+      prompt: true,
+      reason: "把驾驶舱提示加入输入框，让下一轮先读变更文件、调试目标和失败命令。"
+    }
+  ].filter(Boolean);
+  const prompt = [
+    "Workspace Coding Cockpit",
+    "",
+    "请基于当前编码驾驶舱继续写代码、运行和调试程序。",
+    "",
+    `工作区：${currentWorkspace}`,
+    `状态：${doctor?.status || runDebugGuide?.summary?.status || "unknown"} · 工作区健康：${runDebugGuide?.summary?.workspaceStatus || "unknown"}`,
+    `差距：本地 ${doctor?.summary?.localActionableGaps ?? runDebugGuide?.summary?.localActionableGaps ?? 0} / 外部 ${doctor?.summary?.externalBlockedGaps ?? runDebugGuide?.summary?.externalBlockedGaps ?? 0}`,
+    git.branch ? `Git：${git.branch} · changed=${changedFiles.length}` : `Git changed=${changedFiles.length}`,
+    preferredLauncher?.command ? `手动启动：${preferredLauncher.command}` : "",
+    managedCommand?.command ? `受管启动：${managedCommand.command}` : "",
+    runtimeUrl ? `调试 URL：${runtimeUrl}` : "调试 URL：启动后自动识别",
+    lastFailedCommand ? `最近失败命令：${lastFailedCommand}` : "",
+    "",
+    changedFiles.length ? `当前变更文件：\n${changedFiles.slice(0, 16).map((file) => `@${file}`).join("\n")}` : "当前变更文件：暂无",
+    "",
+    quickActions.length ? `建议动作：\n${quickActions.map((item) => `- ${item.label}${item.command ? `：${item.command}` : item.url ? `：${item.url}` : ""}${item.reason ? ` · ${item.reason}` : ""}`).join("\n")}` : "",
+    commands.length ? `建议验证：\n${commands.slice(0, 10).map((item) => `- ${item.command}${item.reason ? ` · ${item.reason}` : ""}`).join("\n")}` : "",
+    "",
+    "要求：先读取相关 @file，优先处理当前变更、最近失败命令和调试目标；改动保持聚焦；完成后运行驾驶舱建议验证；外部授权阻塞项只生成准备清单，不要标成已完成。"
+  ].filter(Boolean).join("\n");
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    summary: {
+      status: doctor?.status || runDebugGuide?.summary?.status || "unknown",
+      workspaceStatus: runDebugGuide?.summary?.workspaceStatus || "unknown",
+      localActionableGaps: doctor?.summary?.localActionableGaps ?? runDebugGuide?.summary?.localActionableGaps ?? 0,
+      externalBlockedGaps: doctor?.summary?.externalBlockedGaps ?? runDebugGuide?.summary?.externalBlockedGaps ?? 0,
+      changedFiles: changedFiles.length,
+      commandCount: commands.length,
+      recommendedProfile: selected.id,
+      runtimeUrl,
+      preferredLauncher: preferredLauncher?.command || "",
+      managedCommand: managedCommand?.command || "",
+      lastFailedCommand
+    },
+    prompt,
+    quickActions,
+    commands,
+    changedFiles,
+    runDebugGuide: runDebugGuide ? { summary: runDebugGuide.summary, quickStart: runDebugGuide.quickStart, debug: runDebugGuide.debug } : null,
+    codingSessionBrief: codingSessionBrief ? { summary: codingSessionBrief.summary, recoverySummary: codingSessionBrief.recoverySummary } : null,
+    localValidationPack: localValidationPack ? { summary: localValidationPack.summary, selectedProfile: localValidationPack.selectedProfile } : null,
+    debugTarget: debugTarget ? { target: debugTarget.target, summary: debugTarget.summary, nextActions: debugTarget.nextActions || [] } : null,
+    policy: {
+      access: "local-coding-cockpit-read-only",
+      scope: "currentWorkspace",
+      executesCommands: false,
+      startsProcesses: false,
+      writesFiles: false,
+      writesRemote: false
     }
   };
 }
@@ -5563,7 +6034,7 @@ function buildFailureRecoveryChain(command = "", result = {}, diagnostics = null
     commandItem(command, "修复后第一时间重跑原失败命令，确认根因已消除。", { stage: "verify-original" }),
     commandItem("node --check server.js", "复查后端入口语法，避免修复引入新的 JavaScript 语法错误。", { stage: "verify-syntax" }),
     commandItem("node --check app.js", "复查前端入口语法，避免修复引入新的 JavaScript 语法错误。", { stage: "verify-syntax" }),
-    commandItem("node server.js --api-smoke-section=debug", "运行调试闭环 smoke，验证失败分类、诊断和修复链路仍可用。", { stage: "verify-debug" }),
+    commandItem("node server.js --api-smoke-section=debug", "运行快速调试闭环 smoke，验证失败分类、诊断和修复链路仍可用。", { stage: "verify-debug" }),
     ...packageManagerFallbackCommands,
     ...diagnosticCommands.map((item) => commandItem(item.command || item, item.reason || "复用调试诊断推荐的验证命令。", { stage: "diagnose" }))
   ]);
@@ -10138,6 +10609,8 @@ async function listRemotePublishPackages({ limit = 20 } = {}) {
     const approval = approvals.find((item) => item.type === "remote_publish_plan" && item.command === (plan.commands || []).map((command) => command.command).join("\n"));
     const externalEvidence = await readJsonOrNull(path.join(packageDir, "external-evidence.json"));
     const externalEvidenceSummary = summarizeRemotePublishEvidence(externalEvidence);
+    const externalEvidenceDraft = await readJsonOrNull(path.join(packageDir, "external-evidence-draft.json"));
+    const externalEvidenceDraftSummary = summarizeRemotePublishEvidenceDraft(externalEvidenceDraft);
     packages.push({
       id: entry.name,
       generatedAt: plan.generatedAt || "",
@@ -10152,13 +10625,17 @@ async function listRemotePublishPackages({ limit = 20 } = {}) {
       approvalStatus: approval?.status || "",
       externalEvidence: externalEvidenceSummary,
       externalEvidenceStatus: externalEvidenceSummary?.status || "",
+      externalEvidenceDraft: externalEvidenceDraftSummary,
+      externalEvidenceDraftStatus: externalEvidenceDraftSummary?.status || "",
       paths: {
         dir: toPosix(path.relative(APP_ROOT, packageDir)),
         plan: toPosix(path.relative(APP_ROOT, path.join(packageDir, "plan.json"))),
         prBody: toPosix(path.relative(APP_ROOT, path.join(packageDir, "pr-body.md"))),
         reviewSummary: toPosix(path.relative(APP_ROOT, path.join(packageDir, "review-summary.md"))),
         externalEvidence: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(packageDir, "external-evidence.json"))) : "",
-        externalEvidenceSummary: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(packageDir, "external-evidence-summary.md"))) : ""
+        externalEvidenceSummary: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(packageDir, "external-evidence-summary.md"))) : "",
+        externalEvidenceDraft: externalEvidenceDraftSummary ? toPosix(path.relative(APP_ROOT, path.join(packageDir, "external-evidence-draft.json"))) : "",
+        externalEvidenceDraftMarkdown: externalEvidenceDraftSummary ? toPosix(path.relative(APP_ROOT, path.join(packageDir, "external-evidence-draft.md"))) : ""
       }
     });
   }
@@ -10170,7 +10647,9 @@ async function listRemotePublishPackages({ limit = 20 } = {}) {
       approvalRequired: packages.filter((item) => item.status === "approval_required").length,
       withApproval: packages.filter((item) => item.approvalId).length,
       withExternalEvidence: packages.filter((item) => item.externalEvidence).length,
-      readyExternalEvidence: packages.filter((item) => item.externalEvidence?.status === "ready").length
+      readyExternalEvidence: packages.filter((item) => item.externalEvidence?.status === "ready").length,
+      withExternalEvidenceDraft: packages.filter((item) => item.externalEvidenceDraft).length,
+      readyExternalEvidenceDraft: packages.filter((item) => item.externalEvidenceDraft?.status === "ready_to_ingest").length
     },
     packages: packages
       .sort((left, right) => String(right.generatedAt).localeCompare(String(left.generatedAt)))
@@ -10206,6 +10685,34 @@ function summarizeRemotePublishEvidence(artifact = null) {
   };
 }
 
+function summarizeRemotePublishEvidenceDraft(artifact = null) {
+  if (!artifact || typeof artifact !== "object") return null;
+  const validation = artifact.validation || {};
+  const summary = artifact.summary || {};
+  const external = artifact.evidenceTemplate?.externalExecution || {};
+  return {
+    generatedAt: artifact.generatedAt || "",
+    packageId: artifact.packageId || "",
+    provider: artifact.provider || artifact.evidenceTemplate?.provider || "",
+    status: artifact.status || "",
+    missingCount: Array.isArray(summary.missing) ? summary.missing.length : 0,
+    nextRequiredFields: Array.isArray(summary.nextRequiredFields) ? summary.nextRequiredFields.slice(0, 12) : [],
+    blockers: validation.blockers || [],
+    warnings: validation.warnings || [],
+    remoteUrl: external.remoteUrl || "",
+    prOrMrNumber: external.prOrMrNumber || "",
+    ciUrl: external.ciUrl || "",
+    reviewCommentUrl: external.reviewCommentUrl || "",
+    paths: artifact.paths || {},
+    policy: {
+      writesFormalEvidence: false,
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false
+    }
+  };
+}
+
 async function readRemotePublishPackage(id = "") {
   if (!/^[\w.-]+$/.test(String(id || "")) || !String(id).startsWith("remote-publish-")) {
     throw new Error("remote publish package id 非法。");
@@ -10221,12 +10728,18 @@ async function readRemotePublishPackage(id = "") {
   const reviewSummary = await fs.readFile(path.join(full, "review-summary.md"), "utf8").catch(() => "");
   const externalEvidence = await readJsonOrNull(path.join(full, "external-evidence.json"));
   const externalEvidenceSummary = summarizeRemotePublishEvidence(externalEvidence);
+  const externalEvidenceDraft = await readJsonOrNull(path.join(full, "external-evidence-draft.json"));
+  const externalEvidenceDraftMarkdown = await fs.readFile(path.join(full, "external-evidence-draft.md"), "utf8").catch(() => "");
+  const externalEvidenceDraftSummary = summarizeRemotePublishEvidenceDraft(externalEvidenceDraft);
   return {
     id,
     generatedAt: plan.generatedAt || "",
     workspace: plan.workspace || "",
     plan,
     externalEvidence: externalEvidenceSummary,
+    externalEvidenceDraft: externalEvidenceDraftSummary,
+    externalEvidenceDraftJson: externalEvidenceDraft ? JSON.stringify(externalEvidenceDraft.evidenceTemplate || externalEvidenceDraft, null, 2).slice(0, 60000) : "",
+    externalEvidenceDraftMarkdown: externalEvidenceDraftMarkdown.slice(0, 60000),
     prBody: prBody.slice(0, 60000),
     reviewSummary: reviewSummary.slice(0, 60000),
     paths: {
@@ -10235,7 +10748,9 @@ async function readRemotePublishPackage(id = "") {
       prBody: toPosix(path.relative(APP_ROOT, path.join(full, "pr-body.md"))),
       reviewSummary: toPosix(path.relative(APP_ROOT, path.join(full, "review-summary.md"))),
       externalEvidence: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(full, "external-evidence.json"))) : "",
-      externalEvidenceSummary: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(full, "external-evidence-summary.md"))) : ""
+      externalEvidenceSummary: externalEvidenceSummary ? toPosix(path.relative(APP_ROOT, path.join(full, "external-evidence-summary.md"))) : "",
+      externalEvidenceDraft: externalEvidenceDraftSummary ? toPosix(path.relative(APP_ROOT, path.join(full, "external-evidence-draft.json"))) : "",
+      externalEvidenceDraftMarkdown: externalEvidenceDraftSummary ? toPosix(path.relative(APP_ROOT, path.join(full, "external-evidence-draft.md"))) : ""
     },
     policy: {
       access: "local-read-only",
@@ -10768,6 +11283,129 @@ async function buildRemotePublishEvidenceDraft({ id = "", evidence = null, limit
   return draft;
 }
 
+function buildRemotePublishEvidenceHelperChecklist({ detail = null, draft = null, continuation = null } = {}) {
+  const evidence = draft?.evidenceTemplate || continuation?.evidenceTemplate || {};
+  const external = evidence.externalExecution || {};
+  const validation = draft?.validation || validateRemotePublishExternalEvidence(evidence, detail);
+  const commandsRun = Array.isArray(external.commandsRun) ? external.commandsRun : [];
+  const item = (id, label, value, required = true, hint = "") => ({
+    id,
+    label,
+    required,
+    status: String(value || "").trim() ? "filled" : required ? "missing" : "optional",
+    value: value || "",
+    hint
+  });
+  return [
+    item("executedBy", "执行人", external.executedBy, true, "填写实际在 Gitee 网页执行 PR/CI/评论动作的人。"),
+    item("executedAt", "执行时间", external.executedAt, true, "填写人工执行完成时间，建议使用 ISO 时间。"),
+    item("commandsRun", "外部动作状态", commandsRun.every((row) => row.status && row.outputSummary) ? `${commandsRun.length} commands` : "", true, "每个 manual:gitee-* 步骤都要填 status 和 outputSummary。"),
+    item("remoteUrl", "Gitee PR URL", external.remoteUrl || external.prOrMrNumber, true, "填写 Gitee Pull Request 链接；没有链接时至少填 PR 编号。"),
+    item("ciUrl", "Gitee CI URL", external.ciUrl, false, "如果有流水线或检查页，粘贴链接；没有 CI 时说明原因。"),
+    item("reviewCommentUrl", "Gitee 评论 URL", external.reviewCommentUrl, false, "如果已把 review summary 评论到 PR，粘贴评论链接。"),
+    item("rollbackPlan", "回滚方案", external.rollbackPlan, true, "说明如何关闭 PR、回退分支或撤销远端动作。"),
+    {
+      id: "validation",
+      label: "正式回填校验",
+      required: true,
+      status: validation.status || "unknown",
+      value: [...(validation.blockers || []), ...(validation.warnings || [])].join(" / "),
+      hint: "无 blockers 时才会写入正式 external-evidence.json；warnings 会保留在摘要里。"
+    }
+  ];
+}
+
+async function buildRemotePublishEvidenceHelper({ id = "", evidence = null, limit = 20 } = {}) {
+  const packageIndex = await listRemotePublishPackages({ limit: Math.max(Number(limit) || 20, 1) });
+  const packageId = id || packageIndex.packages?.[0]?.id || "";
+  if (!packageId) throw new Error("未找到远端发布包，请先生成发布审批计划。");
+  const detail = await readRemotePublishPackage(packageId);
+  const continuation = await buildRemotePublishContinuation({ id: packageId, limit, deep: false });
+  const draft = await buildRemotePublishEvidenceDraft({
+    id: packageId,
+    evidence: evidence || continuation.evidenceTemplate,
+    limit
+  });
+  const checklist = buildRemotePublishEvidenceHelperChecklist({ detail, draft, continuation });
+  const copyableEvidence = draft.evidenceTemplate || continuation.evidenceTemplate || {};
+  const copyableEvidenceJson = JSON.stringify(copyableEvidence, null, 2);
+  const verificationCommands = remotePublishEvidenceVerificationCommands(copyableEvidence).slice(0, Math.max(1, Number(limit) || 20));
+  const helperMarkdown = [
+    `# Gitee Remote Publish Evidence Helper - ${packageId}`,
+    "",
+    `Provider: ${draft.provider || detail.plan?.provider || "unknown"}`,
+    `Status: ${draft.status}`,
+    `Manual provider: ${Boolean(draft.policy?.manualProvider || detail.plan?.provider === "gitee")}`,
+    "",
+    "## Fill Checklist",
+    checklist.map((row) => `- [${row.status === "filled" || row.status === "ready" ? "x" : " "}] ${row.label}: ${row.status}${row.value ? ` - ${row.value}` : ""}${row.hint ? ` (${row.hint})` : ""}`).join("\n"),
+    "",
+    "## Copyable Evidence JSON",
+    "```json",
+    copyableEvidenceJson,
+    "```",
+    "",
+    "## Local Follow-Up Verification",
+    verificationCommands.map((row) => `- \`${row.command}\` - ${row.reason}`).join("\n")
+  ].join("\n");
+  const packageDir = detail?.paths?.dir ? path.join(APP_ROOT, detail.paths.dir) : "";
+  const helperPath = packageDir ? path.join(packageDir, "gitee-evidence-helper.md") : "";
+  if (helperPath) await fs.writeFile(helperPath, helperMarkdown, "utf8");
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace: currentWorkspace,
+    packageId,
+    provider: draft.provider || detail.plan?.provider || "",
+    status: draft.status,
+    summary: {
+      missing: checklist.filter((row) => row.status === "missing").length,
+      optional: checklist.filter((row) => row.status === "optional").length,
+      filled: checklist.filter((row) => row.status === "filled" || row.status === "ready").length,
+      validationStatus: draft.validation?.status || "unknown"
+    },
+    manualProvider: Boolean(draft.policy?.manualProvider || detail.plan?.provider === "gitee"),
+    fillChecklist: checklist,
+    copyableEvidenceJson,
+    continuation: {
+      status: continuation.status,
+      packageId: continuation.packageId,
+      manualSteps: continuation.manualSteps,
+      paths: continuation.paths,
+      policy: continuation.policy
+    },
+    draft: {
+      status: draft.status,
+      validation: draft.validation,
+      summary: draft.summary,
+      paths: draft.paths,
+      policy: draft.policy
+    },
+    validation: draft.validation,
+    verificationCommands,
+    paths: {
+      helper: helperPath ? toPosix(path.relative(APP_ROOT, helperPath)) : "",
+      continuation: continuation.paths?.continuation || "",
+      evidenceTemplate: continuation.paths?.evidenceTemplate || "",
+      draft: draft.paths?.draft || "",
+      draftMarkdown: draft.paths?.markdown || "",
+      prBody: detail.paths?.prBody || "",
+      reviewSummary: detail.paths?.reviewSummary || "",
+      plan: detail.paths?.plan || ""
+    },
+    policy: {
+      access: "local-artifact-only",
+      writesLocalArtifacts: Boolean(helperPath),
+      writesFormalEvidence: false,
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      requiresManualExternalExecution: true,
+      manualProvider: Boolean(draft.policy?.manualProvider || detail.plan?.provider === "gitee")
+    }
+  };
+}
+
 async function buildRemotePublishEvidence({ id = "", evidence = null, limit = 20 } = {}) {
   const detail = await readRemotePublishPackage(id || "");
   const packageDir = detail?.paths?.dir ? path.join(APP_ROOT, detail.paths.dir) : "";
@@ -11138,7 +11776,8 @@ async function listThreads(limit = 20, { includeArchived = false, includeSmoke =
   const threads = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const thread = JSON.parse(await fs.readFile(path.join(THREAD_DIR, entry.name), "utf8").catch(() => "{}"));
+    const thread = await readJsonOrNull(path.join(THREAD_DIR, entry.name));
+    if (!thread || typeof thread !== "object") continue;
     if (thread.workspace !== currentWorkspace) continue;
     if (thread.archived && !includeArchived) continue;
     const summary = summarizeThread(thread);
@@ -11268,7 +11907,7 @@ function defaultGoalState() {
 }
 
 async function readGoalState() {
-  const state = JSON.parse(await fs.readFile(GOAL_STATE_PATH, "utf8").catch(() => "{}"));
+  const state = await readJsonOrNull(GOAL_STATE_PATH) || {};
   if (state.workspace !== currentWorkspace) return defaultGoalState();
   return { ...defaultGoalState(), ...state };
 }
@@ -11363,7 +12002,8 @@ async function listTaskLogs(limit = 20, { includeSmoke = true } = {}) {
   const tasks = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const task = JSON.parse(await fs.readFile(path.join(TASK_LOG_DIR, entry.name), "utf8").catch(() => "{}"));
+    const task = await readJsonOrNull(path.join(TASK_LOG_DIR, entry.name));
+    if (!task || typeof task !== "object") continue;
     if (task.workspace !== currentWorkspace) continue;
     if (!includeSmoke && isApiSmokeArtifact(task)) continue;
     tasks.push({
@@ -11439,7 +12079,8 @@ async function listQueuedTasks(limit = 20) {
   const items = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const item = JSON.parse(await fs.readFile(path.join(QUEUE_DIR, entry.name), "utf8").catch(() => "{}"));
+    const item = await readJsonOrNull(path.join(QUEUE_DIR, entry.name));
+    if (!item || typeof item !== "object") continue;
     if (item.workspace !== currentWorkspace) continue;
     items.push({
       id: item.id,
@@ -11614,7 +12255,8 @@ async function listApprovalRequests(limit = 20) {
   const approvals = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const approval = JSON.parse(await fs.readFile(path.join(APPROVAL_DIR, entry.name), "utf8").catch(() => "{}"));
+    const approval = await readJsonOrNull(path.join(APPROVAL_DIR, entry.name));
+    if (!approval || typeof approval !== "object") continue;
     if (approval.workspace !== currentWorkspace) continue;
     approvals.push({
       id: approval.id,
@@ -11937,7 +12579,8 @@ async function listReviewArtifacts(limit = 20, { includeSmoke = true } = {}) {
   const reviews = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const artifact = JSON.parse(await fs.readFile(path.join(REVIEW_DIR, entry.name), "utf8").catch(() => "{}"));
+    const artifact = await readJsonOrNull(path.join(REVIEW_DIR, entry.name));
+    if (!artifact || typeof artifact !== "object") continue;
     if (artifact.workspace !== currentWorkspace) continue;
     if (!includeSmoke && isApiSmokeArtifact(artifact)) continue;
     reviews.push({
@@ -12283,7 +12926,7 @@ function buildCapabilityVerificationCommands(capability = {}) {
     }
   };
   if (/浏览器|视觉|Trace|DOM|调试|进程|长任务/i.test(text)) {
-    add("node server.js --api-smoke-section=debug", "验证浏览器、调试诊断、长任务和源码定位闭环。");
+    add("node server.js --api-smoke-section=debug", "快速验证调试诊断、长任务和门禁闭环。");
     add("node server.js --api-smoke-section=browser", "验证浏览器检查、Trace、截图、DOM 和视觉入口。");
   } else if (/工具|MCP|扩展|资产|多模态/i.test(text)) {
     add("node server.js --api-smoke-section=integrations", "验证扩展、MCP、资产和本地工具入口。");
@@ -13527,6 +14170,7 @@ function buildExternalAuthorizationActionMarkdown(packageData = {}) {
   const statusSummary = packageData.authorizationStatus?.summary || {};
   const actions = Array.isArray(packageData.actions) ? packageData.actions : [];
   const commands = Array.isArray(packageData.verificationCommands) ? packageData.verificationCommands : [];
+  const handoff = packageData.handoffTemplate || null;
   const lines = [
     "# Forge Code External Authorization Action Package",
     "",
@@ -13565,10 +14209,72 @@ function buildExternalAuthorizationActionMarkdown(packageData = {}) {
     "",
     ...(commands.length ? commands.map((item) => `- \`${item.command || item}\`${item.reason ? ` - ${item.reason}` : ""}`) : ["- No verification commands detected."]),
     "",
+    "## Copyable External Handoff JSON",
+    "",
+    handoff ? "```json" : "- No handoff template generated.",
+    handoff ? JSON.stringify(handoff, null, 2) : "",
+    handoff ? "```" : "",
+    "",
     packageData.links?.readinessMarkdown ? `Readiness package: ${packageData.links.readinessMarkdown}` : "",
     packageData.links?.remotePublishMarkdown ? `Remote publish package: ${packageData.links.remotePublishMarkdown}` : ""
   ];
   return lines.filter((line, index, array) => !(line === "" && array[index - 1] === "")).join("\n") + "\n";
+}
+
+function buildExternalAuthorizationHandoffTemplate(packageData = {}) {
+  const actions = Array.isArray(packageData.actions) ? packageData.actions : [];
+  const externalActions = actions.filter((action) => action.blocking || action.manual);
+  const verificationCommands = Array.isArray(packageData.verificationCommands) ? packageData.verificationCommands : [];
+  return {
+    packageId: packageData.id || "",
+    generatedAt: new Date().toISOString(),
+    workspace: packageData.workspace || currentWorkspace,
+    status: "pending_external_authorization",
+    remote: {
+      provider: packageData.remote?.provider || "",
+      projectUrl: packageData.remote?.project?.webUrl || "",
+      project: packageData.remote?.project || {}
+    },
+    externalActions: externalActions.map((action, index) => ({
+      order: index + 1,
+      id: action.id || "",
+      label: action.label || action.id || "",
+      status: action.status || "",
+      required: Boolean(action.required),
+      manual: Boolean(action.manual),
+      blocking: Boolean(action.blocking),
+      next: action.next || "",
+      evidence: action.evidence || [],
+      steps: (action.commands || []).map((item) => ({
+        commandOrManualStep: item.command || item,
+        manual: Boolean(item.manual),
+        reason: item.reason || ""
+      })),
+      evidenceToFill: {
+        performedBy: "",
+        performedAt: "",
+        externalUrl: "",
+        ciUrl: "",
+        commentUrl: "",
+        outputSummary: "",
+        rollbackPlan: "",
+        notes: ""
+      }
+    })),
+    followUpVerification: verificationCommands.map((item) => ({
+      command: item.command || item,
+      reason: item.reason || ""
+    })),
+    links: packageData.links || {},
+    policy: {
+      writesRemote: false,
+      executesCommands: false,
+      pushes: false,
+      createsRemotePr: false,
+      writesRemoteComments: false,
+      requiresManualExternalExecution: true
+    }
+  };
 }
 
 async function buildExternalAuthorizationActionPackage({ deep = false, write = true } = {}) {
@@ -13622,6 +14328,7 @@ async function buildExternalAuthorizationActionPackage({ deep = false, write = t
       writesRemote: false
     }
   };
+  packageData.handoffTemplate = buildExternalAuthorizationHandoffTemplate(packageData);
   const markdown = buildExternalAuthorizationActionMarkdown(packageData);
   if (!write) {
     return { package: packageData, markdown, paths: null };
@@ -13630,15 +14337,18 @@ async function buildExternalAuthorizationActionPackage({ deep = false, write = t
   await fs.mkdir(packageDir, { recursive: true });
   const jsonPath = path.join(packageDir, "action.json");
   const markdownPath = path.join(packageDir, "action.md");
+  const handoffPath = path.join(packageDir, "handoff-template.json");
   await fs.writeFile(jsonPath, JSON.stringify(packageData, null, 2), "utf8");
   await fs.writeFile(markdownPath, markdown, "utf8");
+  await fs.writeFile(handoffPath, JSON.stringify(packageData.handoffTemplate, null, 2), "utf8");
   return {
     package: packageData,
     markdown,
     paths: {
       dir: toPosix(path.relative(APP_ROOT, packageDir)),
       json: toPosix(path.relative(APP_ROOT, jsonPath)),
-      markdown: toPosix(path.relative(APP_ROOT, markdownPath))
+      markdown: toPosix(path.relative(APP_ROOT, markdownPath)),
+      handoffTemplate: toPosix(path.relative(APP_ROOT, handoffPath))
     }
   };
 }
@@ -13665,7 +14375,8 @@ async function listExternalAuthorizationActionPackages({ limit = 20 } = {}) {
       paths: {
         dir: toPosix(path.relative(APP_ROOT, packageDir)),
         json: toPosix(path.relative(APP_ROOT, path.join(packageDir, "action.json"))),
-        markdown: toPosix(path.relative(APP_ROOT, path.join(packageDir, "action.md")))
+        markdown: toPosix(path.relative(APP_ROOT, path.join(packageDir, "action.md"))),
+        handoffTemplate: action.handoffTemplate ? toPosix(path.relative(APP_ROOT, path.join(packageDir, "handoff-template.json"))) : ""
       }
     });
   }
@@ -13704,16 +14415,20 @@ async function readExternalAuthorizationActionPackage(id = "") {
   const action = await readJsonOrNull(path.join(full, "action.json"));
   if (!action || action.workspace !== currentWorkspace) throw new Error("未找到当前工作区的 external authorization action package。");
   const markdown = await fs.readFile(path.join(full, "action.md"), "utf8").catch(() => buildExternalAuthorizationActionMarkdown(action));
+  const handoffTemplate = await readJsonOrNull(path.join(full, "handoff-template.json")) || action.handoffTemplate || buildExternalAuthorizationHandoffTemplate(action);
   return {
     id,
     generatedAt: action.generatedAt || "",
     workspace: action.workspace || "",
     package: action,
+    handoffTemplate,
+    handoffTemplateJson: JSON.stringify(handoffTemplate, null, 2).slice(0, 60000),
     markdown: markdown.slice(0, 120000),
     paths: {
       dir: toPosix(path.relative(APP_ROOT, full)),
       json: toPosix(path.relative(APP_ROOT, path.join(full, "action.json"))),
-      markdown: toPosix(path.relative(APP_ROOT, path.join(full, "action.md")))
+      markdown: toPosix(path.relative(APP_ROOT, path.join(full, "action.md"))),
+      handoffTemplate: toPosix(path.relative(APP_ROOT, path.join(full, "handoff-template.json")))
     },
     policy: {
       access: "local-read-only",
@@ -13737,11 +14452,11 @@ function buildIntegrationReadinessTemplates() {
       }
     },
     extensionManifest: {
-      name: "local-readonly-helper",
-      version: "0.1.0",
-      type: "plugin",
-      description: "本地只读辅助工具示例。批准后只能桥接到内置只读工具。",
-      capabilities: ["workspace-readiness", "project-doctor", "repo-map", "mcp-readiness"],
+        name: "local-readonly-helper",
+        version: "0.1.0",
+        type: "plugin",
+        description: "本地只读辅助工具示例。批准后只能桥接到内置只读工具。",
+        capabilities: ["workspace-readiness", "project-doctor", "run-debug-guide", "coding-session-brief", "local-validation-pack", "coding-cockpit", "repo-map", "mcp-readiness"],
       policy: {
         access: "read-only",
         scope: "currentWorkspace",
@@ -13759,6 +14474,30 @@ function buildIntegrationReadinessTemplates() {
           description: "只读运行 Project Doctor 汇总当前本地能力、授权和集成状态。",
           mapsTo: "project_doctor",
           parameters: { type: "object", properties: { deep: { type: "boolean" } } }
+        },
+        {
+          name: "run_debug_guide",
+          description: "读取当前项目启动、调试 URL、推荐验证命令和下一步指南。",
+          mapsTo: "run_debug_guide",
+          parameters: { type: "object", properties: { limit: { type: "number" } } }
+        },
+        {
+          name: "coding_session_brief",
+          description: "读取当前编码会话简报，汇总变更文件、调试目标、最近失败命令和验证命令。",
+          mapsTo: "coding_session_brief",
+          parameters: { type: "object", properties: { limit: { type: "number" } } }
+        },
+        {
+          name: "local_validation_pack",
+          description: "读取本地验证预设包，把语法、UI、fast/debug/integration smoke 组合成可排队命令。",
+          mapsTo: "local_validation_pack",
+          parameters: { type: "object", properties: { profile: { type: "string" }, limit: { type: "number" } } }
+        },
+        {
+          name: "coding_cockpit",
+          description: "读取编码驾驶舱，聚合启动入口、调试目标、变更文件、失败命令和本地验证包。",
+          mapsTo: "coding_cockpit",
+          parameters: { type: "object", properties: { profile: { type: "string" }, limit: { type: "number" } } }
         },
         {
           name: "repo_map",
@@ -14509,6 +15248,21 @@ function getAgentTools() {
     {
       type: "function",
       function: {
+        name: "remote_publish_evidence_helper",
+        description: "生成 Gitee/手工远端发布证据回填助手，汇总继续包、草稿校验、缺失字段和可复制 JSON；不执行远端写入。",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            limit: { type: "number" },
+            evidence: { type: "object" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
         name: "permission_matrix",
         description: "读取 provider/action 权限矩阵，按工作区、命令、模型、浏览器、扩展、MCP 和远端发布汇总访问边界；不执行任何动作。",
         parameters: {
@@ -14636,6 +15390,60 @@ function getAgentTools() {
             includeTrace: { type: "boolean" },
             runChecks: { type: "boolean" },
             waitMs: { type: "number" },
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "run_debug_guide",
+        description: "读取当前项目怎么运行、怎么调试、先跑哪些验证命令的结构化指南；不启动进程、不执行检查命令。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "coding_session_brief",
+        description: "读取当前编码会话简报：工作树变更、运行/调试入口、最近失败命令、恢复线索和建议验证命令；不执行命令、不写文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "local_validation_pack",
+        description: "读取本地验证预设包：语法快检、日常安全验证、调试闭环、集成与完整本地验证；不执行命令、不写文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            profile: { type: "string" },
+            limit: { type: "number" }
+          }
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "coding_cockpit",
+        description: "读取编码驾驶舱：启动入口、调试目标、当前变更、最近失败命令和本地验证包；不启动进程、不执行命令、不写文件。",
+        parameters: {
+          type: "object",
+          properties: {
+            profile: { type: "string" },
             limit: { type: "number" }
           }
         }
@@ -16319,6 +17127,13 @@ async function runReadTool(name, args) {
       deep: Boolean(args.deep)
     }));
   }
+  if (name === "remote_publish_evidence_helper") {
+    return JSON.stringify(await buildRemotePublishEvidenceHelper({
+      id: String(args.id || ""),
+      evidence: args.evidence || null,
+      limit: Number(args.limit || 20)
+    }));
+  }
   if (name === "policy_audit") {
     return JSON.stringify(await buildPolicyAudit({
       sampleCommands: Array.isArray(args.sampleCommands) ? args.sampleCommands : [],
@@ -16339,6 +17154,28 @@ async function runReadTool(name, args) {
   if (name === "workspace_readiness") {
     return JSON.stringify(await buildWorkspaceReadiness({
       includeIgnored: Boolean(args.includeIgnored)
+    }));
+  }
+  if (name === "run_debug_guide") {
+    return JSON.stringify(await buildRunDebugGuide({
+      limit: Number(args.limit || 8)
+    }));
+  }
+  if (name === "coding_session_brief") {
+    return JSON.stringify(await buildCodingSessionBrief({
+      limit: Number(args.limit || 8)
+    }));
+  }
+  if (name === "local_validation_pack") {
+    return JSON.stringify(await buildLocalValidationPack({
+      profile: args.profile || "safe",
+      limit: Number(args.limit || 12)
+    }));
+  }
+  if (name === "coding_cockpit") {
+    return JSON.stringify(await buildCodingCockpit({
+      profile: args.profile || "safe",
+      limit: Number(args.limit || 12)
     }));
   }
   if (name === "external_authorization_status") {
@@ -17919,6 +18756,32 @@ async function handleApi(req, res) {
       }));
     }
 
+    if (req.method === "GET" && url.pathname === "/api/run-debug-guide") {
+      return send(res, 200, await buildRunDebugGuide({
+        limit: Number(url.searchParams.get("limit") || 8)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/coding-session-brief") {
+      return send(res, 200, await buildCodingSessionBrief({
+        limit: Number(url.searchParams.get("limit") || 8)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/local-validation-pack") {
+      return send(res, 200, await buildLocalValidationPack({
+        profile: url.searchParams.get("profile") || "safe",
+        limit: Number(url.searchParams.get("limit") || 12)
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/coding-cockpit") {
+      return send(res, 200, await buildCodingCockpit({
+        profile: url.searchParams.get("profile") || "safe",
+        limit: Number(url.searchParams.get("limit") || 12)
+      }));
+    }
+
     if (req.method === "GET" && url.pathname === "/api/process-health") {
       return send(res, 200, await buildManagedProcessHealth({
         id: url.searchParams.get("id") || "",
@@ -18582,6 +19445,20 @@ async function handleApi(req, res) {
       }) });
     }
 
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/remote-publish-evidence-helper") {
+      const payload = req.method === "POST"
+        ? await readJson(req)
+        : {
+            id: url.searchParams.get("id") || "",
+            limit: Number(url.searchParams.get("limit") || 20)
+          };
+      return send(res, 200, { helper: await buildRemotePublishEvidenceHelper({
+        id: String(payload.id || ""),
+        evidence: payload.evidence || null,
+        limit: Number(payload.limit || 20)
+      }) });
+    }
+
     if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/remote-publish-evidence-draft") {
       const payload = req.method === "POST"
         ? await readJson(req)
@@ -19063,7 +19940,8 @@ const API_SMOKE_SECTION_ALIASES = {
   all: ["core", "browser", "semantic", "model", "extensions", "mcp", "assets", "apply", "runtime", "context", "gates", "remote"],
   fast: ["core", "semantic", "model", "apply", "context", "gates"],
   coding: ["core", "semantic", "apply", "runtime", "context", "gates"],
-  debug: ["core", "browser", "semantic", "runtime", "gates"],
+  debug: ["core", "runtime", "gates"],
+  "debug-full": ["core", "browser", "semantic", "runtime", "gates"],
   integrations: ["extensions", "mcp", "assets"],
   publish: ["gates", "remote"]
 };
@@ -19300,6 +20178,32 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(projectDoctor.policy?.writesRemote === false, "project doctor should not write remote");
       assertSmoke(projectDoctor.summary?.workspaceStatus, "project doctor missing workspace status");
       assertSmoke(Array.isArray(projectDoctor.recommendedCommands), "project doctor missing recommended commands");
+      const runDebugGuide = await requestJson(baseUrl, "/api/run-debug-guide?limit=8", { timeoutMs: 120000 });
+      assertSmoke(runDebugGuide.policy?.access === "local-run-debug-guide-read-only", "run/debug guide should be read-only");
+      assertSmoke(runDebugGuide.policy?.startsProcesses === false, "run/debug guide should not start processes");
+      assertSmoke(runDebugGuide.summary?.preferredLauncher === "start.bat", "run/debug guide missing preferred start.bat launcher");
+      assertSmoke(runDebugGuide.summary?.managedCommand === "node server.js", "run/debug guide missing managed node server command");
+      assertSmoke(runDebugGuide.quickStart?.steps?.some((item) => item.id === "debug-url"), "run/debug guide missing debug-url step");
+      assertSmoke(runDebugGuide.verificationCommands?.some((item) => item.command === "node server.js --start-bat-smoke-test"), "run/debug guide missing start smoke verification");
+      const codingSessionBrief = await requestJson(baseUrl, "/api/coding-session-brief?limit=8", { timeoutMs: 120000 });
+      assertSmoke(codingSessionBrief.policy?.access === "local-coding-session-brief-read-only", "coding session brief should be read-only");
+      assertSmoke(codingSessionBrief.policy?.writesFiles === false, "coding session brief should not write files");
+      assertSmoke(codingSessionBrief.prompt?.includes("Coding Session Brief"), "coding session brief missing prompt body");
+      assertSmoke(Array.isArray(codingSessionBrief.changedFiles), "coding session brief missing changed files list");
+      assertSmoke(codingSessionBrief.runDebugGuide?.summary?.managedCommand === "node server.js", "coding session brief missing run/debug guide summary");
+      assertSmoke(codingSessionBrief.verificationCommands?.some((item) => item.command === "node --check server.js"), "coding session brief missing syntax verification");
+      const localValidationPack = await requestJson(baseUrl, "/api/local-validation-pack?profile=debug&limit=8", { timeoutMs: 120000 });
+      assertSmoke(localValidationPack.policy?.access === "local-validation-pack-read-only", "local validation pack should be read-only");
+      assertSmoke(localValidationPack.policy?.executesCommands === false, "local validation pack should not execute commands");
+      assertSmoke(localValidationPack.summary?.recommendedProfile === "debug", "local validation pack should honor selected profile");
+      assertSmoke(localValidationPack.commands?.some((item) => item.command === "node server.js --api-smoke-section=debug"), "local validation pack missing debug smoke command");
+      assertSmoke(localValidationPack.profiles?.some((item) => item.id === "safe"), "local validation pack missing safe profile");
+      const codingCockpit = await requestJson(baseUrl, "/api/coding-cockpit?profile=debug&limit=8", { timeoutMs: 120000 });
+      assertSmoke(codingCockpit.policy?.access === "local-coding-cockpit-read-only", "coding cockpit should be read-only");
+      assertSmoke(codingCockpit.policy?.executesCommands === false, "coding cockpit should not execute commands");
+      assertSmoke(codingCockpit.summary?.recommendedProfile === "debug", "coding cockpit should honor selected profile");
+      assertSmoke(codingCockpit.prompt?.includes("Workspace Coding Cockpit"), "coding cockpit missing prompt body");
+      assertSmoke(codingCockpit.commands?.some((item) => item.command === "node server.js --api-smoke-section=debug"), "coding cockpit missing debug smoke command");
       const externalAuthorizationActionPreview = await requestJson(baseUrl, "/api/external-authorization-action", {
         method: "POST",
         body: JSON.stringify({ dryRun: true })
@@ -19307,18 +20211,22 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(externalAuthorizationActionPreview.package?.policy?.artifactOnly === true, "external authorization action preview missing artifact-only policy");
       assertSmoke(externalAuthorizationActionPreview.package?.policy?.pushes === false, "external authorization action preview should not push");
       assertSmoke(Array.isArray(externalAuthorizationActionPreview.package?.actions), "external authorization action preview missing actions");
+      assertSmoke(externalAuthorizationActionPreview.package?.handoffTemplate?.status === "pending_external_authorization", "external authorization action preview missing handoff template");
       assertSmoke(externalAuthorizationActionPreview.markdown?.includes("## Action Checklist"), "external authorization action preview missing action checklist markdown");
+      assertSmoke(externalAuthorizationActionPreview.markdown?.includes("## Copyable External Handoff JSON"), "external authorization action preview missing copyable handoff markdown");
       const externalAuthorizationActionWritten = await requestJson(baseUrl, "/api/external-authorization-action", {
         method: "POST",
         body: JSON.stringify({ dryRun: false })
       });
       assertSmoke(externalAuthorizationActionWritten.package?.id, "external authorization action write missing package id");
       assertSmoke(externalAuthorizationActionWritten.paths?.markdown, "external authorization action write missing markdown path");
+      assertSmoke(externalAuthorizationActionWritten.paths?.handoffTemplate?.endsWith("handoff-template.json"), "external authorization action write missing handoff template path");
       const externalAuthorizationActions = await requestJson(baseUrl, "/api/external-authorization-actions?limit=5");
       assertSmoke(externalAuthorizationActions.packages?.some((item) => item.id === externalAuthorizationActionWritten.package.id), "external authorization action list missing written package");
       const externalAuthorizationActionRead = await requestJson(baseUrl, `/api/external-authorization-action-package?id=${encodeURIComponent(externalAuthorizationActionWritten.package.id)}`);
       assertSmoke(externalAuthorizationActionRead.id === externalAuthorizationActionWritten.package.id, "external authorization action read returned wrong package");
       assertSmoke(externalAuthorizationActionRead.markdown?.includes("## Follow-up Verification"), "external authorization action read missing verification markdown");
+      assertSmoke(externalAuthorizationActionRead.handoffTemplateJson?.includes("\"externalActions\""), "external authorization action read missing copyable handoff JSON");
       const integrationReadinessPreview = await requestJson(baseUrl, "/api/integration-readiness", {
         method: "POST",
         body: JSON.stringify({ dryRun: true })
@@ -19670,11 +20578,16 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(extensions.extensions.some((item) => item.name === "api-smoke-section-skill"), "extensions missing focused fixture");
       assertSmoke(extensions.extensions.some((item) => item.name === "local-readonly-helper" && item.source === "extensions/plugins/local-readonly-helper/manifest.json"), "extensions missing versioned local helper");
       assertSmoke(extensions.extensions.some((item) => item.name === "local-readonly-helper" && (item.tools || []).some((tool) => tool.name === "project_doctor")), "versioned local helper missing project_doctor tool");
+      assertSmoke(extensions.extensions.some((item) => item.name === "local-readonly-helper" && (item.tools || []).some((tool) => tool.name === "run_debug_guide")), "versioned local helper missing run_debug_guide tool");
+      assertSmoke(extensions.extensions.some((item) => item.name === "local-readonly-helper" && (item.tools || []).some((tool) => tool.name === "coding_session_brief")), "versioned local helper missing coding_session_brief tool");
       const extensionTrust = await requestJson(baseUrl, "/api/extension-trust?limit=10");
       assertSmoke(extensionTrust.trust?.summary?.signatureVerified >= 1, "extension trust missing verified signature summary");
       assertSmoke(extensionTrust.trust?.rows?.some((item) => item.name === "local-readonly-helper" && item.trust?.manifestHash), "extension trust missing versioned local helper row");
       const toolsWithVersionedExtension = await requestJson(baseUrl, "/api/tools");
       assertSmoke(toolsWithVersionedExtension.tools.some((item) => item.name === "local-readonly-helper.project_doctor"), "tools endpoint missing versioned local project_doctor bridge");
+      assertSmoke(toolsWithVersionedExtension.tools.some((item) => item.name === "local-readonly-helper.run_debug_guide"), "tools endpoint missing versioned local run_debug_guide bridge");
+      assertSmoke(toolsWithVersionedExtension.tools.some((item) => item.name === "local-readonly-helper.coding_session_brief"), "tools endpoint missing versioned local coding_session_brief bridge");
+      assertSmoke(toolsWithVersionedExtension.tools.some((item) => item.name === "local-readonly-helper.local_validation_pack"), "tools endpoint missing versioned local validation pack bridge");
       checked.push("extensions", "extension-trust");
     }
 
@@ -20009,6 +20922,18 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       assertSmoke(remotePublishEvidenceDraft.draft?.paths?.draft?.endsWith("external-evidence-draft.json"), "remote publish evidence draft missing JSON artifact");
       assertSmoke(remotePublishEvidenceDraft.draft?.paths?.markdown?.endsWith("external-evidence-draft.md"), "remote publish evidence draft missing markdown artifact");
       assertSmoke(remotePublishEvidenceDraft.draft?.summary?.missing?.length >= 1, "remote publish evidence draft missing field checklist");
+      const remotePublishEvidenceHelper = await requestJson(baseUrl, "/api/remote-publish-evidence-helper", {
+        method: "POST",
+        body: JSON.stringify({
+          id: remotePublishPlan.package.id,
+          limit: 5,
+          evidence: remotePublishContinuation.continuation.evidenceTemplate
+        })
+      });
+      assertSmoke(remotePublishEvidenceHelper.helper?.policy?.pushes === false, "remote publish evidence helper should not push");
+      assertSmoke(remotePublishEvidenceHelper.helper?.policy?.writesFormalEvidence === false, "remote publish evidence helper should not write formal evidence");
+      assertSmoke(remotePublishEvidenceHelper.helper?.copyableEvidenceJson?.includes("\"externalExecution\""), "remote publish evidence helper missing copyable JSON");
+      assertSmoke(remotePublishEvidenceHelper.helper?.fillChecklist?.some((item) => item.id === "remoteUrl"), "remote publish evidence helper missing remoteUrl checklist");
       const remotePublishEvidence = await requestJson(baseUrl, "/api/remote-publish-evidence", {
         method: "POST",
         body: JSON.stringify({
@@ -20047,7 +20972,7 @@ async function runApiSmokeSectionTest(sectionValue = "") {
       });
       assertSmoke(mergeGateWithExternalEvidence.gate?.gates?.some((item) => item.id === "remote-publish-external-evidence"), "merge gate missing remote publish external evidence gate");
       assertSmoke(mergeGateWithExternalEvidence.gate?.externalEvidence?.status === "ready", "merge gate missing ready external evidence summary");
-      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight", "remote-publish-continuation", "remote-publish-evidence-draft", "remote-publish-evidence", "merge-gate-external-evidence");
+      checked.push("pr-readiness", "remote-publish-plan", "remote-publish-preflight", "remote-publish-continuation", "remote-publish-evidence-draft", "remote-publish-evidence-helper", "remote-publish-evidence", "merge-gate-external-evidence");
     }
 
     console.log(JSON.stringify({
@@ -20177,6 +21102,8 @@ async function runUiSmokeTest() {
     "modelCostPolicyBtn",
     "modelBillingBtn",
     "contextSnapshotBtn",
+    "codingSessionBriefBtn",
+    "codingCockpitBtn",
     "contextCompactBtn",
     "contextRollupBtn",
     "semanticIndexBtn",
@@ -20276,10 +21203,13 @@ async function runUiSmokeTest() {
     "外部授权状态",
     "外部授权状态已加入提示词",
     "function formatExternalAuthorizationActionSummary",
+    "function externalAuthorizationActionHandoffJson",
     "function appendExternalAuthorizationActionToPrompt",
+    "function copyExternalAuthorizationHandoff",
     "function stageExternalAuthorizationActionCommands",
     "async function generateExternalAuthorizationActionPackage",
     "外部授权行动包已生成",
+    "外部授权回填模板已复制",
     "外部授权行动包验证命令已放入面板",
     "function formatWorkspaceReadiness",
     "function workspaceReadinessPrompt",
@@ -20456,7 +21386,22 @@ async function runUiSmokeTest() {
     "async function startManagedProcessCommand",
     "async function waitForManagedProcessProbe",
     "async function discoverStartupCommand",
+    "function formatRunDebugGuide",
+    "function formatCodingSessionBrief",
+    "function formatCodingCockpit",
+    "function appendCodingSessionBriefToPrompt",
+    "function appendCodingCockpitToPrompt",
+    "/api/run-debug-guide",
+    "/api/coding-session-brief",
+    "/api/coding-cockpit",
+    "运行/调试指南已生成",
+    "编码会话简报已生成",
+    "编码驾驶舱已生成",
+    "编码会话简报已加入提示词",
+    "编码驾驶舱已加入提示词",
+    "编码简报已加入提示词，验证命令已放入面板。",
     "启动命令已发现",
+    "启动入口已发现",
     "启动页面 URL 已识别",
     "启动页面 URL 未识别",
     "发现并启动",
@@ -20468,6 +21413,8 @@ async function runUiSmokeTest() {
     "discover-start-debug",
     "发现并启动失败",
     "启动命令发现失败",
+    "preferredLauncher",
+    "launchersAreNotAutoStarted",
     "进程页面一键调试",
     "启动后页面调试恢复",
     "启动后页面复查命令",
@@ -20644,6 +21591,7 @@ async function runUiSmokeTest() {
     "/api/remote-publish-package",
       "/api/remote-publish-preflight",
       "/api/remote-publish-continuation",
+      "/api/remote-publish-evidence-helper",
       "/api/remote-publish-evidence-draft",
       "/api/remote-publish-evidence",
       "function buildBrowserEvidenceContext",
@@ -20744,6 +21692,7 @@ async function runUiSmokeTest() {
     "function stageGateEvidenceCommands",
     "function runGateEvidenceRepair",
     "function gateEvidenceArtifactFiles",
+    "function gateEvidenceCopyableJson",
     "function referenceGateEvidenceFilesInPrompt",
     "function buildGateFailureEvidence",
     "function appendGateFailureEvidence",
@@ -20763,13 +21712,18 @@ async function runUiSmokeTest() {
       "远端发布预检已生成",
       "远端发布继续包已生成",
     "function appendRemotePublishContinuationCard",
+    "function appendRemotePublishEvidenceHelperCard",
     "function appendRemotePublishEvidenceDraftCard",
     "function appendRemotePublishEvidenceCard",
     "外部发布证据已回填",
     "data-action=\"release-evidence\"",
+    "data-action=\"release-helper\"",
     "data-action=\"release-draft\"",
+    "data-action=\"copy-evidence-json\"",
     "发布回填提示",
+    "Gitee 发布回填助手已生成",
     "发布证据草稿",
+    "复制证据 JSON",
     "function renderDebugDiagnostics",
     "lastDebugDiagnostics",
     "function pruneDebugDiagnosticsForStorage",
@@ -21131,13 +22085,26 @@ async function runUiSmokeTest() {
     "/api/queue-isolation",
     "/api/processes",
     "/api/process-startup-commands",
+    "/api/run-debug-guide",
+    "/api/coding-session-brief",
+    "/api/local-validation-pack",
+    "/api/coding-cockpit",
     "/api/process-health",
     "/api/process-search",
     "/api/process-history",
     "/api/debug-target",
     "/api/runtime-url",
     "runtime_url",
-    "debug_target"
+    "debug_target",
+    "run_debug_guide",
+    "coding_session_brief",
+    "local_validation_pack",
+    "coding_cockpit",
+    "localValidationPackBtn",
+    "codingCockpitBtn",
+    "function formatLocalValidationPack",
+    "function stageLocalValidationPack",
+    "function stageCodingCockpit"
   ];
   for (const hook of appHooks) {
     assertIncludes(app, hook, `app.js missing ${hook}`);
@@ -22217,6 +23184,8 @@ async function runApiSmokeTest() {
     assertSmoke(tools.tools.some((item) => item.name === "ci_status"), "tools endpoint missing ci_status");
     assertSmoke(tools.tools.some((item) => item.name === "debug_diagnostics"), "tools endpoint missing debug_diagnostics");
     assertSmoke(tools.tools.some((item) => item.name === "debug_target"), "tools endpoint missing debug_target");
+    assertSmoke(tools.tools.some((item) => item.name === "run_debug_guide"), "tools endpoint missing run_debug_guide");
+    assertSmoke(tools.tools.some((item) => item.name === "coding_session_brief"), "tools endpoint missing coding_session_brief");
     assertSmoke(tools.tools.some((item) => item.name === "merge_gate"), "tools endpoint missing merge_gate");
     assertSmoke(tools.tools.some((item) => item.name === "mcp_resource"), "tools endpoint missing mcp_resource");
     assertSmoke(tools.tools.some((item) => item.name === "remote_publish_packages"), "tools endpoint missing remote_publish_packages");
@@ -22802,10 +23771,24 @@ async function runApiSmokeTest() {
     const startupCommands = await requestJson(baseUrl, "/api/process-startup-commands?limit=8");
     assertSmoke(startupCommands.policy?.access === "read-only-startup-discovery", "startup discovery missing read-only policy");
     assertSmoke(startupCommands.policy?.readsRuntimeUrl === true, "startup discovery missing runtime URL policy");
+    assertSmoke(startupCommands.policy?.returnsManualLaunchers === true, "startup discovery missing manual launcher policy");
     assertSmoke(startupCommands.runtimeUrl && typeof startupCommands.runtimeUrl === "object", "startup discovery missing runtime URL state");
+    assertSmoke(startupCommands.preferredLauncher?.command === "start.bat", "startup discovery should expose start.bat as preferred manual launcher");
+    assertSmoke(startupCommands.launchers?.some((item) => item.command === "start.bat" && item.managed === false), "startup discovery missing non-managed start.bat launcher");
     assertSmoke(startupCommands.commands?.[0]?.command === "node server.js", "startup discovery should prioritize expanded direct node start command");
     assertSmoke(startupCommands.commands?.some((item) => item.command === "npm start"), "startup discovery missing package start command fallback");
     assertSmoke(startupCommands.commands?.every((item) => item.policy?.allowed === true), "startup discovery returned non-policy-approved command");
+    const runDebugGuide = await requestJson(baseUrl, "/api/run-debug-guide?limit=8");
+    assertSmoke(runDebugGuide.summary?.preferredLauncher === "start.bat", "run/debug guide missing manual start launcher");
+    assertSmoke(runDebugGuide.summary?.managedCommand === "node server.js", "run/debug guide missing managed process command");
+    assertSmoke(runDebugGuide.quickStart?.steps?.some((item) => item.id === "managed-start"), "run/debug guide missing managed-start step");
+    assertSmoke(runDebugGuide.debug?.summary && typeof runDebugGuide.debug.summary === "object", "run/debug guide missing debug summary");
+    assertSmoke(runDebugGuide.verificationCommands?.length >= 1, "run/debug guide missing verification commands");
+    const codingSessionBrief = await requestJson(baseUrl, "/api/coding-session-brief?limit=8");
+    assertSmoke(codingSessionBrief.summary?.workspaceStatus, "coding session brief missing workspace status");
+    assertSmoke(codingSessionBrief.prompt?.includes("当前变更文件"), "coding session brief missing changed file prompt section");
+    assertSmoke(codingSessionBrief.runDebugGuide?.quickStart?.managedCommand?.command === "node server.js", "coding session brief missing managed command");
+    assertSmoke(codingSessionBrief.verificationCommands?.some((item) => item.command === "node server.js --api-smoke-section=debug"), "coding session brief missing debug smoke command");
     const processHealth = await requestJson(baseUrl, `/api/process-health?id=${encodeURIComponent(startedProcess.id)}`);
     assertSmoke(processHealth.policy?.access === "managed-process-health-and-artifacts", "process health missing read-only policy");
     assertSmoke(processHealth.summary?.total >= 1, "process health missing summary");
@@ -23103,6 +24086,14 @@ async function runApiSmokeTest() {
     assertSmoke(remotePublishEvidenceDraft.draft?.paths?.draft?.endsWith("external-evidence-draft.json"), "remote publish evidence draft missing JSON artifact");
     assertSmoke(remotePublishEvidenceDraft.draft?.paths?.markdown?.endsWith("external-evidence-draft.md"), "remote publish evidence draft missing markdown artifact");
     assertSmoke(remotePublishEvidenceDraft.draft?.summary?.missing?.length >= 1, "remote publish evidence draft missing field checklist");
+    const remotePublishPackagesWithDraft = await requestJson(baseUrl, "/api/remote-publish-packages?limit=5");
+    const draftPackage = remotePublishPackagesWithDraft.packages.find((item) => item.id === remotePublishPlan.package.id);
+    assertSmoke(draftPackage?.externalEvidenceDraft?.status === "draft_needs_input", "remote publish package index missing external evidence draft summary");
+    assertSmoke(draftPackage?.paths?.externalEvidenceDraft?.endsWith("external-evidence-draft.json"), "remote publish package index missing external evidence draft path");
+    assertSmoke(remotePublishPackagesWithDraft.summary?.withExternalEvidenceDraft >= 1, "remote publish package index missing external evidence draft count");
+    const remotePublishPackageWithDraft = await requestJson(baseUrl, `/api/remote-publish-package?id=${encodeURIComponent(remotePublishPlan.package.id)}`);
+    assertSmoke(remotePublishPackageWithDraft.externalEvidenceDraft?.status === "draft_needs_input", "remote publish package detail missing external evidence draft summary");
+    assertSmoke(remotePublishPackageWithDraft.externalEvidenceDraftJson?.includes("\"externalExecution\""), "remote publish package detail missing copyable external evidence draft JSON");
     const remotePublishEvidence = await requestJson(baseUrl, "/api/remote-publish-evidence", {
       method: "POST",
       body: JSON.stringify({

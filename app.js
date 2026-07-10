@@ -44,6 +44,8 @@ const browserSessionBtn = document.querySelector("#browserSessionBtn");
 const browserVisualBtn = document.querySelector("#browserVisualBtn");
 const worktreeBtn = document.querySelector("#worktreeBtn");
 const contextSnapshotBtn = document.querySelector("#contextSnapshotBtn");
+const codingSessionBriefBtn = document.querySelector("#codingSessionBriefBtn");
+const codingCockpitBtn = document.querySelector("#codingCockpitBtn");
 const contextCompactBtn = document.querySelector("#contextCompactBtn");
 const contextRollupBtn = document.querySelector("#contextRollupBtn");
 const modelPolicyBtn = document.querySelector("#modelPolicyBtn");
@@ -59,6 +61,7 @@ const semanticDiagnosticsBtn = document.querySelector("#semanticDiagnosticsBtn")
 const semanticImpactBtn = document.querySelector("#semanticImpactBtn");
 const dependencyGraphBtn = document.querySelector("#dependencyGraphBtn");
 const reviewBtn = document.querySelector("#reviewBtn");
+const localValidationPackBtn = document.querySelector("#localValidationPackBtn");
 const queueBtn = document.querySelector("#queueBtn");
 const handoffBtn = document.querySelector("#handoffBtn");
 const prReadinessBtn = document.querySelector("#prReadinessBtn");
@@ -70,6 +73,7 @@ const permissionMatrixBtn = document.querySelector("#permissionMatrixBtn");
 const remotePublishPlanBtn = document.querySelector("#remotePublishPlanBtn");
 const remotePublishPackagesBtn = document.querySelector("#remotePublishPackagesBtn");
 const remotePublishPreflightBtn = document.querySelector("#remotePublishPreflightBtn");
+const remotePublishEvidenceHelperBtn = document.querySelector("#remotePublishEvidenceHelperBtn");
 const extensionTrustBtn = document.querySelector("#extensionTrustBtn");
 const planSteps = document.querySelector("#planSteps");
 const goalState = document.querySelector("#goalState");
@@ -950,8 +954,11 @@ function setBusy(value, label = "待命") {
   if (processHealthBtn) processHealthBtn.disabled = value;
   if (processHistoryBtn) processHistoryBtn.disabled = value;
   if (reviewBtn) reviewBtn.disabled = value;
+  if (localValidationPackBtn) localValidationPackBtn.disabled = value;
   if (worktreeBtn) worktreeBtn.disabled = value;
   if (contextSnapshotBtn) contextSnapshotBtn.disabled = value;
+  if (codingSessionBriefBtn) codingSessionBriefBtn.disabled = value;
+  if (codingCockpitBtn) codingCockpitBtn.disabled = value;
   if (contextCompactBtn) contextCompactBtn.disabled = value;
   if (contextRollupBtn) contextRollupBtn.disabled = value;
   if (modelPolicyBtn) modelPolicyBtn.disabled = value;
@@ -975,6 +982,7 @@ function setBusy(value, label = "待命") {
   if (remotePublishPlanBtn) remotePublishPlanBtn.disabled = value;
   if (remotePublishPackagesBtn) remotePublishPackagesBtn.disabled = value;
   if (remotePublishPreflightBtn) remotePublishPreflightBtn.disabled = value;
+  if (remotePublishEvidenceHelperBtn) remotePublishEvidenceHelperBtn.disabled = value;
   if (extensionTrustBtn) extensionTrustBtn.disabled = value;
   if (browserAuditBtn) browserAuditBtn.disabled = value;
   runState.lastChild.textContent = value ? "运行中" : label;
@@ -2330,6 +2338,121 @@ function commandItemsToText(commands = []) {
   return normalizeCommandItems(commands)
     .map((item) => item.command)
     .join("\n");
+}
+
+function formatRunDebugGuide(guide = {}) {
+  const summary = guide.summary || {};
+  const quickStart = guide.quickStart || {};
+  const steps = Array.isArray(quickStart.steps) ? quickStart.steps : [];
+  const commands = normalizeCommandItems(guide.verificationCommands || []);
+  return [
+    `状态：${summary.status || "unknown"} · 工作区：${summary.workspaceStatus || "unknown"}`,
+    `差距：本地=${summary.localActionableGaps || 0} · 外部=${summary.externalBlockedGaps || 0}`,
+    summary.preferredLauncher ? `手动启动：${summary.preferredLauncher}` : "",
+    summary.managedCommand ? `受管启动：${summary.managedCommand}` : "",
+    summary.runtimeUrl ? `调试 URL：${summary.runtimeUrl}` : "调试 URL：启动后自动识别",
+    steps.length ? "步骤：" : "",
+    ...steps.map((item) => `- ${item.label || item.id}: ${item.command || item.url || ""}${item.reason ? ` · ${item.reason}` : ""}`),
+    commands.length ? "验证：" : "",
+    ...commands.slice(0, 6).map((item) => `- ${item.command}${item.reason ? ` · ${item.reason}` : ""}`)
+  ].filter(Boolean).join("\n");
+}
+
+function formatCodingSessionBrief(brief = {}) {
+  const summary = brief.summary || {};
+  const commands = normalizeCommandItems(brief.verificationCommands || []);
+  const changedFiles = Array.isArray(brief.changedFiles) ? brief.changedFiles : [];
+  return [
+    `状态：${summary.status || "unknown"} · 工作区：${summary.workspaceStatus || "unknown"}`,
+    `差距：本地=${summary.localActionableGaps || 0} · 外部=${summary.externalBlockedGaps || 0}`,
+    `变更文件：${summary.changedFiles || changedFiles.length || 0}`,
+    summary.runtimeUrl ? `调试 URL：${summary.runtimeUrl}` : "调试 URL：启动后自动识别",
+    summary.lastFailedCommand ? `最近失败命令：${summary.lastFailedCommand}` : "",
+    changedFiles.length ? "当前变更：" : "",
+    ...changedFiles.slice(0, 8).map((file) => `- @${file}`),
+    commands.length ? "建议验证：" : "",
+    ...commands.slice(0, 6).map((item) => `- ${item.command}${item.reason ? ` · ${item.reason}` : ""}`)
+  ].filter(Boolean).join("\n");
+}
+
+function formatLocalValidationPack(pack = {}) {
+  const summary = pack.summary || {};
+  const profiles = Array.isArray(pack.profiles) ? pack.profiles : [];
+  const commands = normalizeCommandItems(pack.commands || []);
+  const profileLines = profiles
+    .slice(0, 5)
+    .map((profile) => `- ${profile.label || profile.id || "验证预设"}：${(profile.commands || []).length} 条 · ${profile.reason || ""}`);
+  return [
+    `状态：${summary.status || "unknown"} · 工作区：${summary.workspaceStatus || "unknown"}`,
+    `推荐预设：${summary.recommendedProfile || "safe"}`,
+    profileLines.length ? "预设：" : "",
+    ...profileLines,
+    commands.length ? "命令：" : "",
+    ...commands.slice(0, 10).map((item) => `- ${item.command}${item.reason ? ` · ${item.reason}` : ""}`)
+  ].filter(Boolean).join("\n");
+}
+
+function formatCodingCockpit(cockpit = {}) {
+  const summary = cockpit.summary || {};
+  const commands = normalizeCommandItems(cockpit.commands || []);
+  const quickActions = Array.isArray(cockpit.quickActions) ? cockpit.quickActions : [];
+  const changedFiles = Array.isArray(cockpit.changedFiles) ? cockpit.changedFiles : [];
+  return [
+    `状态：${summary.status || "unknown"} · 工作区：${summary.workspaceStatus || "unknown"}`,
+    `差距：本地=${summary.localActionableGaps || 0} · 外部=${summary.externalBlockedGaps || 0}`,
+    `变更文件：${summary.changedFiles || changedFiles.length || 0}`,
+    `验证预设：${summary.recommendedProfile || "safe"} · 命令=${summary.commandCount || commands.length || 0}`,
+    summary.runtimeUrl ? `调试 URL：${summary.runtimeUrl}` : "调试 URL：启动后自动识别",
+    summary.preferredLauncher ? `手动启动：${summary.preferredLauncher}` : "",
+    summary.managedCommand ? `受管启动：${summary.managedCommand}` : "",
+    summary.lastFailedCommand ? `最近失败命令：${summary.lastFailedCommand}` : "",
+    quickActions.length ? "建议动作：" : "",
+    ...quickActions.slice(0, 6).map((item) => `- ${item.label || item.id || "action"}${item.command ? `：${item.command}` : item.url ? `：${item.url}` : ""}${item.reason ? ` · ${item.reason}` : ""}`),
+    changedFiles.length ? "当前变更：" : "",
+    ...changedFiles.slice(0, 8).map((file) => `- @${file}`),
+    commands.length ? "建议验证：" : "",
+    ...commands.slice(0, 8).map((item) => `- ${item.command}${item.reason ? ` · ${item.reason}` : ""}`)
+  ].filter(Boolean).join("\n");
+}
+
+function appendCodingSessionBriefToPrompt(brief = {}) {
+  const prompt = brief.prompt || formatCodingSessionBrief(brief);
+  if (!prompt) {
+    showToast("暂无可加入提示词的编码简报。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "编码会话简报已加入提示词",
+    label: "ctx",
+    state: brief.summary?.status || "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("编码会话简报已加入提示词。");
+  return prompt;
+}
+
+function appendCodingCockpitToPrompt(cockpit = {}) {
+  const prompt = cockpit.prompt || formatCodingCockpit(cockpit);
+  if (!prompt) {
+    showToast("暂无可加入提示词的编码驾驶舱。");
+    return "";
+  }
+  const current = input.value.trim();
+  input.value = [current, prompt].filter(Boolean).join("\n\n---\n\n");
+  input.focus();
+  scheduleReferencePreview({ immediate: true });
+  appendToolCall({
+    title: "编码驾驶舱已加入提示词",
+    label: "ctx",
+    state: cockpit.summary?.status || "ready",
+    body: prompt.slice(0, 12000)
+  });
+  showToast("编码驾驶舱已加入提示词。");
+  return prompt;
 }
 
 function formatCommandFailureAnalysis(analysis = null) {
@@ -5783,6 +5906,90 @@ function stageRepairVerificationCommands(commands = [], { title = "修复验证�
   return items;
 }
 
+async function stageLocalValidationPack({ profile = "safe", limit = 12 } = {}) {
+  setBusy(true, "本地验证包");
+  try {
+    const pack = await api(`/api/local-validation-pack?profile=${encodeURIComponent(profile)}&limit=${encodeURIComponent(String(limit))}`);
+    const commands = normalizeCommandItems(pack.commands || []);
+    stageRepairVerificationCommands(commands, {
+      title: "本地验证包",
+      successTitle: `本地验证包已放入命令面板：${pack.summary?.recommendedProfile || profile}`,
+      source: "local-validation-pack",
+      note: "当前项目暂未生成本地验证包。"
+    });
+    appendToolCall({
+      title: "本地验证包已生成",
+      label: "verify",
+      state: `${commands.length} 条`,
+      body: JSON.stringify({
+        tool: "local_validation_pack",
+        summary: pack.summary,
+        profiles: pack.profiles,
+        commands: pack.commands,
+        policy: pack.policy
+      }, null, 2).slice(0, 12000)
+    });
+    if (pack.prompt) {
+      appendToolCall({
+        title: "本地验证包说明",
+        label: "verify",
+        state: pack.summary?.status || "ready",
+        body: pack.prompt.slice(0, 12000)
+      });
+    }
+    showToast(commands.length ? "本地验证包已放入命令面板。" : "没有可排队的本地验证命令。");
+    setBusy(false, commands.length ? "验证已排队" : "无验证命令");
+    return pack;
+  } catch (error) {
+    showToast(error.message);
+    appendContextFailureEvidence("local-validation-pack", error, {
+      endpoint: "/api/local-validation-pack",
+      request: { method: "GET", profile, limit }
+    });
+    setBusy(false, "验证包失败");
+    return null;
+  }
+}
+
+async function stageCodingCockpit({ profile = "safe", limit = 12 } = {}) {
+  setBusy(true, "编码驾驶舱");
+  try {
+    const cockpit = await api(`/api/coding-cockpit?profile=${encodeURIComponent(profile)}&limit=${encodeURIComponent(String(limit))}`);
+    appendCodingCockpitToPrompt(cockpit);
+    const commands = normalizeCommandItems(cockpit.commands || []);
+    stageRepairVerificationCommands(commands, {
+      title: "编码驾驶舱验证命令",
+      successTitle: `编码驾驶舱验证命令已放入命令面板：${cockpit.summary?.recommendedProfile || profile}`,
+      source: "coding-cockpit",
+      note: "当前编码驾驶舱没有生成可排队的验证命令。"
+    });
+    appendToolCall({
+      title: "编码驾驶舱已生成",
+      label: "ctx",
+      state: cockpit.summary?.status || "ready",
+      body: JSON.stringify({
+        tool: "coding_cockpit",
+        summary: cockpit.summary,
+        quickActions: cockpit.quickActions,
+        changedFiles: cockpit.changedFiles,
+        commands: cockpit.commands,
+        policy: cockpit.policy
+      }, null, 2).slice(0, 12000)
+    });
+    showToast(commands.length ? "编码驾驶舱已加入提示词，验证命令已放入面板。" : "编码驾驶舱已加入提示词。");
+    setBusy(false, commands.length ? "驾驶舱+验证" : "驾驶舱已加入");
+    return cockpit;
+  } catch (error) {
+    showToast(error.message);
+    appendContextFailureEvidence("coding-cockpit", error, {
+      endpoint: "/api/coding-cockpit",
+      request: { method: "GET", profile, limit }
+    });
+    setBusy(false, "驾驶舱失败");
+    return null;
+  }
+}
+
 function renderReview(review = []) {
   reviewList.innerHTML = "";
   if (!review.length) {
@@ -8399,11 +8606,23 @@ function formatExternalAuthorizationActionSummary(packageData = {}, fallback = {
     packageData.generatedAt || fallback.generatedAt ? `生成时间：${packageData.generatedAt || fallback.generatedAt}` : "",
     paths.markdown ? `Markdown：${paths.markdown}` : "",
     paths.json ? `JSON：${paths.json}` : "",
+    paths.handoffTemplate ? `回填模板：${paths.handoffTemplate}` : "",
     `状态：${summary.status || "unknown"} · actions=${summary.actionCount || actions.length || 0} · blocking=${summary.blockingActionCount || 0} · manual=${summary.manualActionCount || 0}`,
     packageData.remote?.provider ? `远端：${packageData.remote.provider}${packageData.remote?.project?.webUrl ? ` · ${packageData.remote.project.webUrl}` : ""}` : "",
     actions.length ? `待处理：${actions.slice(0, 5).map((item) => `${item.label || item.id}(${item.status || "unknown"})`).join(" / ")}` : "",
     commands.length ? `验证命令：${commands.slice(0, 6).map((item) => item.command).join(" / ")}` : ""
   ].filter(Boolean).join("\n");
+}
+
+function externalAuthorizationActionHandoffJson(packageResult = {}) {
+  const packageData = packageResult.package || packageResult;
+  const candidate = packageResult.handoffTemplate
+    || packageData.handoffTemplate
+    || packageResult.handoffTemplateJson
+    || "";
+  if (typeof candidate === "string") return candidate.trim();
+  if (candidate && typeof candidate === "object") return JSON.stringify(candidate, null, 2);
+  return "";
 }
 
 function externalAuthorizationActionPrompt(packageResult = {}) {
@@ -8439,6 +8658,29 @@ function appendExternalAuthorizationActionToPrompt(packageResult = {}) {
   });
   showToast("外部授权行动包已加入提示词。");
   return context;
+}
+
+async function copyExternalAuthorizationHandoff(packageResult = {}) {
+  const body = externalAuthorizationActionHandoffJson(packageResult);
+  if (!body) {
+    showToast("这份行动包没有可复制的外部回填模板。");
+    appendToolCall({
+      title: "外部授权回填模板不可用",
+      label: "auth",
+      state: "跳过",
+      body: formatExternalAuthorizationActionSummary(packageResult.package || packageResult, packageResult)
+    });
+    return false;
+  }
+  const copied = await copyText(body);
+  appendToolCall({
+    title: copied ? "外部授权回填模板已复制" : "外部授权回填模板复制失败",
+    label: "auth",
+    state: copied ? "ready" : "failed",
+    body: copyLogBody(copied, body.slice(0, 10000))
+  });
+  showToast(copied ? "外部授权回填模板已复制。" : copyFailureSummary());
+  return copied;
 }
 
 function stageExternalAuthorizationActionCommands(packageResult = {}) {
@@ -8482,6 +8724,7 @@ async function openExternalAuthorizationActionPackage(id = "") {
         result.markdown || ""
       ].join("\n").slice(0, 30000)
     });
+    await copyExternalAuthorizationHandoff(result);
     showToast("外部授权行动包已打开。");
     return result;
   } catch (error) {
@@ -8543,6 +8786,7 @@ async function generateExternalAuthorizationActionPackage({ dryRun = false } = {
         result.markdown || ""
       ].join("\n").slice(0, 30000)
     });
+    await copyExternalAuthorizationHandoff(result);
     showToast(dryRun ? "外部授权行动包预览已生成。" : "外部授权行动包已写入 .forge。");
     if (!dryRun) await listExternalAuthorizationActionPackages();
     return result;
@@ -12613,6 +12857,19 @@ function compactGateEvidence(evidence = {}, max = 12000) {
   return JSON.stringify(evidence, null, 2).slice(0, max);
 }
 
+function gateEvidenceCopyableJson(evidence = {}) {
+  const candidate = evidence.evidenceTemplate
+    || evidence.copyableEvidenceJson
+    || evidence.helper?.copyableEvidenceJson
+    || evidence.externalEvidenceDraft?.evidenceTemplate
+    || evidence.externalEvidenceDraftJson
+    || evidence.latest?.externalEvidenceDraftJson
+    || "";
+  if (typeof candidate === "string") return candidate.trim();
+  if (candidate && typeof candidate === "object") return JSON.stringify(candidate, null, 2);
+  return "";
+}
+
 function gateEvidenceCommands(evidence = {}) {
   const commands = [];
   const addCommand = (value) => {
@@ -13037,6 +13294,48 @@ async function appendRemotePublishEvidenceDraftCard(packageId = "", evidence = n
   return draft;
 }
 
+async function appendRemotePublishEvidenceHelperCard(packageId = "", seedEvidence = null) {
+  const result = await api("/api/remote-publish-evidence-helper", {
+    method: "POST",
+    body: JSON.stringify({ id: packageId || "", evidence: seedEvidence || null, limit: 8 })
+  });
+  const helper = result.helper || {};
+  const evidence = {
+    status: helper.status,
+    packageId: helper.packageId,
+    provider: helper.provider,
+    manualProvider: helper.manualProvider,
+    fillChecklist: helper.fillChecklist,
+    copyableEvidenceJson: helper.copyableEvidenceJson,
+    continuation: helper.continuation,
+    draft: helper.draft,
+    validation: helper.validation,
+    verificationCommands: helper.verificationCommands,
+    paths: helper.paths,
+    policy: helper.policy,
+    helper
+  };
+  appendGateEvidenceCard(evidence, {
+    title: "Gitee 发布回填助手已生成",
+    kind: "release",
+    state: helper.status || "needs_input",
+    body: compactGateEvidence({
+      summary: helper.summary,
+      fillChecklist: helper.fillChecklist,
+      copyableEvidenceJson: helper.copyableEvidenceJson,
+      paths: helper.paths,
+      policy: helper.policy
+    })
+  });
+  if (helper.verificationCommands?.length) {
+    stageGateEvidenceVerificationCommands(helper, {
+      title: "Gitee 发布回填助手",
+      source: "remote-publish-evidence-helper"
+    });
+  }
+  return helper;
+}
+
 function appendRemotePublishContinuationPrompt(continuation = {}) {
   const evidence = {
     status: continuation.status,
@@ -13098,9 +13397,9 @@ function appendGateEvidenceCard(evidence = {}, {
   actions.className = "debug-last-failed-actions";
   const packageId = evidence.packageId || evidence.package?.id || evidence.latest?.id || evidence.latest?.plan?.package?.id || evidence.preflight?.package?.id || "";
   const releaseActions = kind === "release"
-    ? `<button type="button" data-action="release-continuation" ${packageId || evidence.summary?.total ? "" : "disabled"}>继续包</button><button type="button" data-action="release-prompt" ${packageId || evidence.paths?.evidenceTemplate ? "" : "disabled"}>发布回填提示</button><button type="button" data-action="release-draft" ${packageId || evidence.paths?.evidenceTemplate ? "" : "disabled"}>回填草稿</button><button type="button" data-action="release-evidence" ${packageId || evidence.paths?.evidenceTemplate || evidence.status === "ready_to_ingest" ? "" : "disabled"}>正式回填</button>`
+    ? `<button type="button" data-action="release-continuation" ${packageId || evidence.summary?.total ? "" : "disabled"}>继续包</button><button type="button" data-action="release-prompt" ${packageId || evidence.paths?.evidenceTemplate ? "" : "disabled"}>发布回填提示</button><button type="button" data-action="release-helper" ${packageId || evidence.summary?.total || evidence.paths?.evidenceTemplate ? "" : "disabled"}>回填助手</button><button type="button" data-action="release-draft" ${packageId || evidence.paths?.evidenceTemplate ? "" : "disabled"}>回填草稿</button><button type="button" data-action="release-evidence" ${packageId || evidence.paths?.evidenceTemplate || evidence.status === "ready_to_ingest" ? "" : "disabled"}>正式回填</button>`
     : "";
-  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference" ${gateEvidenceArtifactFiles(evidence).length ? "" : "disabled"}>引用文件</button><button type="button" data-action="stage" ${includeCommands && gateEvidenceCommands(evidence).length ? "" : "disabled"}>加入命令</button><button type="button" data-action="stage-verification">排队验证</button><button type="button" data-action="blocker-prompt">阻塞提示</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button>${releaseActions}<button type="button" data-action="repair">直接修复</button>`;
+  actions.innerHTML = `<button type="button" data-action="prompt">加入提示词</button><button type="button" data-action="reference" ${gateEvidenceArtifactFiles(evidence).length ? "" : "disabled"}>引用文件</button><button type="button" data-action="stage" ${includeCommands && gateEvidenceCommands(evidence).length ? "" : "disabled"}>加入命令</button><button type="button" data-action="stage-verification">排队验证</button><button type="button" data-action="blocker-prompt">阻塞提示</button><button type="button" data-action="verification-prompt">验证提示</button><button type="button" data-action="verification-fix">验证修复</button>${releaseActions}<button type="button" data-action="copy-evidence-json" ${gateEvidenceCopyableJson(evidence) ? "" : "disabled"}>复制证据 JSON</button><button type="button" data-action="repair">直接修复</button>`;
   actions.querySelector("[data-action='prompt']").addEventListener("click", () => {
     appendGateEvidenceToPrompt(evidence, { title, kind });
   });
@@ -13149,6 +13448,19 @@ function appendGateEvidenceCard(evidence = {}, {
       });
     }
   });
+  actions.querySelector("[data-action='release-helper']")?.addEventListener("click", async () => {
+    try {
+      await appendRemotePublishEvidenceHelperCard(packageId, evidence.evidenceTemplate || evidence.evidence || null);
+    } catch (error) {
+      showToast(error.message);
+      appendGateFailureEvidence(error, {
+        title: "生成 Gitee 发布回填助手失败",
+        kind: "release",
+        endpoint: "/api/remote-publish-evidence-helper",
+        request: { id: packageId || "", hasEvidenceTemplate: Boolean(evidence.evidenceTemplate) }
+      });
+    }
+  });
   actions.querySelector("[data-action='release-draft']")?.addEventListener("click", async () => {
     try {
       const continuation = evidence.evidenceTemplate ? evidence : await appendRemotePublishContinuationCard(packageId);
@@ -13180,6 +13492,17 @@ function appendGateEvidenceCard(evidence = {}, {
         request: { id: packageId || "", hasEvidenceTemplate: Boolean(evidence.evidenceTemplate) }
       });
     }
+  });
+  actions.querySelector("[data-action='copy-evidence-json']")?.addEventListener("click", async () => {
+    const body = gateEvidenceCopyableJson(evidence);
+    const copied = await copyText(body);
+    appendToolCall({
+      title: copied ? "发布证据 JSON 已复制" : "发布证据 JSON 复制失败",
+      label: "release",
+      state: copied ? "ready" : "failed",
+      body: copyLogBody(copied, body.slice(0, 8000))
+    });
+    showToast(copied ? "发布证据 JSON 已复制。" : copyFailureSummary());
   });
   actions.querySelector("[data-action='repair']").addEventListener("click", () => {
     runGateEvidenceRepair(evidence, { title, kind });
@@ -14610,6 +14933,44 @@ contextSnapshotBtn?.addEventListener("click", async () => {
   }
 });
 
+codingSessionBriefBtn?.addEventListener("click", async () => {
+  setBusy(true, "编码简报");
+  try {
+    const brief = await api("/api/coding-session-brief?limit=8");
+    appendCodingSessionBriefToPrompt(brief);
+    const commands = normalizeCommandItems(brief.verificationCommands || []);
+    if (commands.length) {
+      renderCommands(commands);
+    }
+    appendToolCall({
+      title: "编码会话简报已生成",
+      label: "ctx",
+      state: brief.summary?.status || "ready",
+      body: JSON.stringify({
+        tool: "coding_session_brief",
+        summary: brief.summary,
+        changedFiles: brief.changedFiles,
+        runDebugGuide: brief.runDebugGuide,
+        verificationCommands: brief.verificationCommands,
+        policy: brief.policy
+      }, null, 2).slice(0, 12000)
+    });
+    showToast(commands.length ? "编码简报已加入提示词，验证命令已放入面板。" : "编码简报已加入提示词。");
+    setBusy(false, commands.length ? "简报+验证" : "简报已加入");
+  } catch (error) {
+    showToast(error.message);
+    appendContextFailureEvidence("coding-session-brief", error, {
+      endpoint: "/api/coding-session-brief",
+      request: { method: "GET", limit: 8 }
+    });
+    setBusy(false, "简报失败");
+  }
+});
+
+codingCockpitBtn?.addEventListener("click", () => {
+  stageCodingCockpit({ profile: "safe", limit: 12 });
+});
+
 contextCompactBtn?.addEventListener("click", async () => {
   setBusy(true, "压缩上下文");
   try {
@@ -15661,6 +16022,10 @@ runCommandsBtn.addEventListener("click", async () => {
   setBusy(false, ok ? "命令通过" : "命令失败");
 });
 
+localValidationPackBtn?.addEventListener("click", () => {
+  stageLocalValidationPack({ profile: "safe", limit: 12 });
+});
+
 manualCommandForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const command = manualCommandInput?.value.trim() || "";
@@ -16110,6 +16475,9 @@ remotePublishPackagesBtn?.addEventListener("click", async () => {
           commands: detail.plan?.commands,
           readiness: detail.plan?.readiness
         },
+        externalEvidenceDraft: detail.externalEvidenceDraft,
+        externalEvidenceDraftJson: detail.externalEvidenceDraftJson,
+        externalEvidenceDraftMarkdownPreview: detail.externalEvidenceDraftMarkdown?.slice(0, 2000),
         prBodyPreview: detail.prBody?.slice(0, 2000),
         reviewSummaryPreview: detail.reviewSummary?.slice(0, 2000)
       } : null,
@@ -16175,6 +16543,25 @@ remotePublishPreflightBtn?.addEventListener("click", async () => {
       request: { limit: 8 }
     });
     setBusy(false, "预检失败");
+  }
+});
+
+remotePublishEvidenceHelperBtn?.addEventListener("click", async () => {
+  setBusy(true, "发布回填助手");
+  try {
+    const packages = await api("/api/remote-publish-packages?limit=1");
+    const id = packages.packages?.[0]?.id || "";
+    const helper = await appendRemotePublishEvidenceHelperCard(id);
+    setBusy(false, helper?.status === "ready_to_ingest" ? "回填可提交" : "等待回填");
+  } catch (error) {
+    showToast(error.message);
+    appendGateFailureEvidence(error, {
+      title: "生成 Gitee 发布回填助手失败",
+      kind: "release",
+      endpoint: "/api/remote-publish-evidence-helper",
+      request: { limit: 1 }
+    });
+    setBusy(false, "回填助手失败");
   }
 });
 
@@ -16449,24 +16836,48 @@ async function discoverStartupCommand({ start = false, debug = false } = {}) {
   setBusy(true, debug ? "发现并调试" : start ? "发现并启动" : "发现启动命令");
   try {
     const runtimeUrl = await refreshRuntimeUrl().catch(() => null);
-    const result = await api("/api/process-startup-commands?limit=8");
+    const guide = await api("/api/run-debug-guide?limit=8");
+    const result = guide.startup || await api("/api/process-startup-commands?limit=8");
     const first = result.commands?.[0] || null;
+    const launcher = result.preferredLauncher || result.launchers?.[0] || null;
     if (first?.command && processCommandInput) {
       processCommandInput.value = first.command;
       processCommandInput.focus();
     }
     appendToolCall({
-      title: first?.command ? `启动命令已发现：${first.command}` : "启动命令未发现",
+      title: launcher?.command
+        ? `启动入口已发现：${launcher.command}${first?.command ? ` / 受管命令：${first.command}` : ""}`
+        : first?.command ? `启动命令已发现：${first.command}` : "启动命令未发现",
       label: "proc",
       state: `${result.commands?.length || 0} commands`,
       body: JSON.stringify({
         tool: "runtime_url",
+        guideTool: "run_debug_guide",
         runtimeUrl: result.runtimeUrl || runtimeUrl,
         packageManager: result.packageManager,
         scripts: result.scripts,
+        preferredLauncher: result.preferredLauncher,
+        launchers: result.launchers,
+        launcherPolicy: {
+          returnsManualLaunchers: result.policy?.returnsManualLaunchers,
+          launchersAreNotAutoStarted: result.policy?.launchersAreNotAutoStarted
+        },
         commands: result.commands,
+        runDebugGuide: {
+          summary: guide.summary,
+          quickStart: guide.quickStart,
+          debug: guide.debug,
+          verificationCommands: guide.verificationCommands,
+          policy: guide.policy
+        },
         policy: result.policy
       }, null, 2).slice(0, 12000)
+    });
+    appendToolCall({
+      title: "运行/调试指南已生成",
+      label: "guide",
+      state: guide.summary?.status || "ready",
+      body: formatRunDebugGuide(guide).slice(0, 12000)
     });
     if (start && first?.command) {
       const process = await startManagedProcessCommand(first.command, {
@@ -16523,9 +16934,11 @@ async function discoverStartupCommand({ start = false, debug = false } = {}) {
       setBusy(false, process?.blocked ? "已拒绝" : debug ? "未识别 URL" : "已启动");
       return { result, process: probedProcess };
     }
-    showToast(first?.command ? "已填入推荐启动命令。" : "没有发现可安全启动的命令。");
+    showToast(first?.command
+      ? (launcher?.command ? "已生成运行/调试指南，并填入受管启动命令。" : "已生成运行/调试指南。")
+      : "没有发现可安全启动的命令。");
     setBusy(false, first?.command ? "已发现" : "未发现");
-    return { result, process: null };
+    return { result, guide, process: null };
   } catch (error) {
     showToast(error.message);
     appendProcessFailureEvidence(error, {
